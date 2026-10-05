@@ -161,6 +161,41 @@ def cancel_import(id: int, user=Depends(writer), db=Depends(get_db)):
     batch.status = 'Cancelling' if batch.status == 'Importing' else 'Cancelled'; db.commit()
     return {'id': id, 'status': batch.status}
 
+
+@router.patch('/{id}')
+def edit_import(id: int, payload: dict, user=Depends(writer), db=Depends(get_db)):
+    batch = db.get(ImportBatch, id)
+    if not batch or (batch.owner_id != user.id and user.role != 'Administrator'):
+        raise HTTPException(404, 'Import not found')
+    if batch.status in ('Queued', 'Importing'):
+        raise HTTPException(409, 'Stop the import before editing it')
+    filename = payload.get('filename')
+    if filename is not None:
+        filename = PurePath(str(filename)).name.strip()[:255]
+        if not filename:
+            raise HTTPException(422, 'Filename cannot be empty')
+        batch.filename = filename
+    if isinstance(payload.get('mapping'), dict):
+        if batch.status == 'Imported':
+            raise HTTPException(409, 'Imported batches cannot change their mapping')
+        batch.mapping = payload['mapping']
+    db.add(Audit(actor_id=user.id, action='import.edited', entity='import', entity_id=id, details=payload))
+    db.commit()
+    return {'id': batch.id, 'filename': batch.filename, 'mapping': batch.mapping, 'status': batch.status}
+
+@router.delete('/{id}', status_code=204)
+def delete_import(id: int, user=Depends(writer), db=Depends(get_db)):
+    batch = db.get(ImportBatch, id)
+    if not batch or (batch.owner_id != user.id and user.role != 'Administrator'):
+        raise HTTPException(404, 'Import not found')
+    if batch.status in ('Queued', 'Importing', 'Cancelling'):
+        raise HTTPException(409, 'Cancel the running import before deleting it')
+    # Keep imported findings; remove only the import history and its source rows.
+    db.query(ImportRow).filter(ImportRow.import_id == id).delete(synchronize_session=False)
+    db.add(Audit(actor_id=user.id, action='import.deleted', entity='import', entity_id=id, details={'filename': batch.filename, 'status': batch.status}))
+    db.delete(batch)
+    db.commit()
+
 @router.post('/{id}/retry', status_code=202)
 def retry_import(id: int, request: Request, tasks: BackgroundTasks, user=Depends(writer), db=Depends(get_db)):
     batch = db.get(ImportBatch, id)
