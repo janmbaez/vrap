@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
-from io import BytesIO
+from io import BytesIO, StringIO
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select, func, case, update
 from ..db import get_db
 from ..auth import require_user, writer, admin
@@ -216,3 +216,19 @@ def executive_report_pdf(request: Request, user=Depends(require_user), db=Depend
     doc.build(story,onFirstPage=footer,onLaterPages=footer);stream.seek(0)
     filename=f"VRAP-Executive-Report-{data['environment']}-{datetime.now(timezone.utc).date().isoformat()}.pdf"
     return StreamingResponse(stream,media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
+
+@router.get('/review-report')
+def review_report(request: Request, days: int = 7, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request); days = max(1, min(days, 366)); since = datetime.now(timezone.utc) - timedelta(days=days)
+    total = db.scalar(select(func.count(Finding.id)).where(Finding.workspace == workspace)) or 0
+    reviewed = db.scalar(select(func.count(Finding.id)).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, FindingWorkflow.status == 'Reviewed', FindingWorkflow.updated_at >= since)) or 0
+    pending = total - reviewed
+    rows = db.execute(select(Finding.id, Asset.hostname, Vulnerability.name, Vulnerability.plugin_id, FindingWorkflow.updated_at).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, FindingWorkflow.status == 'Reviewed', FindingWorkflow.updated_at >= since).order_by(FindingWorkflow.updated_at.desc())).all()
+    return {'workspace': workspace, 'period_days': days, 'since': since.isoformat(), 'generated_at': datetime.now(timezone.utc).isoformat(), 'summary': {'total_findings': total, 'reviewed_in_period': reviewed, 'pending_review': pending, 'coverage_percent': round(reviewed * 100 / total, 1) if total else 0}, 'reviews': [{'finding_id': i, 'asset': h, 'vulnerability': n, 'plugin_id': p, 'reviewed_at': t.isoformat() if t else None} for i,h,n,p,t in rows]}
+
+@router.get('/review-report.csv')
+def review_report_csv(request: Request, days: int = 7, user=Depends(require_user), db=Depends(get_db)):
+    report = review_report(request, days, user, db); out = StringIO(); out.write('VRAP Operational Vulnerability Review Report\n'); out.write(f"Workspace,{report['workspace']}\nPeriod days,{report['period_days']}\nReviewed in period,{report['summary']['reviewed_in_period']}\nPending review,{report['summary']['pending_review']}\nCoverage percent,{report['summary']['coverage_percent']}\n\nFinding ID,Asset,Vulnerability,Plugin ID,Reviewed At\n")
+    for x in report['reviews']:
+        values=[str(x[k] or '').replace('"','""') for k in ('finding_id','asset','vulnerability','plugin_id','reviewed_at')]; out.write(','.join(f'"{v}"' for v in values)+'\n')
+    return StreamingResponse(iter([out.getvalue()]), media_type='text/csv', headers={'Content-Disposition': 'attachment; filename=vrap-operational-review.csv'})
