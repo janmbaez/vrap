@@ -18,7 +18,8 @@ jobs:
           python-version: '3.13'
       - run: pip install -r backend/requirements.txt
       - run: pip install pytest
-      - run: pytest -q backend/tests
+      - run: pytest -q tests
+        working-directory: backend
 
   publish:
     needs: test
