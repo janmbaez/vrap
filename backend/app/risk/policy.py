@@ -1,0 +1,47 @@
+"""Versioned provisional policy. These are seed data, not engine constants."""
+LEVELS = {'Low': 20, 'Medium': 45, 'High': 75, 'Critical': 100}
+DEFAULT = {
+    'engine_version': '1.0', 'appetite': 'Medium', 'unknown_score': 70,
+    'thresholds': [{'name': 'Low', 'min': 0}, {'name': 'Medium', 'min': 25}, {'name': 'High', 'min': 50}, {'name': 'Critical', 'min': 75}],
+    'technical_weights': {'cvss': 0.65, 'vpr': 0.35},
+    'severity_map': {'Informational': 0, 'Low': 20, 'Medium': 45, 'High': 75, 'Critical': 95},
+    'max_control_reduction': 0.85,
+    'grc_matrix': {
+        'enabled': True,
+        'authorized_tolerance': 9.999999,
+        'remaining_risk_factors': {'2': 0.95, '3': 0.80, '4': 0.68, '5': 0.50, '6': 0.36, '7': 0.20, '8': 0.11, '9': 0.08, '10': 0.05},
+        'bands': [
+            {'name': 'Informational', 'min': 1, 'max': 3},
+            {'name': 'Low', 'min': 4, 'max': 6},
+            {'name': 'Medium', 'min': 7, 'max': 9.999999},
+            {'name': 'High', 'min': 10, 'max': 16},
+            {'name': 'Critical', 'min': 17, 'max': 25},
+        ],
+    },
+    'required_context': ['asset_criticality', 'business_criticality', 'data_classification', 'exposure', 'environment', 'regulatory'],
+    'factors': [
+        {'key': 'technical', 'component': 'likelihood', 'weight': 0.45, 'kind': 'technical'},
+        {'key': 'exploit_available', 'component': 'likelihood', 'weight': 0.15, 'kind': 'boolean', 'true_score': 100, 'false_score': 20},
+        {'key': 'kev', 'component': 'likelihood', 'weight': 0.1, 'kind': 'boolean', 'true_score': 100, 'false_score': 20},
+        {'key': 'exposure', 'component': 'likelihood', 'weight': 0.2, 'kind': 'mapping', 'values': {'Internet Facing': 100, 'Internal': 55, 'Restricted Network': 30, 'Isolated': 10}},
+        {'key': 'age_days', 'component': 'likelihood', 'weight': 0.05, 'kind': 'linear', 'scale': 180},
+        {'key': 'threat_intelligence', 'component': 'likelihood', 'weight': 0.05, 'kind': 'mapping', 'values': {'Low': 20, 'Medium': 50, 'High': 80, 'Critical': 100}},
+        {'key': 'technical', 'component': 'impact', 'weight': 0.2, 'kind': 'technical'},
+        {'key': 'asset_criticality', 'component': 'impact', 'weight': 0.15, 'kind': 'mapping', 'values': LEVELS},
+        {'key': 'business_criticality', 'component': 'impact', 'weight': 0.25, 'kind': 'mapping', 'values': LEVELS},
+        {'key': 'data_classification', 'component': 'impact', 'weight': 0.15, 'kind': 'mapping', 'values': {'Public': 10, 'Internal': 40, 'Confidential': 75, 'Restricted': 100}},
+        {'key': 'regulatory', 'component': 'impact', 'weight': 0.1, 'kind': 'multi', 'values': {'None': 0, 'PCI DSS': 100, 'SOC 2': 70, 'SOX': 85, 'HIPAA': 100, 'GDPR': 90, 'Other': 80}},
+        {'key': 'production', 'component': 'impact', 'weight': 0.05, 'kind': 'boolean', 'true_score': 100, 'false_score': 20},
+        {'key': 'privileged', 'component': 'impact', 'weight': 0.05, 'kind': 'boolean', 'true_score': 100, 'false_score': 20},
+        {'key': 'critical_process', 'component': 'impact', 'weight': 0.05, 'kind': 'boolean', 'true_score': 100, 'false_score': 20},
+    ],
+    'controls': [
+        {'name': 'Network segmentation', 'component': 'likelihood', 'max_effectiveness': 0.6, 'requires': None},
+        {'name': 'MFA', 'component': 'likelihood', 'max_effectiveness': 0.45, 'requires': 'authentication_required'},
+        {'name': 'WAF', 'component': 'likelihood', 'max_effectiveness': 0.5, 'requires': 'web_applicable'},
+        {'name': 'EDR', 'component': 'likelihood', 'max_effectiveness': 0.35, 'requires': None},
+        {'name': 'Firewall restrictions', 'component': 'likelihood', 'max_effectiveness': 0.4, 'requires': None},
+        {'name': 'IPS/IDS', 'component': 'likelihood', 'max_effectiveness': 0.25, 'requires': None},
+        {'name': 'Tested backups', 'component': 'impact', 'max_effectiveness': 0.65, 'requires': None},
+    ],
+}

@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: vrap
+      POSTGRES_USER: vrap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - vrap_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vrap -d vrap"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    image: shyhotboy/vrap-api:latest
+    environment:
+      DATABASE_URL: postgresql+psycopg://vrap:${POSTGRES_PASSWORD}@db/vrap
+      APP_ORIGIN: ${APP_ORIGIN:-http://10.0.0.193:8181}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TENABLE_ACCESS_KEY: ${TENABLE_ACCESS_KEY:-}
+      TENABLE_SECRET_KEY: ${TENABLE_SECRET_KEY:-}
+      TENABLE_BASE_URL: ${TENABLE_BASE_URL:-https://cloud.tenable.com}
+      TENABLE_ALLOWED_HOSTS: ${TENABLE_ALLOWED_HOSTS:-cloud.tenable.com}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?Set CREDENTIAL_ENCRYPTION_KEY in .env}
+      BOOTSTRAP_USER: ${BOOTSTRAP_USER:-admin}
+      BOOTSTRAP_PASSWORD: ${BOOTSTRAP_PASSWORD:?Set BOOTSTRAP_PASSWORD in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    image: shyhotboy/vrap-web:latest
+    ports:
+      - "8181:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  vrap_db:
+    name: vrap_db

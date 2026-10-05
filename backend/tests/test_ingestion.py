@@ -1,0 +1,62 @@
+import asyncio,io
+from types import SimpleNamespace
+import httpx,pytest
+from openpyxl import Workbook
+from app.integrations.tenable import normalize,TenableClient,TenableError
+from app.imports.parser import parse_file, normalize as normalize_import, MAX_BYTES, MAX_ROWS
+
+def test_missing_fields():
+    d=normalize({'asset':{'uuid':'123','hostname':['asset']},'plugin':{'id':123,'name':'Test'},'port':{'port':443,'protocol':'TCP'}})
+    assert d.kev is None and d.cvss is None and d.vpr is None
+    assert d.hostname=='asset' and d.port==443
+
+def test_export_chunks_safe_errors():
+    config=SimpleNamespace(tenable_base_url='https://cloud.tenable.com',tenable_allowed_hosts='cloud.tenable.com',tenable_access_key='PRIVATE',tenable_secret_key='SECRET')
+    def respond(request):
+        if request.method=='POST':
+            assert b'"since":0' in request.content
+            return httpx.Response(200,json={'export_uuid':'abc-123'})
+        if request.url.path.endswith('/status'):return httpx.Response(200,json={'status':'FINISHED','chunks_available':[3,1]})
+        return httpx.Response(200,json=[{'chunk':request.url.path[-1]}])
+    async def run():
+        c=TenableClient(config,httpx.MockTransport(respond));chunks=[chunk async for chunk in c.export('vulnerabilities')]
+        assert chunks==[[{'chunk':'3'}],[{'chunk':'1'}]];await c.close()
+        c=TenableClient(config,httpx.MockTransport(lambda _:httpx.Response(403,text='SECRET')))
+        with pytest.raises(TenableError) as exc:await c.test()
+        assert 'SECRET' not in str(exc.value);await c.close()
+    asyncio.run(run())
+def test_reject_host():
+    c=SimpleNamespace(tenable_base_url='http://127.0.0.1',tenable_allowed_hosts='cloud.tenable.com',tenable_access_key='x',tenable_secret_key='y')
+    with pytest.raises(TenableError):TenableClient(c)
+def test_xlsx_formulas():
+    w=Workbook();s=w.active;s.append(['Host','Plugin']);s.append(['server','Test']);b=io.BytesIO();w.save(b)
+    h,r=parse_file('a.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',b.getvalue());assert len(r)==1
+    s.append(['server','=1+1']);b=io.BytesIO();w.save(b)
+    with pytest.raises(ValueError,match='Formulas'):parse_file('a.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',b.getvalue())
+def test_csv_limits():
+    assert MAX_BYTES == 100 * 1024 * 1024 and MAX_BYTES > 60 * 1024 * 1024
+    assert MAX_ROWS == 100000
+    with pytest.raises(ValueError):parse_file('a.csv','text/csv',b'Host,Host\na,b')
+    with pytest.raises(ValueError):parse_file('a.csv','application/octet-stream',b'Host,Plugin\na,b')
+
+def test_tenable_csv_value_normalization():
+    mapping={'hostname':'asset.name','ip':'asset.display_ipv4_address','name':'definition.name',
+             'exploit_available':'definition.exploitability_ease','kev':'definition.vpr.drivers_on_cisa_kev',
+             'first_seen':'first_observed','last_seen':'last_seen','protocol':'protocol'}
+    base={'asset.name':'server-1','asset.display_ipv4_address':'10.0.0.1','definition.name':'Finding',
+          'definition.vpr.drivers_on_cisa_kev':'false','first_observed':'2026-09-29T08:06:52.386Z',
+          'last_seen':'2026-09-30T04:18:20.359Z','protocol':'TCP'}
+    available=normalize_import({**base,'definition.exploitability_ease':'AVAILABLE'},mapping)
+    assert available.exploit_available is True and available.kev is False
+    assert available.first_seen.isoformat()=='2026-09-29' and available.last_seen.isoformat()=='2026-09-30'
+    assert available.protocol=='tcp'
+    not_required=normalize_import({**base,'definition.exploitability_ease':'NOT_REQUIRED'},mapping)
+    assert not_required.exploit_available is None
+    many_cves=normalize_import({**base,'definition.exploitability_ease':'NOT_AVAILABLE',
+                                'definition.cve':', '.join(f'CVE-2026-{i:04}' for i in range(628))},
+                               {**mapping,'cves':'definition.cve'})
+    assert len(many_cves.cves)==628
+
+def test_tenable_asset_tags_are_normalized_for_rules():
+    data=normalize_import({'asset.name':'server-1','asset.tags':'[{"category":"Location","value":"OWB - Data Center"},{"category":"Patching Group","value":"Windows_Server_Prod_A"},{"category":"Application","value":"JCOM"}]'}, {'hostname':'asset.name','asset_tags':'asset.tags','name':'asset.name'})
+    assert data.asset_tags==['location:OWB - Data Center','patching_group:Windows_Server_Prod_A','application:JCOM']

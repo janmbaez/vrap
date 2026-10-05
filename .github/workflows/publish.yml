@@ -1,0 +1,49 @@
+name: Build and publish VRAP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r backend/requirements.txt
+      - run: pip install pytest
+      - run: pytest -q backend/tests
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            shyhotboy/vrap-api:latest
+            shyhotboy/vrap-api:${{ github.sha }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            shyhotboy/vrap-web:latest
+            shyhotboy/vrap-web:${{ github.sha }}
+      - name: Tell Portainer to redeploy
+        if: ${{ secrets.PORTAINER_WEBHOOK_URL != '' }}
+        run: curl --fail --retry 3 --silent --show-error -X POST '${{ secrets.PORTAINER_WEBHOOK_URL }}'
