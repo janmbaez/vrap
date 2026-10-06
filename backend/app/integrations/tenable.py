@@ -50,7 +50,9 @@ class TenableClient:
 
     async def export(self, kind):
         path = '/vulns/export' if kind == 'vulnerabilities' else '/assets/export'
-        payload = {'num_assets': 500, 'filters': {'since': 0}} if kind == 'vulnerabilities' else {'chunk_size': 500}
+        # Vulnerability records can include large plugin output. Smaller asset groups
+        # keep a single response below the bounded connector memory limit.
+        payload = {'num_assets': 100, 'filters': {'since': 0}} if kind == 'vulnerabilities' else {'chunk_size': 500}
         job = await self.request('POST', path, json=payload)
         export_id = job.get('export_uuid')
         if not isinstance(export_id, str) or not export_id or any(c not in '0123456789abcdefABCDEF-' for c in export_id):

@@ -30,6 +30,7 @@ def test_export_chunks_safe_errors():
     def respond(request):
         if request.method=='POST':
             assert b'"since":0' in request.content
+            assert b'"num_assets":100' in request.content
             return httpx.Response(200,json={'export_uuid':'abc-123'})
         if request.url.path.endswith('/status'):return httpx.Response(200,json={'status':'FINISHED','chunks_available':[3,1]})
         return httpx.Response(200,json=[{'chunk':request.url.path[-1]}])
