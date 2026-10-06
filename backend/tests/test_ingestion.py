@@ -15,7 +15,7 @@ def test_missing_fields():
 
 def test_tenable_chunk_limit_matches_import_limit():
     assert MAX_TENABLE_CHUNK_BYTES == 100 * 1024 * 1024
-    assert MAX_ACTIONABLE_VULNERABILITIES == 100000
+    assert MAX_ACTIONABLE_VULNERABILITIES == 500000
 
 def test_tenable_info_severity_is_normalized():
     data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},
