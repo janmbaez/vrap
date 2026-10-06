@@ -10,6 +10,12 @@ def test_missing_fields():
     assert d.kev is None and d.cvss is None and d.vpr is None
     assert d.hostname=='asset' and d.port==443
 
+def test_tenable_info_severity_is_normalized():
+    data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},
+                      'plugin': {'id': 123, 'name': 'Test'},
+                      'severity': 'Info'})
+    assert data.severity == 'Informational'
+
 def test_export_chunks_safe_errors():
     config=SimpleNamespace(tenable_base_url='https://cloud.tenable.com',tenable_allowed_hosts='cloud.tenable.com',tenable_access_key='PRIVATE',tenable_secret_key='SECRET')
     def respond(request):

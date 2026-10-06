@@ -99,6 +99,22 @@ def optional_bool(value):
         return False
     return None
 
+def canonical_severity(value):
+    """Map Tenable's export labels to the application's risk taxonomy."""
+    if isinstance(value, int):
+        return ['Informational', 'Low', 'Medium', 'High', 'Critical'][value] if value in range(5) else None
+    if value is None:
+        return None
+    labels = {
+        'info': 'Informational',
+        'informational': 'Informational',
+        'low': 'Low',
+        'medium': 'Medium',
+        'high': 'High',
+        'critical': 'Critical',
+    }
+    return labels.get(str(value).strip().casefold())
+
 def normalize(record):
     plugin = record.get('plugin') or record.get('definition') or {}
     asset = record.get('asset') or {}
@@ -108,10 +124,7 @@ def normalize(record):
     port = record.get('port') or {}
     if not isinstance(port, dict):
         port = {'port': port}
-    severity = record.get('severity')
-    if isinstance(severity, int):
-        severity = ['Informational', 'Low', 'Medium', 'High', 'Critical'][severity] if severity in range(5) else None
-    severity = str(severity).capitalize() if severity is not None else None
+    severity = canonical_severity(record.get('severity'))
     cves = plugin.get('cve') or plugin.get('cves') or []
     if isinstance(cves, str):
         cves = [cves]
