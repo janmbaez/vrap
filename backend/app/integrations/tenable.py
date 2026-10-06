@@ -115,6 +115,15 @@ def canonical_severity(value):
     }
     return labels.get(str(value).strip().casefold())
 
+def cvss_vector_value(value):
+    """Extract the machine-readable vector from either Tenable export shape."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return None
+    strings = [item for item in value.values() if isinstance(item, str)]
+    return next((item for item in strings if item.upper().startswith('CVSS:')), None)
+
 def normalize(record):
     plugin = record.get('plugin') or record.get('definition') or {}
     asset = record.get('asset') or {}
@@ -133,7 +142,7 @@ def normalize(record):
         ip=first(asset.get('ipv4')), os=first(asset.get('operating_system')), asset_tags=asset.get('tags') or [],
         name=str(plugin.get('name') or ''), plugin_id=str(plugin.get('id')) if plugin.get('id') is not None else None,
         cves=cves, severity=severity, cvss=optional_score(plugin.get('cvss3_base_score') or plugin.get('cvss_v3_base_score')),
-        vpr=optional_score(vpr.get('score')), cvss_vector=plugin.get('cvss3_vector'),
+        vpr=optional_score(vpr.get('score')), cvss_vector=cvss_vector_value(plugin.get('cvss3_vector')),
         exploit_available=optional_bool(plugin.get('exploit_available')), kev=optional_bool(plugin.get('in_the_news_cisa') if 'in_the_news_cisa' in plugin else plugin.get('cisa_kev')),
         exploit_maturity=vpr.get('drivers', {}).get('exploit_code_maturity') if isinstance(vpr.get('drivers'), dict) else None,
         first_seen=date_value(record.get('first_found')), last_seen=date_value(record.get('last_found')),

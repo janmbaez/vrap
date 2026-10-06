@@ -16,6 +16,12 @@ def test_tenable_info_severity_is_normalized():
                       'severity': 'Info'})
     assert data.severity == 'Informational'
 
+def test_tenable_cvss_vector_object_is_accepted():
+    data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},
+                      'plugin': {'id': 123, 'name': 'Test',
+                                 'cvss3_vector': {'version': '3.1', 'vector': 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'}}})
+    assert data.cvss_vector == 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'
+
 def test_export_chunks_safe_errors():
     config=SimpleNamespace(tenable_base_url='https://cloud.tenable.com',tenable_allowed_hosts='cloud.tenable.com',tenable_access_key='PRIVATE',tenable_secret_key='SECRET')
     def respond(request):
