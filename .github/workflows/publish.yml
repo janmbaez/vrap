@@ -13,6 +13,20 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: backend
+      VRAP_TEST_DATABASE_URL: postgresql+psycopg://vrap_test@127.0.0.1:5432/vrap_migration_test
+      VRAP_CAMPAIGN_DATABASE_URL: postgresql+psycopg://vrap_test@127.0.0.1:5432/vrap_campaign_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: vrap_test
+          POSTGRES_DB: vrap_migration_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vrap_test -d vrap_migration_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,11 +34,27 @@ jobs:
           python-version: '3.13'
       - run: pip install -r backend/requirements.txt
       - run: pip install pytest
+      - name: Prepare isolated campaign test database
+        run: python -c "import psycopg; connection = psycopg.connect('host=127.0.0.1 user=vrap_test dbname=postgres', autocommit=True); connection.execute('CREATE DATABASE vrap_campaign_test'); connection.close()"
       - run: PYTHONPATH=. pytest -q tests
         working-directory: backend
 
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
   publish:
-    needs: test
+    needs: [test, frontend]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +66,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: ./backend
+          platforms: linux/amd64
           push: true
           tags: |
             shyhotboy/vrap-api:latest
@@ -43,6 +74,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: ./frontend
+          platforms: linux/amd64
           push: true
           tags: |
             shyhotboy/vrap-web:latest
