@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import select, update, func, case, cast, Float
+from sqlalchemy import select, update, func, case, cast, Float, or_
 from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
@@ -9,6 +9,7 @@ from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCre
 from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
+from ..query import finding_query, validate_filters
 
 router = APIRouter(tags=['Workbench'])
 
@@ -20,6 +21,7 @@ def saved_filters(request: Request, user=Depends(require_user), db=Depends(get_d
 
 @router.post('/saved-filters', status_code=201)
 def save_filter(data: SavedFilterInput, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    validate_filters(data.filters)
     existing = db.scalar(select(SavedFilter).where(SavedFilter.workspace == request.state.session.workspace,
                                                     SavedFilter.user_id == user.id, SavedFilter.name == data.name))
     if existing:
@@ -40,30 +42,13 @@ def delete_filter(id: int, request: Request, user=Depends(require_user), db=Depe
     return {'deleted': id}
 
 @router.get('/findings')
-def findings(request: Request, q: str = '', severity: str = '', source: str = '', status: str = '', residual: str = '', inherent: str = '', appetite: str = '', business: str = '', classification: str = '', regulatory: str = '', limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
-    statement = select(Finding).join(Asset).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == request.state.session.workspace).order_by(Finding.id)
-    if source:
-        statement = statement.where(Finding.source == source)
-    if q:
-        statement = statement.where((Asset.hostname.ilike(f'%{q}%')) | (Vulnerability.name.ilike(f'%{q}%')) | (Vulnerability.plugin_id.ilike(f'%{q}%')) | (Vulnerability.cves.cast(Text).ilike(f'%{q}%')))
-    if severity:
-        statement = statement.where(func.coalesce(Finding.observed['severity'].as_string(), Vulnerability.technical['severity'].as_string()) == severity)
-    # Apply contextual and saved-score filters in SQL. This keeps a deliberate
-    # Search action responsive even with tens of thousands of findings.
-    if any((status, residual, inherent, appetite)):
-        latest_ids = (select(Assessment.instance_id, func.max(Assessment.id).label('assessment_id'))
-                      .group_by(Assessment.instance_id).subquery())
-        statement = (statement.outerjoin(latest_ids, latest_ids.c.instance_id == Finding.id)
-                      .outerjoin(Assessment, Assessment.id == latest_ids.c.assessment_id)
-                      .outerjoin(RiskScore, RiskScore.assessment_id == Assessment.id))
-        if status:
-            statement = statement.where(Assessment.id.is_(None) if status == 'Not Assessed' else Assessment.status == status)
-        if residual: statement = statement.where(RiskScore.result['residual_level'].as_string() == residual)
-        if inherent: statement = statement.where(RiskScore.result['inherent_level'].as_string() == inherent)
-        if appetite: statement = statement.where(RiskScore.result['above_appetite'].as_boolean() == (appetite == 'Above'))
-    if business: statement = statement.where(Asset.context['business_criticality'].as_string() == business)
-    if classification: statement = statement.where(Asset.context['data_classification'].as_string() == classification)
-    if regulatory: statement = statement.where(Asset.context['regulatory'].cast(Text).ilike(f'%"{regulatory}"%'))
+def findings(request: Request, q: str = '', severity: str = '', source: str = '', status: str = '', residual: str = '', inherent: str = '', appetite: str = '', business: str = '', classification: str = '', regulatory: str = '', plugin_id: str = '', asset_group: str = '', asset_tag: str = '', business_owner: str = '', it_owner: str = '', application_owner: str = '', limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
+    filters = {key: value for key, value in {
+        'q': q, 'severity': severity, 'source': source, 'status': status, 'residual': residual,
+        'inherent': inherent, 'appetite': appetite, 'business': business, 'classification': classification,
+        'regulatory': regulatory, 'plugin_id': plugin_id, 'asset_group': asset_group, 'asset_tag': asset_tag,
+        'business_owner': business_owner, 'it_owner': it_owner, 'application_owner': application_owner}.items() if value}
+    statement = finding_query(db, request.state.session.workspace, filters).order_by(Finding.id)
     total = db.scalar(select(func.count()).select_from(statement.order_by(None).subquery())) or 0
     page = db.scalars(statement.limit(limit).offset(offset)).all()
     return {'items': [detail(db, finding) for finding in page], 'total': total}
@@ -315,8 +300,18 @@ def add_methodology(data: MethodologyCreate, user=Depends(admin), db=Depends(get
     return {'id': method.id, 'version': method.version}
 
 @router.get('/audit')
-def audit(user=Depends(require_user), db=Depends(get_db)):
-    return [{'id': a.id, 'actor': db.get(User, a.actor_id).username if a.actor_id else 'System', 'action': a.action, 'entity': a.entity, 'entity_id': a.entity_id, 'details': a.details, 'date': a.created_at.isoformat()} for a in db.scalars(select(Audit).order_by(Audit.id.desc()).limit(500))]
+def audit(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    from ..campaigns import visible_campaigns
+    workspace = request.state.session.workspace
+    visible_ids = visible_campaigns(workspace, user).with_only_columns(ReviewCampaign.id)
+    scope = Audit.details['workspace'].as_string()
+    query = (select(Audit, User.username).outerjoin(User, User.id == Audit.actor_id)
+             .where(or_(scope == workspace, scope.is_(None)),
+                    or_(Audit.entity != 'review_campaign', Audit.entity_id.in_(visible_ids)))
+             .order_by(Audit.id.desc()).limit(500))
+    return [{'id': a.id, 'actor': actor or 'System', 'action': a.action, 'entity': a.entity,
+             'entity_id': a.entity_id, 'details': a.details, 'date': a.created_at.isoformat()}
+            for a, actor in db.execute(query)]
 
 @router.get('/users')
 def users(user=Depends(admin), db=Depends(get_db)):

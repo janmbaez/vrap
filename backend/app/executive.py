@@ -81,7 +81,9 @@ def live_exposure(db, workspace, filters, generated):
     for name, value in db.execute(select(base.c.severity, func.count()).group_by(base.c.severity)):
         severity[name if name in severity else 'Unknown'] += value
     residual = {s: 0 for s in SEVERITIES}
-    for name, value in db.execute(select(base.c.result['residual_level'].as_string(), func.count()).where(valid).group_by(base.c.result['residual_level'].as_string())):
+    # Reuse one JSON expression so PostgreSQL sees one bind parameter in SELECT/GROUP BY.
+    residual_level = base.c.result['residual_level'].as_string()
+    for name, value in db.execute(select(residual_level, func.count()).where(valid).group_by(residual_level)):
         residual[name if name in residual else 'Unknown'] += value
     approved = db.scalar(select(func.count(RiskException.id)).where(RiskException.workspace == workspace,
                          RiskException.status == 'Approved', RiskException.expires_at > generated,

@@ -88,9 +88,21 @@ def update_workflow(finding_id: int, data: WorkflowInput, request: Request, user
     if not finding or finding.workspace != _workspace(request): raise HTTPException(404, 'Finding not found')
     _owner(db, data.owner_id); item = db.get(FindingWorkflow, finding_id)
     if not item: item = FindingWorkflow(finding_id=finding_id, updated_by=user.id); db.add(item)
-    item.owner_id, item.status, item.updated_by, item.updated_at = data.owner_id, data.status, user.id, datetime.now(timezone.utc)
-    db.add(Audit(actor_id=user.id, action='workflow.updated', entity='finding', entity_id=finding_id, details=data.model_dump()))
-    db.commit(); return {'finding_id': finding_id, 'status': item.status, 'owner_id': item.owner_id}
+    timestamp = datetime.now(timezone.utc)
+    if data.status == 'Reviewed':
+        previous = {'review_state': item.review_state, 'reviewed_at': item.reviewed_at.isoformat() if item.reviewed_at else None,
+                    'reviewed_by': item.reviewed_by}
+        item.review_state, item.reviewed_at, item.reviewed_by = 'Reviewed', timestamp, user.id
+        item.review_decision, item.review_notes = 'No change required', 'Reviewed from the vulnerabilities worklist'
+        db.add(Audit(actor_id=user.id, action='finding.reviewed', entity='finding', entity_id=finding_id,
+                     details={'workspace': _workspace(request), 'before': previous, 'decision': item.review_decision}))
+    else:
+        item.owner_id, item.status = data.owner_id, data.status
+        db.add(Audit(actor_id=user.id, action='workflow.updated', entity='finding', entity_id=finding_id,
+                     details={**data.model_dump(), 'workspace': _workspace(request)}))
+    item.updated_by, item.updated_at = user.id, timestamp
+    db.commit(); return {'finding_id': finding_id, 'status': item.status, 'owner_id': item.owner_id,
+                         'review_state': item.review_state, 'reviewed_at': item.reviewed_at.isoformat() if item.reviewed_at else None}
 
 @router.get('/exceptions')
 def exceptions(request: Request, user=Depends(require_user), db=Depends(get_db)):
@@ -194,14 +206,17 @@ def executive_report_pdf(request: Request, user=Depends(require_user), db=Depend
 def review_report(request: Request, days: int = 7, user=Depends(require_user), db=Depends(get_db)):
     workspace = _workspace(request); days = max(1, min(days, 366)); since = datetime.now(timezone.utc) - timedelta(days=days)
     total = db.scalar(select(func.count(Finding.id)).where(Finding.workspace == workspace)) or 0
-    reviewed = db.scalar(select(func.count(Finding.id)).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, FindingWorkflow.status == 'Reviewed', FindingWorkflow.updated_at >= since)) or 0
+    review_state = func.coalesce(FindingWorkflow.review_state, FindingWorkflow.status)
+    reviewed_at = func.coalesce(FindingWorkflow.reviewed_at, FindingWorkflow.updated_at)
+    reviewed = db.scalar(select(func.count(Finding.id)).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, review_state == 'Reviewed', reviewed_at >= since)) or 0
     pending = total - reviewed
-    rows = db.execute(select(Finding.id, Asset.hostname, Vulnerability.name, Vulnerability.plugin_id, FindingWorkflow.updated_at).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, FindingWorkflow.status == 'Reviewed', FindingWorkflow.updated_at >= since).order_by(FindingWorkflow.updated_at.desc())).all()
+    rows = db.execute(select(Finding.id, Asset.hostname, Vulnerability.name, Vulnerability.plugin_id, reviewed_at).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, Asset.workspace == workspace, review_state == 'Reviewed', reviewed_at >= since).order_by(reviewed_at.desc())).all()
     return {'workspace': workspace, 'period_days': days, 'since': since.isoformat(), 'generated_at': datetime.now(timezone.utc).isoformat(), 'summary': {'total_findings': total, 'reviewed_in_period': reviewed, 'pending_review': pending, 'coverage_percent': round(reviewed * 100 / total, 1) if total else 0}, 'reviews': [{'finding_id': i, 'asset': h, 'vulnerability': n, 'plugin_id': p, 'reviewed_at': t.isoformat() if t else None} for i,h,n,p,t in rows]}
 
 @router.get('/review-report.csv')
 def review_report_csv(request: Request, days: int = 7, user=Depends(require_user), db=Depends(get_db)):
+    from .campaign_exports import safe_csv_cell
     report = review_report(request, days, user, db); out = StringIO(); out.write('VRAP Operational Vulnerability Review Report\n'); out.write(f"Workspace,{report['workspace']}\nPeriod days,{report['period_days']}\nReviewed in period,{report['summary']['reviewed_in_period']}\nPending review,{report['summary']['pending_review']}\nCoverage percent,{report['summary']['coverage_percent']}\n\nFinding ID,Asset,Vulnerability,Plugin ID,Reviewed At\n")
     for x in report['reviews']:
-        values=[str(x[k] or '').replace('"','""') for k in ('finding_id','asset','vulnerability','plugin_id','reviewed_at')]; out.write(','.join(f'"{v}"' for v in values)+'\n')
+        values=[safe_csv_cell(x[k]).replace('"','""') for k in ('finding_id','asset','vulnerability','plugin_id','reviewed_at')]; out.write(','.join(f'"{v}"' for v in values)+'\n')
     return StreamingResponse(iter([out.getvalue()]), media_type='text/csv', headers={'Content-Disposition': 'attachment; filename=vrap-operational-review.csv'})

@@ -33,6 +33,7 @@ class Context(Strict):
     business_owner: str | None = Field(default=None, max_length=200)
     it_owner: str | None = Field(default=None, max_length=200)
     application_owner: str | None = Field(default=None, max_length=200)
+    asset_group: str | None = Field(default=None, max_length=200)
     inherent_likelihood_override: int | None = Field(default=None, ge=1, le=5)
     inherent_impact_override: int | None = Field(default=None, ge=1, le=5)
     other_controls: str = Field(default='', max_length=5000)
@@ -220,6 +221,7 @@ class AssetUpdate(Strict):
     business_owner: str | None = Field(default=None, max_length=200)
     it_owner: str | None = Field(default=None, max_length=200)
     application_owner: str | None = Field(default=None, max_length=200)
+    asset_group: str | None = Field(default=None, max_length=200)
 
 class SavedFilterInput(Strict):
     name: str = Field(min_length=1, max_length=100)
@@ -228,7 +230,8 @@ class SavedFilterInput(Strict):
     @field_validator('filters')
     @classmethod
     def valid_filters(cls, value):
-        allowed = {'q','severity','residual','inherent','appetite','status','source','business','classification','regulatory'}
+        allowed = {'q','severity','residual','inherent','appetite','status','source','business','classification','regulatory',
+                   'plugin_id','asset_group','asset_tag','business_owner','it_owner','application_owner'}
         if set(value) - allowed or any(len(str(v)) > 300 for v in value.values()):
             raise ValueError('Saved filter contains unsupported fields')
         return {k: v for k, v in value.items() if v}

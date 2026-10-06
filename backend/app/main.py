@@ -7,9 +7,11 @@ from .api.core import router as core_router
 from .api.imports import router as imports_router
 from .api.tenable import router as tenable_router
 from .api.governance import router as governance_router
+from .api.campaigns import router as campaigns_router
+from .api.campaign_exports import router as campaign_exports_router
 
 app = FastAPI(title='VRAP', version='1.0.0', docs_url='/api/docs', openapi_url='/api/openapi.json', redoc_url=None)
-for router in (auth_router, core_router, imports_router, tenable_router, governance_router):
+for router in (auth_router, core_router, imports_router, tenable_router, governance_router, campaigns_router, campaign_exports_router):
     app.include_router(router, prefix='/api')
 
 @app.middleware('http')

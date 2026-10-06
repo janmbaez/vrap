@@ -2,7 +2,7 @@ import hashlib
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy import select
-from .models import Asset, Vulnerability, Finding, Methodology, Assessment, AssessmentControl, RiskScore
+from .models import Asset, Vulnerability, Finding, Methodology, Assessment, AssessmentControl, RiskScore, FindingWorkflow
 from .risk.engine import calculate
 from .asset_rules import resolve_rules, ASSET_CONTEXT_KEYS
 
@@ -70,6 +70,7 @@ def assessment_controls(db, assessment):
 def detail(db, finding):
     asset, vuln = db.get(Asset, finding.asset_id), db.get(Vulnerability, finding.vulnerability_id)
     assessment = latest_assessment(db, finding.id)
+    workflow = db.get(FindingWorkflow, finding.id)
     method = active_methodology(db)
     technical = {**vuln.technical, **finding.observed}
     context = {**finding.observed.get('context', {}), **(assessment.context if assessment else {}),
@@ -86,6 +87,9 @@ def detail(db, finding):
             'controls': list(merged_controls.values()),
             'applied_rules': finding.observed.get('applied_rules', asset.context.get('applied_rules', [])),
             'status': assessment.status if assessment else 'Not Assessed', 'decision': assessment.decision if assessment else 'Needs Further Assessment',
+            'review_state': workflow.review_state if workflow else None,
+            'reviewed_at': workflow.reviewed_at.isoformat() if workflow and workflow.reviewed_at else None,
+            'reviewed_by': workflow.reviewed_by if workflow else None,
             'notes': assessment.notes if assessment else '', 'justification': assessment.justification if assessment else '',
             'assessed_at': assessment.created_at.isoformat() if assessment else None, 'saved_score': saved.result if saved else None,
             'score': saved.result if saved else baseline, 'baseline': baseline,

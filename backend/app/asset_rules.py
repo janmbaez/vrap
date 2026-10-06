@@ -3,7 +3,7 @@ from sqlalchemy import select
 from .models import AssetRule
 
 ASSET_CONTEXT_KEYS = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure',
-                      'business_owner', 'it_owner', 'application_owner'}
+                      'business_owner', 'it_owner', 'application_owner', 'asset_group'}
 
 def matches(rule: AssetRule, hostname: str, ip: str | None, tags: list) -> bool:
     if rule.match_type == 'All assets':

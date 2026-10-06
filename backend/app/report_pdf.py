@@ -56,6 +56,23 @@ def section(title, sheet):
     return p(title, sheet, 'Section')
 
 
+def comparison_table(comparisons, sheet):
+    rows = []
+    for item in comparisons:
+        delta = item['change']
+        arrow = '^' if item.get('arrow') == 'up' else 'v' if item.get('arrow') == 'down' else '='
+        change = 'n/a' if delta is None else f"{arrow} {delta:+.1f} / {item['direction']}"
+        rows.append([item['label'], value(item['current'], item['unit']),
+                     'n/a' if item['previous'] is None else value(item['previous'], item['unit']), change])
+    result = table(['Metric', 'Current', 'Previous', 'Change / direction'], rows, [218, 83, 83, 148.8], sheet)
+    # Paragraphs carry their own colors, so color the change text explicitly.
+    for index, item in enumerate(comparisons, start=1):
+        color = '#087f79' if item['direction'] == 'improved' else '#c74343' if item['direction'] == 'deteriorated' else '#5e7380'
+        style = ParagraphStyle(name=f'Change{index}', parent=sheet['Compact'], textColor=colors.HexColor(color))
+        result._cellvalues[index][3] = Paragraph(text(rows[index - 1][3]), style)
+    return result
+
+
 def cards(items, sheet, columns=4):
     rows = []
     for index in range(0, len(items), columns):
@@ -170,15 +187,18 @@ def build_executive_pdf(data):
     story += [section('Review coverage trend', s), line_chart(gov.get('trends', [])), p('Real saved campaign populations by reporting period. No historical estate risk is reconstructed.', s, 'Muted'),
               section('Current versus previous period', s),
               p(f"Current: {period['start']} to {period['end']}. Previous: {period['previous_start']} to {period['previous_end']}. Changes are percentage points for percentages. No previous population is shown as n/a.", s, 'Muted'),
-              table(['Metric', 'Current', 'Previous', 'Change / direction'], [[r['label'], value(r['current'], r['unit']),
-                    'n/a' if r['previous'] is None else value(r['previous'], r['unit']), 'n/a' if r['change'] is None else f"{r['change']:+.1f} / {r['direction']}"] for r in data['comparisons']], [218, 83, 83, 148.8], s),
+              comparison_table(data['comparisons'], s),
               p('Campaign population entries are campaign-specific review obligations. A finding included in two campaigns represents two review obligations.', s, 'Muted')]
     story += [PageBreak()] + title_block('Review governance and historical risk', data, s)
     story += [section('Operational review governance', s),
               cards([('Reviewed', value(g.get('reviewed', 0))), ('Pending', value(g.get('pending', 0))), ('Skipped', value(g.get('skipped', 0))),
                      ('Processed coverage', value(g.get('processed_coverage'), 'percent'))], s),
               p('Frozen campaign population entries: ' + value(g.get('total', 0)) + '. Reviewed only counts as review coverage; processed coverage includes Skipped.', s, 'Muted'),
-              section('Coverage by severity', s), bar_chart(gov.get('breakdowns', {}).get('severity', []), field='review_coverage', max_value=100, percent=True),
+              section('Review status distribution', s),
+              bar_chart([{'name': name, 'value': g.get(name.lower(), 0)} for name in ('Reviewed', 'Pending', 'Skipped')]),
+              section('Coverage by severity', s), bar_chart(gov.get('breakdowns', {}).get('severity', []), field='review_coverage', max_value=100, percent=True)]
+    story += [PageBreak()] + title_block('Campaign and assessment history', data, s)
+    story += [section('Findings reviewed over time', s), line_chart(gov.get('trends', []), field='reviewed'),
               section('Campaign snapshot average residual risk', s), line_chart(gov.get('risk_trends', []), field='risk_exposure'),
               p('Saved current completed scores at activation only. These campaign populations do not represent a continuous estate risk trend. Null means no scored snapshot population.', s, 'Muted')]
     story += [PageBreak()] + title_block('Ownership and management attention', data, s)
@@ -218,12 +238,12 @@ def build_campaign_pdf(data, findings, evidence, audit):
               for r in m.get('breakdowns', {}).get(dimension, [])], [227.8, 50, 60, 60, 55, 80], s)]
     story += [PageBreak()] + title_block('Appendix: frozen population and review evidence', data, s)
     for finding in findings:
-        story += [section(f"Finding {finding['finding_id']} | {finding['snapshot_asset']}", s),
+        story.append(KeepTogether([section(f"Finding {finding['finding_id']} | {finding['snapshot_asset']}", s),
             p(f"{finding['snapshot_vulnerability']} | Plugin {finding.get('snapshot_plugin_id') or 'Manual'} | Severity {finding['snapshot_severity']} | Snapshot risk {value(finding.get('snapshot_risk'))}", s),
             p(f"Review: {finding['status']} | Reviewer: {finding.get('reviewer') or 'Pending'} | Time: {finding.get('reviewed_at') or 'n/a'} | Decision: {finding.get('decision') or finding.get('skip_reason') or 'n/a'}", s),
             p(f"Business: {finding.get('snapshot_business_owner') or 'Unassigned'} | IT: {finding.get('snapshot_it_owner') or 'Unassigned'} | Application: {finding.get('snapshot_application_owner') or 'Unassigned'} | Asset group: {finding.get('snapshot_asset_group') or 'Unassigned'}", s, 'Compact'),
             p('Tags: ' + ', '.join(map(str, finding.get('snapshot_tags', []))) + '\nRegulatory: ' + ', '.join(map(str, finding.get('snapshot_regulatory', []))), s, 'Compact'),
-            p('Notes: ' + (finding.get('notes') or 'None') + '\nEvidence references: ' + '\n'.join(finding.get('evidence_references', [])), s, 'Compact')]
+            p('Notes: ' + (finding.get('notes') or 'None') + '\nEvidence references: ' + '\n'.join(finding.get('evidence_references', [])), s, 'Compact')]))
     story += [PageBreak(), section('Campaign evidence references', s),
               table(['Finding', 'Reference / note', 'Added by / time'], [[r.get('finding_id') or 'Campaign', r.get('reference', '') + '\n' + r.get('notes', ''), r['actor'] + '\n' + r['created_at']] for r in evidence], [70, 302.8, 160], s),
               section('Audit trail', s), table(['When / actor', 'Action', 'Previous / new values and population references'],
