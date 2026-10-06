@@ -2,7 +2,7 @@ from copy import deepcopy
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,Audit,ImportRow,IntegrationSettings
+from app.models import Assessment,Audit,ImportRow,IntegrationSettings,User
 from app.risk.policy import DEFAULT
 from conftest import login
 DATA={'hostname':'TEST-01','name':'Synthetic RCE','plugin_id':'test-100','severity':'Critical','cvss':9.8,'vpr':9.4}
@@ -19,6 +19,22 @@ def test_auth_rbac_csrf(client):
     login(client); client.headers.pop('X-CSRF-Token')
     assert client.post('/api/findings',json=DATA).status_code==403
     assert client.post('/api/auth/login',headers={'Origin':'https://evil.example'},json={'username':'admin','password':'Test-password-123!'}).status_code==403
+
+def test_administrator_can_change_role_and_audit_it(client, db):
+    login(client)
+    analyst = client.get('/api/users').json()[1]
+    changed = client.patch(f"/api/users/{analyst['id']}/role", json={'role':'Viewer'})
+    assert changed.status_code == 200 and changed.json()['role'] == 'Viewer'
+    audit = db.scalar(select(Audit).where(Audit.action == 'user.role_changed'))
+    assert audit.details['before'] == 'Security Analyst' and audit.details['after'] == 'Viewer'
+    login(client, 'viewer')
+    assert client.patch(f"/api/users/{analyst['id']}/role", json={'role':'Administrator'}).status_code == 403
+
+def test_final_administrator_cannot_be_demoted(client, db):
+    db.query(User).filter_by(username='analyst').update({'role':'Viewer'})
+    db.commit(); login(client)
+    admin_id = client.get('/api/users').json()[0]['id']
+    assert client.patch(f"/api/users/{admin_id}/role", json={'role':'Viewer'}).status_code == 409
 
 def test_atomic_revision_and_replay(client,db):
     login(client); f=create(client); payload=body(f)

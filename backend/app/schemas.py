@@ -15,6 +15,9 @@ class UserCreate(Login):
     password: str = Field(min_length=14, max_length=256)
     role: Literal['Administrator', 'Security Analyst', 'Viewer']
 
+class UserRoleUpdate(Strict):
+    role: Literal['Administrator', 'Security Analyst', 'Viewer']
+
 class Context(Strict):
     asset_criticality: Literal['Low', 'Medium', 'High', 'Critical'] | None = None
     business_criticality: Literal['Low', 'Medium', 'High', 'Critical'] | None = None

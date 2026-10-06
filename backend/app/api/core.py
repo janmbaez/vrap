@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, AssetUpdate, AssetRuleInput, SavedFilterInput
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetRuleInput, SavedFilterInput
 from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -327,3 +327,21 @@ def add_user(data: UserCreate, user=Depends(admin), db=Depends(get_db)):
     db.add(Audit(actor_id=user.id, action='user.created', entity='user', entity_id=new.id, details={'role': new.role}))
     db.commit()
     return {'id': new.id, 'username': new.username, 'role': new.role}
+
+@router.patch('/users/{user_id}/role')
+def change_user_role(user_id: int, data: UserRoleUpdate, user=Depends(admin), db=Depends(get_db)):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, 'User not found')
+    before = target.role
+    if before == data.role:
+        return {'id': target.id, 'username': target.username, 'role': target.role, 'active': target.active}
+    if before == 'Administrator' and data.role != 'Administrator':
+        administrator_count = db.scalar(select(func.count(User.id)).where(User.role == 'Administrator', User.active == True)) or 0
+        if administrator_count <= 1:
+            raise HTTPException(409, 'Keep at least one active Administrator account')
+    target.role = data.role
+    db.add(Audit(actor_id=user.id, action='user.role_changed', entity='user', entity_id=target.id,
+                 details={'username': target.username, 'before': before, 'after': data.role}))
+    db.commit()
+    return {'id': target.id, 'username': target.username, 'role': target.role, 'active': target.active}
