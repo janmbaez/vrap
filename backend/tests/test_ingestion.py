@@ -2,13 +2,16 @@ import asyncio,io
 from types import SimpleNamespace
 import httpx,pytest
 from openpyxl import Workbook
-from app.integrations.tenable import normalize,TenableClient,TenableError
+from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES
 from app.imports.parser import parse_file, normalize as normalize_import, MAX_BYTES, MAX_ROWS
 
 def test_missing_fields():
     d=normalize({'asset':{'uuid':'123','hostname':['asset']},'plugin':{'id':123,'name':'Test'},'port':{'port':443,'protocol':'TCP'}})
     assert d.kev is None and d.cvss is None and d.vpr is None
     assert d.hostname=='asset' and d.port==443
+
+def test_tenable_chunk_limit_matches_import_limit():
+    assert MAX_TENABLE_CHUNK_BYTES == 100 * 1024 * 1024
 
 def test_tenable_info_severity_is_normalized():
     data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},

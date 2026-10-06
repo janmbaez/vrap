@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 import httpx
 from ..schemas import FindingCreate
 
+# Keep connector exports consistent with the documented interactive-import limit.
+MAX_TENABLE_CHUNK_BYTES = 100 * 1024 * 1024
+
 class TenableError(Exception):
     pass
 
@@ -34,8 +37,8 @@ class TenableClient:
                     continue
             if response.status_code >= 300:
                 raise TenableError(f'Tenable returned HTTP {response.status_code}; verify API permissions and configuration')
-            if len(response.content) > 30 * 1024 * 1024:
-                raise TenableError('Tenable chunk exceeded the configured 30 MiB limit')
+            if len(response.content) > MAX_TENABLE_CHUNK_BYTES:
+                raise TenableError('Tenable chunk exceeded the configured 100 MiB limit')
             try:
                 return response.json()
             except ValueError:
