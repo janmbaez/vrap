@@ -12,6 +12,7 @@ from ..integrations.tenable import TenableClient, TenableError, normalize, first
 from ..schemas import TenableConfiguration
 
 router = APIRouter(prefix='/tenable', tags=['Tenable'])
+MAX_ACTIONABLE_VULNERABILITIES = 100000
 
 def cipher():
     key = settings().credential_encryption_key
@@ -99,8 +100,8 @@ async def run_sync(job_id, actor_id):
                             counts['informational_skipped'] += 1
                             continue
                         counts['received'] += 1
-                        if counts['received'] > 50000:
-                            raise TenableError('Sync limit of 50,000 actionable vulnerabilities exceeded; use a durable worker for larger exports')
+                        if counts['received'] > MAX_ACTIONABLE_VULNERABILITIES:
+                            raise TenableError('Sync limit of 100,000 actionable vulnerabilities exceeded; narrow the Tenable export or use a durable worker for larger exports')
                         _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True, workspace=job.workspace, actor_id=actor_id)
                     else:
                         counts['received'] += 1

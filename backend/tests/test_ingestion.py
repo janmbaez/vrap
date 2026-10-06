@@ -5,6 +5,7 @@ from openpyxl import Workbook
 from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES,normalized_asset_tags
 from app.services import ingest
 from app.models import FindingWorkflow
+from app.api.tenable import MAX_ACTIONABLE_VULNERABILITIES
 from app.imports.parser import parse_file, normalize as normalize_import, MAX_BYTES, MAX_ROWS
 
 def test_missing_fields():
@@ -14,6 +15,7 @@ def test_missing_fields():
 
 def test_tenable_chunk_limit_matches_import_limit():
     assert MAX_TENABLE_CHUNK_BYTES == 100 * 1024 * 1024
+    assert MAX_ACTIONABLE_VULNERABILITIES == 100000
 
 def test_tenable_info_severity_is_normalized():
     data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},
