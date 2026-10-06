@@ -2,7 +2,9 @@ import asyncio,io
 from types import SimpleNamespace
 import httpx,pytest
 from openpyxl import Workbook
-from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES
+from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES,normalized_asset_tags
+from app.services import ingest
+from app.models import FindingWorkflow
 from app.imports.parser import parse_file, normalize as normalize_import, MAX_BYTES, MAX_ROWS
 
 def test_missing_fields():
@@ -18,6 +20,9 @@ def test_tenable_info_severity_is_normalized():
                       'plugin': {'id': 123, 'name': 'Test'},
                       'severity': 'Info'})
     assert data.severity == 'Informational'
+
+def test_tenable_asset_tag_objects_are_normalized():
+    assert normalized_asset_tags([{'category':'Patching Group','value':'Windows Servers'}, {'category_name':'Application','value_name':'VRAP'}]) == ['patching_group:Windows Servers', 'application:VRAP']
 
 def test_tenable_cvss_vector_object_is_accepted():
     data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},
@@ -76,3 +81,18 @@ def test_tenable_csv_value_normalization():
 def test_tenable_asset_tags_are_normalized_for_rules():
     data=normalize_import({'asset.name':'server-1','asset.tags':'[{"category":"Location","value":"OWB - Data Center"},{"category":"Patching Group","value":"Windows_Server_Prod_A"},{"category":"Application","value":"JCOM"}]'}, {'hostname':'asset.name','asset_tags':'asset.tags','name':'asset.name'})
     assert data.asset_tags==['location:OWB - Data Center','patching_group:Windows_Server_Prod_A','application:JCOM']
+
+def test_tenable_lifecycle_updates_one_finding_and_preserves_review(db):
+    original={'finding_id':'stable-1'}
+    active=normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':443,'protocol':'tcp'},'severity':'High','state':'ACTIVE','finding_id':'stable-1'})
+    finding,created=ingest(db,active,'Tenable',original,update_existing=True,actor_id=1)
+    assert created
+    db.add(FindingWorkflow(finding_id=finding.id,status='Reviewed',review_state='Reviewed',updated_by=1,reviewed_by=1)); db.flush()
+    closed=normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':0,'protocol':'tcp'},'severity':'High','state':'FIXED','finding_id':'stable-1'})
+    same,created=ingest(db,closed,'Tenable',{'finding_id':'stable-1'},update_existing=True,actor_id=1)
+    assert same.id == finding.id and not created
+    assert db.get(FindingWorkflow,finding.id).status == 'Closed'
+    assert db.get(FindingWorkflow,finding.id).review_state == 'Reviewed'
+    reopened=normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':0,'protocol':'tcp'},'severity':'High','state':'ACTIVE','finding_id':'stable-1'})
+    same,created=ingest(db,reopened,'Tenable',{'finding_id':'stable-1'},update_existing=True,actor_id=1)
+    assert same.id == finding.id and not created and db.get(FindingWorkflow,finding.id).status == 'New'

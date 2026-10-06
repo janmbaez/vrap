@@ -16,7 +16,7 @@ def active_methodology(db):
 def identity(data):
     return ('plugin:' + data.plugin_id) if data.plugin_id else 'manual:' + hashlib.sha256((data.name.casefold() + '|' + ','.join(sorted(data.cves))).encode()).hexdigest()
 
-def ingest(db, data, source='Manual', original=None, update_existing=False, workspace='Production'):
+def ingest(db, data, source='Manual', original=None, update_existing=False, workspace='Production', actor_id=None):
     asset = db.scalar(select(Asset).where(Asset.external_id == data.external_id, Asset.workspace == workspace)) if data.external_id else None
     if not asset:
         asset = db.scalar(select(Asset).where(Asset.hostname == data.hostname.lower(), Asset.workspace == workspace))
@@ -37,13 +37,35 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
         vuln = Vulnerability(identity=identity(data), name=data.name, plugin_id=data.plugin_id, cves=data.cves, technical=tech)
         db.add(vuln)
         db.flush()
-    finding = db.scalar(select(Finding).where(Finding.asset_id == asset.id, Finding.vulnerability_id == vuln.id, Finding.port == data.port, Finding.protocol == data.protocol))
+    finding = None
+    # Tenable's finding_id is stable across lifecycle changes, including a port
+    # change. Prefer it so a fixed or resurfaced finding updates its history.
+    upstream_id = str(original.get('finding_id')) if source == 'Tenable' and isinstance(original, dict) and original.get('finding_id') is not None else None
+    if upstream_id:
+        for candidate in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.vulnerability_id == vuln.id)):
+            if str((candidate.source_record or {}).get('finding_id')) == upstream_id:
+                finding = candidate
+                break
+    if not finding:
+        finding = db.scalar(select(Finding).where(Finding.asset_id == asset.id, Finding.vulnerability_id == vuln.id, Finding.port == data.port, Finding.protocol == data.protocol))
     if finding:
         if update_existing:
             finding.observed = {**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
                                 'default_controls': default_controls, 'applied_rules': applied_rules}
             finding.source_record = original or data.model_dump(mode='json')
             finding.revision += 1
+            if source == 'Tenable' and actor_id is not None:
+                lifecycle = str(data.state or '').strip().casefold()
+                closed = lifecycle in {'closed', 'fixed', 'resolved'}
+                workflow = db.get(FindingWorkflow, finding.id)
+                if closed:
+                    if not workflow:
+                        workflow = FindingWorkflow(finding_id=finding.id, status='Closed', updated_by=actor_id)
+                        db.add(workflow)
+                    else:
+                        workflow.status, workflow.updated_by = 'Closed', actor_id
+                elif workflow and workflow.status == 'Closed':
+                    workflow.status, workflow.updated_by = 'New', actor_id
         return finding, False
     finding = Finding(asset_id=asset.id, vulnerability_id=vuln.id, source=source, port=data.port, protocol=data.protocol, workspace=workspace,
                       source_record=original or data.model_dump(mode='json'), observed={**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,

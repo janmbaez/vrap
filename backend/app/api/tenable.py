@@ -8,7 +8,7 @@ from ..config import settings
 from ..db import get_db, SessionLocal
 from ..models import SyncJob, IntegrationSettings, Audit, Asset, now
 from ..services import ingest
-from ..integrations.tenable import TenableClient, TenableError, normalize, first
+from ..integrations.tenable import TenableClient, TenableError, normalize, first, canonical_severity, normalized_asset_tags
 from ..schemas import TenableConfiguration
 
 router = APIRouter(prefix='/tenable', tags=['Tenable'])
@@ -89,15 +89,21 @@ async def run_sync(job_id, actor_id):
             job = db.get(SyncJob, job_id)
             state = db.get(IntegrationSettings, 1)
             client = TenableClient(client_config(state) if state and state.access_key_encrypted else settings())
-            counts = {'received': 0, 'created': 0, 'updated': 0}
+            counts = {'received': 0, 'created': 0, 'updated': 0, 'informational_skipped': 0}
             async for rows in client.export(job.kind):
                 for row in rows:
-                    counts['received'] += 1
-                    if counts['received'] > 50000:
-                        raise TenableError('MVP sync limit of 50,000 records exceeded; use a durable worker for larger exports')
                     if job.kind == 'vulnerabilities':
-                        _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True, workspace=job.workspace)
+                        # Filter before accounting: informational records never consume
+                        # capacity or create/update a VRAP finding.
+                        if canonical_severity(row.get('severity')) == 'Informational':
+                            counts['informational_skipped'] += 1
+                            continue
+                        counts['received'] += 1
+                        if counts['received'] > 50000:
+                            raise TenableError('Sync limit of 50,000 actionable vulnerabilities exceeded; use a durable worker for larger exports')
+                        _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True, workspace=job.workspace, actor_id=actor_id)
                     else:
+                        counts['received'] += 1
                         external = row.get('id') or row.get('uuid')
                         if not external:
                             raise TenableError('Asset export is missing an identifier')
@@ -107,7 +113,7 @@ async def run_sync(job_id, actor_id):
                         if not asset:
                             asset = Asset(hostname=str(host).lower(), external_id=external, workspace=job.workspace)
                             db.add(asset)
-                        asset.external_id, asset.ip, asset.os, asset.tags = external, first(row.get('ipv4s')), first(row.get('operating_systems')), row.get('tags') or []
+                        asset.external_id, asset.ip, asset.os, asset.tags = external, first(row.get('ipv4s')), first(row.get('operating_systems')), normalized_asset_tags(row.get('tags'))
                     counts['created' if created else 'updated'] += 1
             job.status, job.counts, job.finished_at = 'Succeeded', counts, now()
             db.add(Audit(actor_id=actor_id, action='tenable.synced', entity='sync', entity_id=job.id, details=counts))

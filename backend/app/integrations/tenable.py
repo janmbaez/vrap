@@ -129,6 +129,24 @@ def cvss_vector_value(value):
     strings = [item for item in value.values() if isinstance(item, str)]
     return next((item for item in strings if item.upper().startswith('CVSS:')), None)
 
+def normalized_asset_tags(value):
+    """Turn Tenable tag objects into stable, human-readable asset tags."""
+    items = value if isinstance(value, list) else [value]
+    output = []
+    for item in items:
+        if isinstance(item, str):
+            tag = item.strip()
+        elif isinstance(item, dict):
+            category = item.get('category') or item.get('category_name') or item.get('key') or ''
+            name = item.get('value') or item.get('value_name') or item.get('name') or item.get('tag_name') or ''
+            category, name = str(category).strip(), str(name).strip()
+            tag = f'{category.casefold().replace(" ", "_")}:{name}' if category and name else name or category
+        else:
+            tag = ''
+        if tag:
+            output.append(tag[:500])
+    return list(dict.fromkeys(output))[:100]
+
 def normalize(record):
     plugin = record.get('plugin') or record.get('definition') or {}
     asset = record.get('asset') or {}
@@ -144,7 +162,7 @@ def normalize(record):
         cves = [cves]
     hostname = first(asset.get('hostname')) or first(asset.get('fqdn')) or first(asset.get('ipv4')) or asset.get('uuid') or asset.get('id')
     return FindingCreate(hostname=str(hostname or ''), external_id=str(asset.get('uuid') or asset.get('id') or '') or None,
-        ip=first(asset.get('ipv4')), os=first(asset.get('operating_system')), asset_tags=asset.get('tags') or [],
+        ip=first(asset.get('ipv4')), os=first(asset.get('operating_system')), asset_tags=normalized_asset_tags(asset.get('tags')),
         name=str(plugin.get('name') or ''), plugin_id=str(plugin.get('id')) if plugin.get('id') is not None else None,
         cves=cves, severity=severity, cvss=optional_score(plugin.get('cvss3_base_score') or plugin.get('cvss_v3_base_score')),
         vpr=optional_score(vpr.get('score')), cvss_vector=cvss_vector_value(plugin.get('cvss3_vector')),
