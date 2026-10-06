@@ -13,6 +13,7 @@ from ..schemas import TenableConfiguration
 
 router = APIRouter(prefix='/tenable', tags=['Tenable'])
 MAX_ACTIONABLE_VULNERABILITIES = 500000
+PROGRESS_COMMIT_INTERVAL = 250
 
 def cipher():
     key = settings().credential_encryption_key
@@ -90,7 +91,9 @@ async def run_sync(job_id, actor_id):
             job = db.get(SyncJob, job_id)
             state = db.get(IntegrationSettings, 1)
             client = TenableClient(client_config(state) if state and state.access_key_encrypted else settings())
-            counts = {'received': 0, 'created': 0, 'updated': 0, 'informational_skipped': 0}
+            counts = {'received': 0, 'created': 0, 'updated': 0, 'informational_skipped': 0,
+                      'batches_processed': 0, 'progress_percent': 0}
+            since_commit = 0
             async for rows in client.export(job.kind):
                 for row in rows:
                     if job.kind == 'vulnerabilities':
@@ -116,6 +119,31 @@ async def run_sync(job_id, actor_id):
                             db.add(asset)
                         asset.external_id, asset.ip, asset.os, asset.tags = external, first(row.get('ipv4s')), first(row.get('operating_systems')), normalized_asset_tags(row.get('tags'))
                     counts['created' if created else 'updated'] += 1
+                    since_commit += 1
+                    if since_commit >= PROGRESS_COMMIT_INTERVAL:
+                        # Publish partial findings and visible job progress while the
+                        # export continues. This avoids a long all-or-nothing wait.
+                        job.counts = dict(counts)
+                        db.commit()
+                        db.refresh(job)
+                        if job.status == 'Cancel requested':
+                            job.status, job.finished_at = 'Cancelled', now()
+                            job.counts = dict(counts)
+                            db.commit()
+                            return
+                        since_commit = 0
+                counts['batches_processed'] += 1
+                counts['progress_percent'] = min(99, counts['batches_processed'])
+                job.counts = dict(counts)
+                db.commit()
+                db.refresh(job)
+                if job.status == 'Cancel requested':
+                    job.status, job.finished_at = 'Cancelled', now()
+                    job.counts = dict(counts)
+                    db.commit()
+                    return
+                since_commit = 0
+            counts['progress_percent'] = 100
             job.status, job.counts, job.finished_at = 'Succeeded', counts, now()
             db.add(Audit(actor_id=actor_id, action='tenable.synced', entity='sync', entity_id=job.id, details=counts))
             db.commit()
@@ -123,7 +151,7 @@ async def run_sync(job_id, actor_id):
         with SessionLocal() as db:
             job = db.get(SyncJob, job_id)
             job.status, job.finished_at = 'Failed', now()
-            job.error = str(exc) if isinstance(exc, TenableError) else 'Sync could not normalize or persist upstream data; no records were committed.'
+            job.error = str(exc) if isinstance(exc, TenableError) else 'Sync stopped while normalizing or persisting upstream data; completed batches remain available.'
             db.add(Audit(actor_id=actor_id, action='tenable.sync_failed', entity='sync', entity_id=job.id, details={'error': job.error}))
             db.commit()
     finally:
@@ -139,7 +167,7 @@ def sync(kind: str, background: BackgroundTasks, request: Request, user=Depends(
         raise HTTPException(409, 'Enable the integration first')
     if not ((state.access_key_encrypted and state.secret_key_encrypted) or (settings().tenable_access_key and settings().tenable_secret_key)):
         raise HTTPException(409, 'Configure credentials on the server first')
-    if db.scalar(select(SyncJob).where(SyncJob.status == 'Running')):
+    if db.scalar(select(SyncJob).where(SyncJob.status.in_(('Running', 'Cancel requested')))):
         raise HTTPException(409, 'A sync is already running')
     job = SyncJob(kind=kind, workspace=request.state.session.workspace)
     db.add(job)
@@ -148,3 +176,15 @@ def sync(kind: str, background: BackgroundTasks, request: Request, user=Depends(
     db.commit()
     background.add_task(run_sync, job.id, user.id)
     return {'id': job.id, 'status': 'Running'}
+
+@router.post('/sync/{job_id}/cancel')
+def cancel_sync(job_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    job = db.get(SyncJob, job_id)
+    if not job or job.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Synchronization job not found')
+    if job.status != 'Running':
+        raise HTTPException(409, 'Only a running synchronization can be stopped')
+    job.status = 'Cancel requested'
+    db.add(Audit(actor_id=user.id, action='tenable.sync_cancel_requested', entity='sync', entity_id=job.id))
+    db.commit()
+    return {'id': job.id, 'status': job.status}
