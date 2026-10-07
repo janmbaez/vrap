@@ -259,30 +259,41 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     workspace = request.state.session.workspace
     base = select(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace)
     total = db.scalar(select(func.count()).select_from(Finding).where(Finding.workspace == workspace)) or 0
+    methodology = active_methodology(db)
     severity_value = func.coalesce(Finding.observed['severity'].as_string(), Vulnerability.technical['severity'].as_string())
     severity_counts = dict(db.execute(select(severity_value, func.count()).select_from(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace).group_by(severity_value)).all())
-    assessed_ids = db.scalars(
-        select(Assessment.instance_id)
-        .join(Finding, Assessment.instance_id == Finding.id)
+    # Dashboard summaries must remain fast for six-figure finding volumes.  Join the
+    # most recent assessment in one query instead of calling detail() for every row.
+    latest = (select(Assessment.instance_id.label('finding_id'), func.max(Assessment.revision).label('revision'))
+              .join(Finding, Assessment.instance_id == Finding.id)
+              .where(Finding.workspace == workspace).group_by(Assessment.instance_id).subquery())
+    assessment_rows = db.execute(
+        select(Finding.id, Finding.revision.label('finding_revision'), Assessment.revision.label('assessment_revision'),
+               Assessment.methodology_id, Assessment.status, RiskScore.result)
+        .join(latest, latest.c.finding_id == Finding.id)
+        .join(Assessment, (Assessment.instance_id == latest.c.finding_id) & (Assessment.revision == latest.c.revision))
+        .outerjoin(RiskScore, RiskScore.assessment_id == Assessment.id)
         .where(Finding.workspace == workspace)
-        .distinct()
     ).all()
-    assessed_findings = db.scalars(select(Finding).where(Finding.id.in_(assessed_ids))).all() if assessed_ids else []
-    assessed_rows = [detail(db, finding) for finding in assessed_findings]
-    assessed = [r for r in assessed_rows if r['saved_score'] is not None and r['status'] not in ('Assessment In Progress', 'Context Required', 'Pending Validation') and not r['reassessment_required']]
+    draft_statuses = {'Assessment In Progress', 'Context Required', 'Pending Validation'}
+    current_scores = [row for row in assessment_rows if row.result is not None and row.status not in draft_statuses
+                      and row.assessment_revision == row.finding_revision and row.methodology_id == methodology.id]
     rank = case((severity_value == 'Critical', 4), (severity_value == 'High', 3), (severity_value == 'Medium', 2), (severity_value == 'Low', 1), else_=0)
     vpr = cast(Finding.observed['vpr'].as_string(), Float)
     cvss = cast(Finding.observed['cvss'].as_string(), Float)
     candidates = db.scalars(base.order_by(rank.desc(), vpr.desc(), cvss.desc()).limit(100)).all()
-    by_id = {finding.id: finding for finding in [*candidates, *assessed_findings]}
+    highest_scored = sorted(current_scores, key=lambda row: float(row.result.get('residual', 0)), reverse=True)[:6]
+    priority_ids = {finding.id for finding in candidates} | {row.id for row in highest_scored}
+    priority_findings = db.scalars(select(Finding).where(Finding.id.in_(priority_ids))).all() if priority_ids else []
+    by_id = {finding.id: finding for finding in priority_findings}
     priority = sorted((detail(db, finding) for finding in by_id.values()), key=lambda row: row['score']['residual'], reverse=True)[:6]
     levels = ['Critical', 'High', 'Medium', 'Low']
     return {'total': total, 'severity': {s: severity_counts.get(s, 0) for s in levels},
-            'pending': total - len(assessed), 'completed': len(assessed), 'exceptions': sum(r['status'] == 'Exception Requested' for r in assessed_rows),
-            'above': sum(r['score']['above_appetite'] for r in assessed), 'within': sum(not r['score']['above_appetite'] for r in assessed),
-            'distribution': [{'name': s, 'value': sum(r['score']['residual_level'] == s for r in assessed)} for s in levels],
+            'pending': total - len(current_scores), 'completed': len(current_scores), 'exceptions': sum(row.status == 'Exception Requested' for row in assessment_rows),
+            'above': sum(bool(row.result.get('above_appetite')) for row in current_scores), 'within': sum(not row.result.get('above_appetite') for row in current_scores),
+            'distribution': [{'name': s, 'value': sum(row.result.get('residual_level') == s for row in current_scores)} for s in levels],
             'priority': priority,
-            'methodology': {'version': active_methodology(db).version, 'appetite': active_methodology(db).configuration['appetite']}}
+            'methodology': {'version': methodology.version, 'appetite': methodology.configuration['appetite']}}
 
 @router.get('/methodologies')
 def methodologies(user=Depends(require_user), db=Depends(get_db)):
