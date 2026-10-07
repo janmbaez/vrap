@@ -168,6 +168,28 @@ def test_asset_rule_hostname_prefix_matches_wildcard_or_plain_prefix(client):
     assert matching['context']['asset_type']=='Cloud server'
     assert not non_matching['applied_rules']
 
+def test_disabling_or_deleting_rule_removes_its_inherited_effects(client):
+    login(client)
+    rule={'name':'AWS inherited context','priority':10,'active':True,'match_type':'Hostname prefix','match_value':'aws',
+          'context':{'environment':'Production','asset_type':'Cloud server'},'controls':[]}
+    created_rule=client.post('/api/asset-rules',json=rule).json()
+    finding=client.post('/api/findings',json={**DATA,'hostname':'aws-api-02','ip':'10.44.2.12','plugin_id':'aws-cleanup'}).json()
+    assert finding['context']['environment']=='Production'
+    disabled={**rule,'active':False}
+    response=client.put(f"/api/asset-rules/{created_rule['id']}",json=disabled)
+    assert response.status_code==200 and response.json()['assets_reconciled']==1
+    cleaned=client.get(f"/api/findings/{finding['id']}").json()
+    assert cleaned['context'].get('environment') is None
+    assert cleaned['context'].get('asset_type') is None
+    assert cleaned['applied_rules']==[]
+    # Deleting an active rule performs the same reconciliation.
+    replacement={**rule,'name':'AWS inherited context replacement'}
+    replacement_id=client.post('/api/asset-rules',json=replacement).json()['id']
+    assert client.post(f"/api/asset-rules/{replacement_id}/apply").status_code==200
+    deleted=client.delete(f"/api/asset-rules/{replacement_id}")
+    assert deleted.status_code==200 and deleted.json()['assets_reconciled']==1
+    assert client.get(f"/api/findings/{finding['id']}").json()['applied_rules']==[]
+
 def test_asset_context_is_authoritative_and_flags_reassessment(client):
     login(client); finding=create(client); payload=body(finding)
     saved=client.post(f"/api/findings/{finding['id']}/assessments",json=payload).json()

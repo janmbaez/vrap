@@ -25,11 +25,10 @@ def matches(rule: AssetRule, hostname: str, ip: str | None, tags: list) -> bool:
             return False
     return False
 
-def resolve_rules(db, hostname: str, ip: str | None, tags: list):
+def resolve_rule_list(rules, hostname: str, ip: str | None, tags: list):
     context, controls, applied = {}, {}, []
-    rules = db.scalars(select(AssetRule).where(AssetRule.active.is_(True)).order_by(AssetRule.priority, AssetRule.id)).all()
     for rule in rules:
-        if not matches(rule, hostname, ip, tags):
+        if not rule.active or not matches(rule, hostname, ip, tags):
             continue
         applied.append({'id': rule.id, 'name': rule.name})
         for key, value in rule.context.items():
@@ -38,3 +37,7 @@ def resolve_rules(db, hostname: str, ip: str | None, tags: list):
         for control in rule.controls:
             controls.setdefault(control['name'], control)
     return context, list(controls.values()), applied
+
+def resolve_rules(db, hostname: str, ip: str | None, tags: list):
+    rules = db.scalars(select(AssetRule).where(AssetRule.active.is_(True)).order_by(AssetRule.priority, AssetRule.id)).all()
+    return resolve_rule_list(rules, hostname, ip, tags)

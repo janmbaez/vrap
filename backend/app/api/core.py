@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta
+from copy import copy
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select, update, delete, func, case, cast, Float, or_
 from sqlalchemy.exc import IntegrityError
@@ -6,7 +7,7 @@ from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
 from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput
-from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules
+from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
@@ -295,6 +296,46 @@ def delete_asset(id: int, request: Request, user=Depends(writer), db=Depends(get
         db.rollback(); raise
     return {'deleted': id, 'findings_deleted': finding_count}
 
+def _reconcile_asset_rule_effects(db, workspace, prior_rules):
+    """Remove obsolete rule-derived values while leaving explicit asset edits intact."""
+    current_rules = db.scalars(select(AssetRule).where(AssetRule.active.is_(True)).order_by(AssetRule.priority, AssetRule.id)).all()
+    changed = 0
+    for asset in db.scalars(select(Asset) if workspace is None else select(Asset).where(Asset.workspace == workspace)):
+        old_context, _, _ = resolve_rule_list(prior_rules, asset.hostname, asset.ip, asset.tags)
+        new_context, new_controls, new_applied = resolve_rule_list(current_rules, asset.hostname, asset.ip, asset.tags)
+        context = dict(asset.context or {})
+        previous_managed = context.pop('_rule_context', old_context)
+        for key, value in previous_managed.items():
+            if context.get(key) == value:
+                context.pop(key, None)
+        managed = {}
+        for key, value in new_context.items():
+            if key not in context:
+                context[key] = value
+                managed[key] = value
+        if managed:
+            context['_rule_context'] = managed
+        context['applied_rules'] = new_applied
+        context_changed = context != asset.context
+        finding_query = select(Finding).where(Finding.asset_id == asset.id)
+        if workspace is not None:
+            finding_query = finding_query.where(Finding.workspace == workspace)
+        findings = db.scalars(finding_query).all()
+        finding_changed = False
+        for record in findings:
+            observed = dict(record.observed or {})
+            if observed.get('default_controls', []) != new_controls or observed.get('applied_rules', []) != new_applied:
+                observed['default_controls'] = new_controls
+                observed['applied_rules'] = new_applied
+                record.observed = observed
+                record.revision += 1
+                finding_changed = True
+        if context_changed:
+            asset.context = context
+        if context_changed or finding_changed:
+            changed += 1
+    return changed
+
 @router.get('/asset-rules')
 def asset_rules(user=Depends(require_user), db=Depends(get_db)):
     return [{'id': r.id, 'name': r.name, 'priority': r.priority, 'active': r.active, 'match_type': r.match_type,
@@ -322,19 +363,24 @@ def update_asset_rule(id: int, data: AssetRuleInput, user=Depends(admin), db=Dep
     if not rule: raise HTTPException(404, 'Asset rule not found')
     if data.name != rule.name and db.scalar(select(AssetRule.id).where(AssetRule.name == data.name)):
         raise HTTPException(409, 'An asset rule with this name already exists')
+    prior_rules = [copy(item) for item in db.scalars(select(AssetRule).where(AssetRule.active.is_(True)).order_by(AssetRule.priority, AssetRule.id))]
     values = data.model_dump(exclude_none=True)
     values['context'] = data.context.model_dump(exclude_none=True)
     for key, value in values.items():
         setattr(rule, key, value if key != 'match_value' else value.strip())
-    db.add(Audit(actor_id=user.id, action='asset_rule.updated', entity='asset_rule', entity_id=id, details={'name':rule.name,'active':rule.active,'match_type':rule.match_type,'match_value':rule.match_value}))
-    db.commit(); return {'id': rule.id, 'name': rule.name, 'active': rule.active}
+    affected = _reconcile_asset_rule_effects(db, None, prior_rules) if not rule.active else 0
+    db.add(Audit(actor_id=user.id, action='asset_rule.updated', entity='asset_rule', entity_id=id, details={'name':rule.name,'active':rule.active,'match_type':rule.match_type,'match_value':rule.match_value,'assets_reconciled':affected}))
+    db.commit(); return {'id': rule.id, 'name': rule.name, 'active': rule.active, 'assets_reconciled': affected}
 
 @router.delete('/asset-rules/{id}')
 def delete_asset_rule(id: int, user=Depends(admin), db=Depends(get_db)):
     rule = db.get(AssetRule, id)
     if not rule: raise HTTPException(404, 'Asset rule not found')
-    db.add(Audit(actor_id=user.id, action='asset_rule.deleted', entity='asset_rule', entity_id=id, details={'name':rule.name}))
-    db.delete(rule); db.commit(); return {'deleted': id}
+    prior_rules = [copy(item) for item in db.scalars(select(AssetRule).where(AssetRule.active.is_(True)).order_by(AssetRule.priority, AssetRule.id))]
+    db.delete(rule); db.flush()
+    affected = _reconcile_asset_rule_effects(db, None, prior_rules)
+    db.add(Audit(actor_id=user.id, action='asset_rule.deleted', entity='asset_rule', entity_id=id, details={'name':rule.name, 'assets_reconciled': affected}))
+    db.commit(); return {'deleted': id, 'assets_reconciled': affected}
 
 @router.post('/asset-rules/{id}/apply')
 def apply_asset_rule(id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
