@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, OperationalError
+from .db import SessionLocal
+from .models import SyncJob, now
 from .auth import router as auth_router
 from .api.core import router as core_router
 from .api.imports import router as imports_router
@@ -10,7 +13,25 @@ from .api.governance import router as governance_router
 from .api.campaigns import router as campaigns_router
 from .api.campaign_exports import router as campaign_exports_router
 
-app = FastAPI(title='VRAP', version='1.0.0', docs_url='/api/docs', openapi_url='/api/openapi.json', redoc_url=None)
+@asynccontextmanager
+async def lifespan(_app):
+    # BackgroundTasks are process-local. A restart cannot resume one, so make
+    # its historical job truthful instead of blocking every future sync.
+    with SessionLocal() as db:
+        try:
+            abandoned = db.scalars(select(SyncJob).where(SyncJob.status.in_(('Running', 'Cancel requested')))).all()
+        except OperationalError:
+            # The isolated test database is initialized after application startup.
+            db.rollback()
+            abandoned = []
+        for job in abandoned:
+            job.status, job.finished_at = 'Interrupted', now()
+            job.error = job.error or 'Sync stopped when the application restarted; no active worker remains.'
+        if abandoned:
+            db.commit()
+    yield
+
+app = FastAPI(title='VRAP', version='1.0.0', docs_url='/api/docs', openapi_url='/api/openapi.json', redoc_url=None, lifespan=lifespan)
 for router in (auth_router, core_router, imports_router, tenable_router, governance_router, campaigns_router, campaign_exports_router):
     app.include_router(router, prefix='/api')
 
