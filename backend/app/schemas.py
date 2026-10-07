@@ -225,6 +225,7 @@ class AssetUpdate(Strict):
     it_owner: str | None = Field(default=None, max_length=200)
     application_owner: str | None = Field(default=None, max_length=200)
     asset_group: str | None = Field(default=None, max_length=200)
+    asset_type: str | None = Field(default=None, max_length=100)
 
 class AssetEdit(AssetUpdate):
     hostname: str | None = Field(default=None, min_length=1, max_length=255)

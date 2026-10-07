@@ -200,7 +200,7 @@ def _asset_output(asset):
             'os': asset.os, 'tags': asset.tags, 'context': asset.context}
 
 @router.get('/assets')
-def assets(request: Request, q: str = '', limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
+def assets(request: Request, q: str = '', asset_criticality: str = '', business_criticality: str = '', environment: str = '', asset_type: str = '', owner: str = '', tag: str = '', regulatory: str = '', data_classification: str = '', limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     workspace = request.state.session.workspace
     query = select(Asset).where(Asset.workspace == workspace)
     if q.strip():
@@ -208,6 +208,19 @@ def assets(request: Request, q: str = '', limit: int = Query(50, ge=1, le=200), 
         query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term), Asset.os.ilike(term), Asset.external_id.ilike(term),
                                 Asset.context['business_owner'].as_string().ilike(term), Asset.context['it_owner'].as_string().ilike(term),
                                 Asset.context['application_owner'].as_string().ilike(term), Asset.context['asset_group'].as_string().ilike(term)))
+    context_filters = {'asset_criticality': asset_criticality, 'business_criticality': business_criticality,
+                       'environment': environment, 'data_classification': data_classification}
+    for key, value in context_filters.items():
+        if value.strip(): query = query.where(Asset.context[key].as_string() == value.strip())
+    if asset_type.strip(): query = query.where(Asset.context['asset_type'].as_string() == asset_type.strip())
+    if owner.strip():
+        value = owner.strip(); query = query.where(or_(Asset.context['business_owner'].as_string() == value, Asset.context['it_owner'].as_string() == value, Asset.context['application_owner'].as_string() == value))
+    if tag.strip():
+        from ..query import asset_tag_has
+        query = query.where(asset_tag_has(db, tag.strip()))
+    if regulatory.strip():
+        from ..query import json_list_has
+        query = query.where(json_list_has(db, Asset.context['regulatory'], regulatory.strip()))
     total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
     rows = db.scalars(query.order_by(Asset.hostname, Asset.id).limit(limit).offset(offset)).all()
     return {'items': [_asset_output(asset) for asset in rows], 'total': total, 'limit': limit, 'offset': offset}
@@ -220,7 +233,7 @@ def create_asset(data: AssetCreate, request: Request, user=Depends(writer), db=D
     if data.external_id and db.scalar(select(Asset.id).where(Asset.workspace == workspace, Asset.external_id == data.external_id)):
         raise HTTPException(409, 'An asset with this external ID already exists in this environment')
     fields = data.model_dump(exclude_none=True)
-    context = {key: fields.pop(key) for key in list(fields) if key in {'asset_criticality','business_criticality','data_classification','regulatory','environment','exposure','business_owner','it_owner','application_owner','asset_group'}}
+    context = {key: fields.pop(key) for key in list(fields) if key in {'asset_criticality','business_criticality','data_classification','regulatory','environment','exposure','business_owner','it_owner','application_owner','asset_group','asset_type'}}
     asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context, **fields)
     db.add(asset); db.flush()
     db.add(Audit(actor_id=user.id, action='asset.created', entity='asset', entity_id=asset.id, details={'hostname':asset.hostname, 'workspace':workspace}))
@@ -302,6 +315,26 @@ def create_asset_rule(data: AssetRuleInput, user=Depends(admin), db=Depends(get_
                  details={'name': rule.name, 'match_type': rule.match_type, 'match_value': rule.match_value}))
     db.commit()
     return {'id': rule.id, 'name': rule.name}
+
+@router.put('/asset-rules/{id}')
+def update_asset_rule(id: int, data: AssetRuleInput, user=Depends(admin), db=Depends(get_db)):
+    rule = db.get(AssetRule, id)
+    if not rule: raise HTTPException(404, 'Asset rule not found')
+    if data.name != rule.name and db.scalar(select(AssetRule.id).where(AssetRule.name == data.name)):
+        raise HTTPException(409, 'An asset rule with this name already exists')
+    values = data.model_dump(exclude_none=True)
+    values['context'] = data.context.model_dump(exclude_none=True)
+    for key, value in values.items():
+        setattr(rule, key, value if key != 'match_value' else value.strip())
+    db.add(Audit(actor_id=user.id, action='asset_rule.updated', entity='asset_rule', entity_id=id, details={'name':rule.name,'active':rule.active,'match_type':rule.match_type,'match_value':rule.match_value}))
+    db.commit(); return {'id': rule.id, 'name': rule.name, 'active': rule.active}
+
+@router.delete('/asset-rules/{id}')
+def delete_asset_rule(id: int, user=Depends(admin), db=Depends(get_db)):
+    rule = db.get(AssetRule, id)
+    if not rule: raise HTTPException(404, 'Asset rule not found')
+    db.add(Audit(actor_id=user.id, action='asset_rule.deleted', entity='asset_rule', entity_id=id, details={'name':rule.name}))
+    db.delete(rule); db.commit(); return {'deleted': id}
 
 @router.post('/asset-rules/{id}/apply')
 def apply_asset_rule(id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
