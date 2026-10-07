@@ -98,3 +98,10 @@ def test_tenable_lifecycle_updates_one_finding_and_preserves_review(db):
     reopened=normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':0,'protocol':'tcp'},'severity':'High','state':'ACTIVE','finding_id':'stable-1'})
     same,created=ingest(db,reopened,'Tenable',{'finding_id':'stable-1'},update_existing=True,actor_id=1)
     assert same.id == finding.id and not created and db.get(FindingWorkflow,finding.id).status == 'New'
+
+def test_ingest_cache_prevents_duplicate_findings(db):
+    cache = {}
+    data = normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':443,'protocol':'tcp'},'severity':'High','finding_id':'stable-1'})
+    first, created = ingest(db, data, 'Tenable', {'finding_id':'stable-1'}, update_existing=True, actor_id=1, cache=cache)
+    second, created_again = ingest(db, data, 'Tenable', {'finding_id':'stable-1'}, update_existing=True, actor_id=1, cache=cache)
+    assert created and not created_again and first.id == second.id

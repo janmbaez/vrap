@@ -93,6 +93,7 @@ async def run_sync(job_id, actor_id):
             client = TenableClient(client_config(state) if state and state.access_key_encrypted else settings())
             counts = {'received': 0, 'created': 0, 'updated': 0, 'informational_skipped': 0,
                       'batches_processed': 0, 'progress_percent': 0}
+            identity_cache = {}
             since_commit = 0
             async for rows in client.export(job.kind):
                 for row in rows:
@@ -105,7 +106,7 @@ async def run_sync(job_id, actor_id):
                         counts['received'] += 1
                         if counts['received'] > MAX_ACTIONABLE_VULNERABILITIES:
                             raise TenableError('Sync limit of 500,000 actionable vulnerabilities exceeded; narrow the Tenable export or use a durable worker for larger exports')
-                        _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True, workspace=job.workspace, actor_id=actor_id)
+                        _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True, workspace=job.workspace, actor_id=actor_id, cache=identity_cache)
                     else:
                         counts['received'] += 1
                         external = row.get('id') or row.get('uuid')

@@ -16,8 +16,14 @@ def active_methodology(db):
 def identity(data):
     return ('plugin:' + data.plugin_id) if data.plugin_id else 'manual:' + hashlib.sha256((data.name.casefold() + '|' + ','.join(sorted(data.cves))).encode()).hexdigest()
 
-def ingest(db, data, source='Manual', original=None, update_existing=False, workspace='Production', actor_id=None):
-    asset = db.scalar(select(Asset).where(Asset.external_id == data.external_id, Asset.workspace == workspace)) if data.external_id else None
+def ingest(db, data, source='Manual', original=None, update_existing=False, workspace='Production', actor_id=None, cache=None):
+    """Persist one finding, optionally reusing identities already seen in this batch."""
+    cache = cache if cache is not None else {}
+    assets, vulnerabilities, findings = (cache.setdefault('assets', {}), cache.setdefault('vulnerabilities', {}), cache.setdefault('findings', {}))
+    asset_key = (workspace, data.external_id or data.hostname.lower())
+    asset = assets.get(asset_key)
+    if not asset:
+        asset = db.scalar(select(Asset).where(Asset.external_id == data.external_id, Asset.workspace == workspace)) if data.external_id else None
     if not asset:
         asset = db.scalar(select(Asset).where(Asset.hostname == data.hostname.lower(), Asset.workspace == workspace))
     if not asset:
@@ -31,17 +37,22 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
         rule_context, default_controls, applied_rules = resolve_rules(db, asset.hostname, data.ip or asset.ip, data.asset_tags or asset.tags)
         if applied_rules:
             asset.context = {**asset.context, **rule_context, 'applied_rules': applied_rules}
+    assets[asset_key] = asset
     tech = data.model_dump(mode='json', exclude={'hostname', 'ip', 'os', 'external_id', 'context', 'name', 'cves', 'plugin_id', 'asset_tags', 'port', 'protocol'})
-    vuln = db.scalar(select(Vulnerability).where(Vulnerability.identity == identity(data)))
+    vulnerability_identity = identity(data)
+    vuln = vulnerabilities.get(vulnerability_identity) or db.scalar(select(Vulnerability).where(Vulnerability.identity == vulnerability_identity))
     if not vuln:
         vuln = Vulnerability(identity=identity(data), name=data.name, plugin_id=data.plugin_id, cves=data.cves, technical=tech)
         db.add(vuln)
         db.flush()
+    vulnerabilities[vulnerability_identity] = vuln
     finding = None
     # Tenable's finding_id is stable across lifecycle changes, including a port
     # change. Prefer it so a fixed or resurfaced finding updates its history.
     upstream_id = str(original.get('finding_id')) if source == 'Tenable' and isinstance(original, dict) and original.get('finding_id') is not None else None
-    if upstream_id:
+    finding_key = (asset.id, vuln.id, upstream_id or data.port, data.protocol if not upstream_id else '')
+    finding = findings.get(finding_key)
+    if not finding and upstream_id:
         for candidate in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.vulnerability_id == vuln.id)):
             if str((candidate.source_record or {}).get('finding_id')) == upstream_id:
                 finding = candidate
@@ -66,12 +77,14 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
                         workflow.status, workflow.updated_by = 'Closed', actor_id
                 elif workflow and workflow.status == 'Closed':
                     workflow.status, workflow.updated_by = 'New', actor_id
+        findings[finding_key] = finding
         return finding, False
     finding = Finding(asset_id=asset.id, vulnerability_id=vuln.id, source=source, port=data.port, protocol=data.protocol, workspace=workspace,
                       source_record=original or data.model_dump(mode='json'), observed={**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
                       'default_controls': default_controls, 'applied_rules': applied_rules})
     db.add(finding)
     db.flush()
+    findings[finding_key] = finding
     return finding, True
 
 def get_finding(db, id):
