@@ -257,6 +257,22 @@ class PluginTemplateInput(Strict):
     decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required'] = 'Needs Further Assessment'
     controls: list[Control] = Field(default_factory=list, max_length=50)
 
+class PluginBulkAssessmentInput(Strict):
+    context: Context
+    controls: list[Control] = Field(default_factory=list, max_length=50)
+    owner_id: int | None = None
+    workflow_status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed'] = 'Investigating'
+    notes: str = Field(default='', max_length=10000)
+    justification: str = Field(min_length=1, max_length=5000)
+    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Risk Accepted'] = 'Needs Further Assessment'
+    status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
+
+    @model_validator(mode='after')
+    def unique_controls(self):
+        if len({control.name for control in self.controls}) != len(self.controls):
+            raise ValueError('Duplicate controls are not allowed')
+        return self
+
 class WorkflowInput(Strict):
     owner_id: int | None = None
     status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed']

@@ -8,7 +8,7 @@ from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent)
-from ..schemas import PluginTemplateInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest
+from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, AssessmentInput
 from ..services import active_methodology, detail
 from ..risk.engine import calculate
 
@@ -82,6 +82,50 @@ def apply_template(vulnerability_id: int, request: Request, user=Depends(writer)
         applied += 1
     db.add(Audit(actor_id=user.id, action='plugin_template.applied', entity='vulnerability', entity_id=vulnerability_id, details={'findings': applied}))
     db.commit(); return {'findings_assessed': applied}
+
+@router.post('/assessment-groups/{vulnerability_id}/bulk-assess')
+def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    """Apply the complete workbench assessment once across a plugin's current finding population."""
+    from .core import preview_score
+    workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace); _owner(db, data.owner_id)
+    findings = list(db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)))
+    if not findings: raise HTTPException(404, 'No findings are available for this plugin')
+    if data.decision == 'Risk Accepted' or data.status == 'Risk Accepted':
+        if user.role != 'Administrator': raise HTTPException(403, 'Only an Administrator can approve risk acceptance')
+        if data.decision != 'Risk Accepted' or data.status != 'Risk Accepted': raise HTTPException(422, 'Risk acceptance decision and status must agree')
+    methodology = active_methodology(db)
+    prepared=[]
+    for finding in findings:
+        assessment_data = AssessmentInput(context=data.context, controls=data.controls, methodology_id=methodology.id,
+            expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+        method, result = preview_score(db, finding, assessment_data)
+        if data.decision == 'Within Risk Appetite' and result['above_appetite']:
+            raise HTTPException(422, 'Residual risk is above appetite for one or more affected assets')
+        if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
+            raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
+        prepared.append((finding, method, result))
+    rules = {rule['name']: rule for rule in prepared[0][1].configuration['controls']}
+    try:
+        for finding, method, result in prepared:
+            finding.revision += 1
+            assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=user.id,
+                context=data.context.model_dump(), notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+            db.add(assessment); db.flush()
+            for control in data.controls:
+                db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
+            asset=db.get(Asset, finding.asset_id)
+            result.update({'methodology_id':method.id, 'methodology_version':method.version, 'asset_snapshot':{'id':asset.id,'hostname':asset.hostname,'ip':asset.ip,'os':asset.os,'tags':asset.tags}})
+            db.add(RiskScore(assessment_id=assessment.id, result=result))
+            workflow=db.get(FindingWorkflow,finding.id)
+            if not workflow:
+                workflow=FindingWorkflow(finding_id=finding.id,updated_by=user.id); db.add(workflow)
+            workflow.owner_id, workflow.status, workflow.updated_by = data.owner_id, data.workflow_status, user.id
+        db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_applied', entity='vulnerability', entity_id=vulnerability_id,
+            details={'findings':len(prepared),'decision':data.decision,'status':data.status,'workflow_status':data.workflow_status,'context':data.context.model_dump()}))
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    return {'findings_assessed':len(prepared), 'assets_affected':len({finding.asset_id for finding,_,_ in prepared})}
 
 @router.put('/findings/{finding_id}/workflow')
 def update_workflow(finding_id: int, data: WorkflowInput, request: Request, user=Depends(writer), db=Depends(get_db)):

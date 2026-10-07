@@ -200,6 +200,20 @@ def test_governance_workflow_template_exception_control_and_reporting(client):
     assert pdf.status_code==200 and pdf.headers['content-type']=='application/pdf'
     assert pdf.content.startswith(b'%PDF-') and len(pdf.content)>3000
 
+def test_plugin_bulk_assessment_applies_full_workbench_context(client):
+    login(client); first=create(client)
+    second=client.post('/api/findings',json={**DATA,'hostname':'TEST-02'}).json()
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    response=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json={
+        'context':CONTEXT,'controls':[],'owner_id':1,'workflow_status':'Risk Review',
+        'notes':'Shared validation completed','justification':'The plugin has the same exposure across this asset group',
+        'decision':'Remediation Required','status':'Assessed'})
+    assert response.status_code==200,response.text
+    assert response.json()=={'findings_assessed':2,'assets_affected':2}
+    for finding in (first,second):
+        detail=client.get(f"/api/findings/{finding['id']}").json()
+        assert detail['status']=='Assessed' and detail['context']['asset_criticality']=='Critical'
+
 def test_saved_filters_are_personal_and_workspace_scoped(client):
     login(client)
     created=client.post('/api/saved-filters',json={'name':'Critical unassessed','filters':{'severity':'Critical','status':'Not Assessed','q':''}})
