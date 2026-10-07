@@ -323,11 +323,14 @@ def apply_asset_rule(id: int, request: Request, user=Depends(admin), db=Depends(
 @router.get('/dashboard')
 def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     workspace = request.state.session.workspace
-    base = select(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace)
-    total = db.scalar(select(func.count()).select_from(Finding).where(Finding.workspace == workspace)) or 0
+    active = or_(FindingWorkflow.status.is_(None), FindingWorkflow.status != 'Closed')
+    base = (select(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id)
+            .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+            .where(Finding.workspace == workspace, active))
+    total = db.scalar(select(func.count()).select_from(Finding).outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, active)) or 0
     methodology = active_methodology(db)
     severity_value = func.coalesce(Finding.observed['severity'].as_string(), Vulnerability.technical['severity'].as_string())
-    severity_counts = dict(db.execute(select(severity_value, func.count()).select_from(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace).group_by(severity_value)).all())
+    severity_counts = dict(db.execute(select(severity_value, func.count()).select_from(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, active).group_by(severity_value)).all())
     # Dashboard summaries must remain fast for six-figure finding volumes.  Join the
     # most recent assessment in one query instead of calling detail() for every row.
     latest = (select(Assessment.instance_id.label('finding_id'), func.max(Assessment.revision).label('revision'))
@@ -339,7 +342,8 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
         .join(latest, latest.c.finding_id == Finding.id)
         .join(Assessment, (Assessment.instance_id == latest.c.finding_id) & (Assessment.revision == latest.c.revision))
         .outerjoin(RiskScore, RiskScore.assessment_id == Assessment.id)
-        .where(Finding.workspace == workspace)
+        .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+        .where(Finding.workspace == workspace, active)
     ).all()
     draft_statuses = {'Assessment In Progress', 'Context Required', 'Pending Validation'}
     current_scores = [row for row in assessment_rows if row.result is not None and row.status not in draft_statuses

@@ -2,7 +2,7 @@
 from fastapi import HTTPException
 from sqlalchemy import select, func, Text, exists, or_, cast
 from sqlalchemy.dialects.postgresql import JSONB
-from .models import Finding, Asset, Vulnerability, Assessment, RiskScore
+from .models import Finding, Asset, Vulnerability, Assessment, FindingWorkflow, RiskScore
 
 FILTER_KEYS = {'q', 'severity', 'source', 'status', 'residual', 'inherent', 'appetite',
                'business', 'classification', 'regulatory', 'plugin_id', 'asset_group',
@@ -80,7 +80,10 @@ def finding_query(db, workspace, filters=None):
                      .outerjoin(RiskScore, RiskScore.assessment_id == Assessment.id))
         if filters.get('status'):
             status = filters['status']
-            statement = statement.where(Assessment.id.is_(None) if status == 'Not Assessed' else Assessment.status == status)
+            if status == 'Closed':
+                statement = statement.outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(FindingWorkflow.status == 'Closed')
+            else:
+                statement = statement.where(Assessment.id.is_(None) if status == 'Not Assessed' else Assessment.status == status)
         for key in ('residual','inherent'):
             if filters.get(key): statement = statement.where(RiskScore.result[key + '_level'].as_string() == filters[key])
         if filters.get('appetite'):

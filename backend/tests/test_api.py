@@ -53,6 +53,15 @@ def test_administrator_can_run_duplicate_cleanup_from_data_quality(client, db):
     assert response.json()['duplicates_removed'] == 0
     assert db.scalar(select(Audit).where(Audit.action == 'data_quality.duplicates_removed')) is not None
 
+def test_closed_workflow_is_visible_and_excluded_from_active_dashboard(client):
+    login(client)
+    finding = create(client)
+    closed = client.put(f"/api/findings/{finding['id']}/workflow", json={'owner_id':None, 'status':'Closed'})
+    assert closed.status_code == 200, closed.text
+    listed = client.get('/api/findings?status=Closed').json()
+    assert listed['total'] == 1 and listed['items'][0]['workflow_status'] == 'Closed'
+    assert client.get('/api/dashboard').json()['total'] == 0
+
 def test_final_administrator_cannot_be_demoted(client, db):
     db.query(User).filter_by(username='analyst').update({'role':'Viewer'})
     db.commit(); login(client)
