@@ -42,6 +42,17 @@ def test_administrator_can_clear_workspace_operational_data(client, db):
     assert quality['findings'] == 0 and quality['assets'] == 0 and quality['can_clear'] is True
     assert db.scalar(select(Audit).where(Audit.action == 'workspace.operational_data_cleared')) is not None
 
+def test_administrator_can_run_duplicate_cleanup_from_data_quality(client, db):
+    login(client)
+    assert client.get('/api/data-quality').json()['duplicates'] == {
+        'duplicate_findings': 0, 'duplicates_protected': 0, 'duplicate_groups': 0,
+    }
+    assert client.post('/api/data-quality/remove-duplicates', json={'confirmation':'REMOVE'}).status_code == 422
+    response = client.post('/api/data-quality/remove-duplicates', json={'confirmation':'REMOVE DUPLICATES'})
+    assert response.status_code == 200, response.text
+    assert response.json()['duplicates_removed'] == 0
+    assert db.scalar(select(Audit).where(Audit.action == 'data_quality.duplicates_removed')) is not None
+
 def test_final_administrator_cannot_be_demoted(client, db):
     db.query(User).filter_by(username='analyst').update({'role':'Viewer'})
     db.commit(); login(client)

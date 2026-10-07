@@ -273,6 +273,16 @@ class DataCleanupRequest(Strict):
             raise ValueError('Type CLEAR DATA to confirm')
         return value
 
+class DuplicateCleanupRequest(Strict):
+    confirmation: str = Field(min_length=1, max_length=32)
+
+    @field_validator('confirmation')
+    @classmethod
+    def confirmation_required(cls, value):
+        if value != 'REMOVE DUPLICATES':
+            raise ValueError('Type REMOVE DUPLICATES to confirm')
+        return value
+
 class PluginTemplateInput(Strict):
     owner_id: int | None = None
     status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed'] = 'New'

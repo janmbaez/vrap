@@ -8,8 +8,8 @@ from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent)
-from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, AssessmentInput
-from ..services import active_methodology, detail
+from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput
+from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
 
 router = APIRouter(tags=['Governance'])
@@ -208,7 +208,21 @@ def data_quality(request:Request,user=Depends(require_user),db=Depends(get_db)):
     rejected=db.scalar(select(func.coalesce(func.sum(ImportBatch.counts['rejected'].as_integer()),0)).where(ImportBatch.workspace==workspace,ImportBatch.status.in_(['Imported','Failed']))) or 0
     checks=[('Missing asset criticality',missing_context,total_assets,'Classify assets or apply an asset rule'),('Missing Business Owner',missing_business_owner,total_assets,'Assign the accountable business owner'),('Missing IT Owner / Remediator',missing_it_owner,total_assets,'Assign the infrastructure or IT remediation owner'),('Missing Application Owner / Remediator',missing_application_owner,total_assets,'Assign the application support owner'),('Missing IP address',missing_ip,total_assets,'Improve scanner asset identity mapping'),('Unassigned findings',unowned,total_findings,'Assign an analyst or plugin owner'),('Findings without CVE',no_cve,total_findings,'Review valid configuration findings and source mappings'),('Rejected import rows',rejected,None,'Download the import error details and correct the source')]
     sync_running=bool(db.scalar(select(SyncJob.id).where(SyncJob.workspace==workspace,SyncJob.status.in_(['Running','Cancel requested'])).limit(1)))
-    return {'assets':total_assets,'findings':total_findings,'sync_running':sync_running,'can_clear':user.role=='Administrator','checks':[{'name':n,'count':c,'percent':round(c*100/d,1) if d else None,'action':a,'status':'Good' if c==0 else 'Needs attention'} for n,c,d,a in checks]}
+    duplicates=tenable_duplicate_summary(db, workspace)
+    return {'assets':total_assets,'findings':total_findings,'sync_running':sync_running,'can_clear':user.role=='Administrator','duplicates':duplicates,'checks':[{'name':n,'count':c,'percent':round(c*100/d,1) if d else None,'action':a,'status':'Good' if c==0 else 'Needs attention'} for n,c,d,a in checks]}
+
+@router.post('/data-quality/remove-duplicates')
+def remove_duplicates(data: DuplicateCleanupRequest, request: Request, user=Depends(admin), db=Depends(get_db)):
+    workspace=_workspace(request)
+    if db.scalar(select(SyncJob.id).where(SyncJob.workspace==workspace,SyncJob.status.in_(['Running','Cancel requested'])).limit(1)):
+        raise HTTPException(409, 'Stop or wait for the active Tenable synchronization before removing duplicates')
+    result=cleanup_tenable_duplicates(db, workspace)
+    db.add(Audit(actor_id=user.id, action='data_quality.duplicates_removed', entity='workspace', details={'workspace':workspace, **result}))
+    db.commit()
+    message=f"Removed {result['duplicates_removed']:,} duplicate Tenable finding{'s' if result['duplicates_removed'] != 1 else ''}."
+    if result['duplicates_protected']:
+        message+=f" Retained {result['duplicates_protected']:,} record{'s' if result['duplicates_protected'] != 1 else ''} referenced by review campaigns."
+    return {'message':message, **result}
 
 @router.post('/data-quality/clear-operational-data')
 def clear_operational_data(data: DataCleanupRequest, request: Request, user=Depends(admin), db=Depends(get_db)):

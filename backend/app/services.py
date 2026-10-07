@@ -90,14 +90,7 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
     return finding, True
 
 
-def cleanup_tenable_duplicates(db, workspace):
-    """Merge legacy duplicate Tenable findings using Tenable's stable finding ID.
-
-    The normal ingestion path is an upsert, but older exports could leave more
-    than one row when a finding changed port.  A campaign's snapshot is audit
-    evidence, so any duplicate referenced by a campaign is deliberately left
-    intact rather than deleting history behind an active or completed review.
-    """
+def _tenable_duplicate_groups(db, workspace):
     findings = db.scalars(
         select(Finding).where(Finding.workspace == workspace, Finding.source == 'Tenable').order_by(Finding.id)
     ).all()
@@ -107,11 +100,36 @@ def cleanup_tenable_duplicates(db, workspace):
         stable_id = source_record.get('finding_id')
         if stable_id is not None and str(stable_id).strip():
             groups.setdefault((finding.asset_id, finding.vulnerability_id, str(stable_id)), []).append(finding)
+    return [duplicates for duplicates in groups.values() if len(duplicates) > 1]
+
+
+def tenable_duplicate_summary(db, workspace):
+    """Return the actionable duplicate count without changing live findings."""
+    groups = _tenable_duplicate_groups(db, workspace)
+    protected = 0
+    duplicates = 0
+    for group in groups:
+        ids = [finding.id for finding in group]
+        campaign_ids = set(db.scalars(select(CampaignFinding.finding_id).where(CampaignFinding.finding_id.in_(ids))))
+        if campaign_ids:
+            protected += len(group) - 1
+        else:
+            duplicates += len(group) - 1
+    return {'duplicate_findings': duplicates, 'duplicates_protected': protected, 'duplicate_groups': len(groups)}
+
+
+def cleanup_tenable_duplicates(db, workspace):
+    """Merge legacy duplicate Tenable findings using Tenable's stable finding ID.
+
+    The normal ingestion path is an upsert, but older exports could leave more
+    than one row when a finding changed port.  A campaign's snapshot is audit
+    evidence, so any duplicate referenced by a campaign is deliberately left
+    intact rather than deleting history behind an active or completed review.
+    """
+    groups = _tenable_duplicate_groups(db, workspace)
 
     removed = protected = 0
-    for duplicates in groups.values():
-        if len(duplicates) < 2:
-            continue
+    for duplicates in groups:
         ids = [finding.id for finding in duplicates]
         campaign_ids = set(db.scalars(select(CampaignFinding.finding_id).where(CampaignFinding.finding_id.in_(ids))))
         if campaign_ids:
