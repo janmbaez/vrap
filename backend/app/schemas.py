@@ -259,7 +259,7 @@ class SavedFilterInput(Strict):
     @classmethod
     def valid_filters(cls, value):
         allowed = {'q','severity','residual','inherent','appetite','status','source','business','classification','regulatory',
-                   'plugin_id','asset_group','asset_tag','business_owner','it_owner','application_owner'}
+                   'plugin_id','asset_group','asset_tag','vulnerability_tag','business_owner','it_owner','application_owner'}
         if set(value) - allowed or any(len(str(v)) > 300 for v in value.values()):
             raise ValueError('Saved filter contains unsupported fields')
         return {k: v for k, v in value.items() if v}

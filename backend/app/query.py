@@ -6,7 +6,7 @@ from .models import Finding, Asset, Vulnerability, Assessment, FindingWorkflow, 
 
 FILTER_KEYS = {'q', 'severity', 'source', 'status', 'residual', 'inherent', 'appetite',
                'business', 'classification', 'regulatory', 'plugin_id', 'asset_group',
-               'asset_tag', 'business_owner', 'it_owner', 'application_owner'}
+               'asset_tag', 'vulnerability_tag', 'business_owner', 'it_owner', 'application_owner'}
 
 def validate_filters(filters):
     if not isinstance(filters, dict) or set(filters) - FILTER_KEYS:
@@ -97,6 +97,7 @@ def finding_query(db, workspace, filters=None):
     if filters.get('plugin_id'): statement = statement.where(Vulnerability.plugin_id == filters['plugin_id'])
     if filters.get('regulatory'): statement = statement.where(json_list_has(db, Asset.context['regulatory'], filters['regulatory']))
     if filters.get('asset_tag'): statement = statement.where(asset_tag_has(db, filters['asset_tag']))
+    if filters.get('vulnerability_tag'): statement = statement.where(json_list_has(db, Finding.observed['tags'], filters['vulnerability_tag']))
     if filters.get('asset_group'):
         column=Asset.context['asset_group'].as_string()
         if filters['asset_group']=='Unassigned':

@@ -42,11 +42,11 @@ def delete_filter(id: int, request: Request, user=Depends(require_user), db=Depe
     return {'deleted': id}
 
 @router.get('/findings')
-def findings(request: Request, q: str = '', severity: str = '', source: str = '', status: str = '', residual: str = '', inherent: str = '', appetite: str = '', business: str = '', classification: str = '', regulatory: str = '', plugin_id: str = '', asset_group: str = '', asset_tag: str = '', business_owner: str = '', it_owner: str = '', application_owner: str = '', limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
+def findings(request: Request, q: str = '', severity: str = '', source: str = '', status: str = '', residual: str = '', inherent: str = '', appetite: str = '', business: str = '', classification: str = '', regulatory: str = '', plugin_id: str = '', asset_group: str = '', asset_tag: str = '', vulnerability_tag: str = '', business_owner: str = '', it_owner: str = '', application_owner: str = '', limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     filters = {key: value for key, value in {
         'q': q, 'severity': severity, 'source': source, 'status': status, 'residual': residual,
         'inherent': inherent, 'appetite': appetite, 'business': business, 'classification': classification,
-        'regulatory': regulatory, 'plugin_id': plugin_id, 'asset_group': asset_group, 'asset_tag': asset_tag,
+        'regulatory': regulatory, 'plugin_id': plugin_id, 'asset_group': asset_group, 'asset_tag': asset_tag, 'vulnerability_tag': vulnerability_tag,
         'business_owner': business_owner, 'it_owner': it_owner, 'application_owner': application_owner}.items() if value}
     statement = finding_query(db, request.state.session.workspace, filters).order_by(Finding.id)
     total = db.scalar(select(func.count()).select_from(statement.order_by(None).subquery())) or 0
