@@ -193,6 +193,8 @@ class FindingWorkflow(Base):
     reviewed_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     review_decision: Mapped[str | None] = mapped_column(String(80))
     review_notes: Mapped[str | None] = mapped_column(Text)
+    remediation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    remediation_evidence: Mapped[str | None] = mapped_column(Text)
 
 class RiskException(Base):
     __tablename__ = 'risk_exceptions'

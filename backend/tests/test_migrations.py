@@ -38,7 +38,7 @@ def preservation_check(engine):
         for table, rows in before.items():
             after = [dict(row) for row in connection.execute(text(f'SELECT * FROM {table}')).mappings()]
             assert [{k: row[k] for k in rows[0]} for row in after] == rows
-        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0005'
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0006'
         assert 'review_campaigns' in inspect(connection).get_table_names()
         assert 'reviewed_at' in {column['name'] for column in inspect(connection).get_columns('finding_workflows')}
 
@@ -74,6 +74,6 @@ def test_concurrent_startup_and_restart_do_not_duplicate_seed(tmp_path):
         with engine.connect() as connection:
             assert connection.scalar(text('SELECT COUNT(*) FROM users')) == 1
             assert connection.scalar(text('SELECT COUNT(*) FROM vulnerability_instances')) == 20
-            assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0005'
+            assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0006'
     finally:
         engine.dispose()

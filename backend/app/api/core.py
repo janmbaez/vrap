@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select, update, delete, func, case, cast, Float, or_
 from sqlalchemy.exc import IntegrityError
@@ -391,8 +391,15 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     by_id = {finding.id: finding for finding in priority_findings}
     priority = sorted((detail(db, finding) for finding in by_id.values()), key=lambda row: row['score']['residual'], reverse=True)[:6]
     levels = ['Critical', 'High', 'Medium', 'Low']
+    now = datetime.now(timezone.utc)
+    due_rows = db.execute(select(FindingWorkflow.remediation_due_at).join(Finding, Finding.id == FindingWorkflow.finding_id).where(
+        Finding.workspace == workspace, FindingWorkflow.status != 'Closed', FindingWorkflow.remediation_due_at.is_not(None))).scalars().all()
+    due_dates = [value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value for value in due_rows]
+    overdue = sum(value < now for value in due_dates)
+    due_soon = sum(now <= value <= now + timedelta(days=7) for value in due_dates)
     return {'total': total, 'severity': {s: severity_counts.get(s, 0) for s in levels},
             'pending': total - len(current_scores), 'completed': len(current_scores), 'exceptions': sum(row.status == 'Exception Requested' for row in assessment_rows),
+            'remediation': {'overdue': overdue, 'due_soon': due_soon, 'scheduled': len(due_dates)},
             'above': sum(bool(row.result.get('above_appetite')) for row in current_scores), 'within': sum(not row.result.get('above_appetite') for row in current_scores),
             'distribution': [{'name': s, 'value': sum(row.result.get('residual_level') == s for row in current_scores)} for s in levels],
             'priority': priority,

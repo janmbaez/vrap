@@ -143,10 +143,14 @@ def update_workflow(finding_id: int, data: WorkflowInput, request: Request, user
                      details={'workspace': _workspace(request), 'before': previous, 'decision': item.review_decision}))
     else:
         item.owner_id, item.status = data.owner_id, data.status
+        item.remediation_due_at = data.remediation_due_at
+        item.remediation_evidence = data.remediation_evidence
         db.add(Audit(actor_id=user.id, action='workflow.updated', entity='finding', entity_id=finding_id,
-                     details={**data.model_dump(), 'workspace': _workspace(request)}))
+                     details={**data.model_dump(mode='json'), 'workspace': _workspace(request)}))
     item.updated_by, item.updated_at = user.id, timestamp
     db.commit(); return {'finding_id': finding_id, 'status': item.status, 'owner_id': item.owner_id,
+                         'remediation_due_at': item.remediation_due_at.isoformat() if item.remediation_due_at else None,
+                         'remediation_evidence': item.remediation_evidence,
                          'review_state': item.review_state, 'reviewed_at': item.reviewed_at.isoformat() if item.reviewed_at else None}
 
 @router.get('/exceptions')

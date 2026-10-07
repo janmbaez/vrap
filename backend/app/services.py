@@ -213,6 +213,8 @@ def detail(db, finding):
             'applied_rules': finding.observed.get('applied_rules', asset.context.get('applied_rules', [])),
             'status': assessment.status if assessment else 'Not Assessed',
             'workflow_status': workflow.status if workflow else 'New',
+            'remediation_due_at': workflow.remediation_due_at.isoformat() if workflow and workflow.remediation_due_at else None,
+            'remediation_evidence': workflow.remediation_evidence if workflow else None,
             'decision': assessment.decision if assessment else 'Needs Further Assessment',
             'review_state': workflow.review_state if workflow else None,
             'reviewed_at': workflow.reviewed_at.isoformat() if workflow and workflow.reviewed_at else None,

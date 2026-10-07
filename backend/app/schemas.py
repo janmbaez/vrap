@@ -311,6 +311,8 @@ class PluginBulkAssessmentInput(Strict):
 class WorkflowInput(Strict):
     owner_id: int | None = None
     status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed']
+    remediation_due_at: datetime | None = None
+    remediation_evidence: str | None = Field(default=None, max_length=10000)
 
 class ExceptionInput(Strict):
     justification: str = Field(min_length=10, max_length=5000)
