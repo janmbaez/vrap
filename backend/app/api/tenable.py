@@ -34,6 +34,23 @@ def client_config(state):
     return SimpleNamespace(tenable_base_url=state.base_url or 'https://cloud.tenable.com', tenable_allowed_hosts=base.tenable_allowed_hosts,
                            tenable_access_key=access, tenable_secret_key=secret)
 
+def sync_summary(job):
+    counts = job.counts or {}
+    if not counts:
+        return None
+    parts = [f"{counts.get('received', 0):,} actionable findings processed"]
+    if counts.get('created'):
+        parts.append(f"{counts['created']:,} new")
+    if counts.get('updated'):
+        parts.append(f"{counts['updated']:,} updated")
+    if counts.get('informational_skipped'):
+        parts.append(f"{counts['informational_skipped']:,} informational skipped")
+    if counts.get('batches_processed'):
+        parts.append(f"{counts['batches_processed']:,} batches complete")
+    if job.status == 'Running':
+        parts.append(f"{counts.get('progress_percent', 0)}% in progress")
+    return ' · '.join(parts)
+
 @router.get('')
 def status(request: Request, user=Depends(admin), db=Depends(get_db)):
     state = db.get(IntegrationSettings, 1)
@@ -45,7 +62,7 @@ def status(request: Request, user=Depends(admin), db=Depends(get_db)):
             'base_url': state.base_url if state else 'https://cloud.tenable.com',
             'last_success': next((j.finished_at.isoformat() for j in jobs if j.status == 'Succeeded'), None),
             'last_failure': next((j.finished_at.isoformat() for j in jobs if j.status == 'Failed'), None),
-            'jobs': [{'id': j.id, 'kind': j.kind, 'status': j.status, 'counts': j.counts, 'error': j.error, 'started_at': j.started_at.isoformat(), 'finished_at': j.finished_at.isoformat() if j.finished_at else None} for j in jobs]}
+            'jobs': [{'id': j.id, 'kind': j.kind, 'status': j.status, 'counts': j.counts, 'error': j.error or sync_summary(j), 'started_at': j.started_at.isoformat(), 'finished_at': j.finished_at.isoformat() if j.finished_at else None} for j in jobs]}
 
 @router.put('')
 def configure(data: TenableConfiguration, user=Depends(admin), db=Depends(get_db)):

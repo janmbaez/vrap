@@ -5,7 +5,7 @@ from openpyxl import Workbook
 from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES,normalized_asset_tags
 from app.services import ingest
 from app.models import FindingWorkflow
-from app.api.tenable import MAX_ACTIONABLE_VULNERABILITIES
+from app.api.tenable import MAX_ACTIONABLE_VULNERABILITIES, sync_summary
 from app.imports.parser import parse_file, normalize as normalize_import, MAX_BYTES, MAX_ROWS
 
 def test_missing_fields():
@@ -16,6 +16,15 @@ def test_missing_fields():
 def test_tenable_chunk_limit_matches_import_limit():
     assert MAX_TENABLE_CHUNK_BYTES == 100 * 1024 * 1024
     assert MAX_ACTIONABLE_VULNERABILITIES == 500000
+
+def test_tenable_sync_summary_is_human_readable():
+    job = SimpleNamespace(status='Running', counts={
+        'received': 5185, 'created': 5185, 'updated': 0,
+        'informational_skipped': 43214, 'batches_processed': 7,
+        'progress_percent': 7,
+    })
+    assert sync_summary(job) == ('5,185 actionable findings processed · 5,185 new · '
+                                '43,214 informational skipped · 7 batches complete · 7% in progress')
 
 def test_tenable_info_severity_is_normalized():
     data = normalize({'asset': {'uuid': '123', 'hostname': ['asset']},
