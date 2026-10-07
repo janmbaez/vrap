@@ -8,7 +8,7 @@ from ..config import settings
 from ..db import get_db, SessionLocal
 from ..models import SyncJob, IntegrationSettings, Audit, Asset, now
 from ..services import ingest
-from ..integrations.tenable import TenableClient, TenableError, normalize, first, canonical_severity, normalized_asset_tags
+from ..integrations.tenable import TenableClient, TenableError, TenableCancelled, normalize, first, canonical_severity, normalized_asset_tags
 from ..schemas import TenableConfiguration
 
 router = APIRouter(prefix='/tenable', tags=['Tenable'])
@@ -39,6 +39,10 @@ def sync_summary(job):
     if not counts:
         return None
     parts = [f"{counts.get('received', 0):,} actionable findings processed"]
+    if counts.get('export_status'):
+        total = counts.get('export_total_chunks')
+        available = counts.get('export_available_chunks', 0)
+        parts.append(f"Tenable {str(counts['export_status']).lower()}" + (f" · {available:,}/{total:,} chunks ready" if total else ''))
     if counts.get('created'):
         parts.append(f"{counts['created']:,} new")
     if counts.get('updated'):
@@ -112,7 +116,23 @@ async def run_sync(job_id, actor_id):
                       'batches_processed': 0, 'progress_percent': 0}
             identity_cache = {}
             since_commit = 0
-            async for rows in client.export(job.kind):
+            async def export_progress(status, seen):
+                """Persist Tenable queue/chunk progress even before a first chunk arrives."""
+                db.refresh(job)
+                if job.status == 'Cancel requested':
+                    job.status, job.finished_at = 'Cancelled', now()
+                    job.counts = dict(counts)
+                    db.commit()
+                    return False
+                total = status.get('total_chunks') or status.get('chunks_total') or 0
+                available = status.get('chunks_available_count') or status.get('finished_chunks') or len(seen)
+                counts.update({'export_status': status.get('status', 'PROCESSING'), 'export_total_chunks': total,
+                               'export_available_chunks': available})
+                counts['progress_percent'] = min(99, int((len(seen) * 100 / total) if total else (3 if status.get('status') == 'QUEUED' else 5)))
+                job.counts = dict(counts)
+                db.commit()
+                return True
+            async for rows in client.export(job.kind, progress=export_progress):
                 for row in rows:
                     if job.kind == 'vulnerabilities':
                         # Filter before accounting: informational records never consume
@@ -168,9 +188,13 @@ async def run_sync(job_id, actor_id):
     except Exception as exc:
         with SessionLocal() as db:
             job = db.get(SyncJob, job_id)
-            job.status, job.finished_at = 'Failed', now()
-            job.error = str(exc) if isinstance(exc, TenableError) else 'Sync stopped while normalizing or persisting upstream data; completed batches remain available.'
-            db.add(Audit(actor_id=actor_id, action='tenable.sync_failed', entity='sync', entity_id=job.id, details={'error': job.error}))
+            if isinstance(exc, TenableCancelled):
+                job.status, job.finished_at, job.error = 'Cancelled', now(), None
+                db.add(Audit(actor_id=actor_id, action='tenable.sync_cancelled', entity='sync', entity_id=job.id))
+            else:
+                job.status, job.finished_at = 'Failed', now()
+                job.error = str(exc) if isinstance(exc, TenableError) else 'Sync stopped while normalizing or persisting upstream data; completed batches remain available.'
+                db.add(Audit(actor_id=actor_id, action='tenable.sync_failed', entity='sync', entity_id=job.id, details={'error': job.error}))
             db.commit()
     finally:
         if client:

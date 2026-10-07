@@ -2,7 +2,7 @@ import asyncio,io
 from types import SimpleNamespace
 import httpx,pytest
 from openpyxl import Workbook
-from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES,normalized_asset_tags
+from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES,normalized_asset_tags,EXPORT_TIMEOUT_SECONDS,VULNERABILITY_ASSETS_PER_CHUNK
 from app.services import ingest
 from app.models import FindingWorkflow
 from app.api.tenable import MAX_ACTIONABLE_VULNERABILITIES, sync_summary
@@ -16,6 +16,7 @@ def test_missing_fields():
 def test_tenable_chunk_limit_matches_import_limit():
     assert MAX_TENABLE_CHUNK_BYTES == 100 * 1024 * 1024
     assert MAX_ACTIONABLE_VULNERABILITIES == 500000
+    assert EXPORT_TIMEOUT_SECONDS == 60 * 60 and VULNERABILITY_ASSETS_PER_CHUNK == 2000
 
 def test_tenable_sync_summary_is_human_readable():
     job = SimpleNamespace(status='Running', counts={
@@ -46,7 +47,8 @@ def test_export_chunks_safe_errors():
     def respond(request):
         if request.method=='POST':
             assert b'"since":0' in request.content
-            assert b'"num_assets":100' in request.content
+            assert b'"num_assets":2000' in request.content
+            assert b'"severity":["low","medium","high","critical"]' in request.content
             return httpx.Response(200,json={'export_uuid':'abc-123'})
         if request.url.path.endswith('/status'):return httpx.Response(200,json={'status':'FINISHED','chunks_available':[3,1]})
         return httpx.Response(200,json=[{'chunk':request.url.path[-1]}])

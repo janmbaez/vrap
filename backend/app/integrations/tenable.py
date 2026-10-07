@@ -1,5 +1,6 @@
 """Tenable VM adapter. External shapes terminate here, never in the risk engine."""
 import asyncio
+import inspect
 import time
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -8,8 +9,13 @@ from ..schemas import FindingCreate
 
 # Keep connector exports consistent with the documented interactive-import limit.
 MAX_TENABLE_CHUNK_BYTES = 100 * 1024 * 1024
+EXPORT_TIMEOUT_SECONDS = 60 * 60
+VULNERABILITY_ASSETS_PER_CHUNK = 2000
 
 class TenableError(Exception):
+    pass
+
+class TenableCancelled(TenableError):
     pass
 
 class TenableClient:
@@ -48,16 +54,22 @@ class TenableClient:
     async def test(self):
         await self.request('GET', '/session')
 
-    async def export(self, kind):
+    async def export(self, kind, progress=None):
         path = '/vulns/export' if kind == 'vulnerabilities' else '/assets/export'
         # Vulnerability records can include large plugin output. Smaller asset groups
         # keep a single response below the bounded connector memory limit.
-        payload = {'num_assets': 100, 'filters': {'since': 0}} if kind == 'vulnerabilities' else {'chunk_size': 500}
+        # Tenable recommends 1,000–3,000 assets per vulnerability chunk.  A larger
+        # chunk count makes large exports spend most of their time in queue/setup.
+        # Filtering informational records upstream prevents them consuming export,
+        # transfer, or VRAP processing capacity.
+        payload = ({'num_assets': VULNERABILITY_ASSETS_PER_CHUNK,
+                    'filters': {'since': 0, 'severity': ['low', 'medium', 'high', 'critical']}}
+                   if kind == 'vulnerabilities' else {'chunk_size': 500})
         job = await self.request('POST', path, json=payload)
         export_id = job.get('export_uuid')
         if not isinstance(export_id, str) or not export_id or any(c not in '0123456789abcdefABCDEF-' for c in export_id):
             raise TenableError('Tenable export response did not include a valid identifier')
-        deadline, seen = time.monotonic() + 300, set()
+        deadline, seen = time.monotonic() + EXPORT_TIMEOUT_SECONDS, set()
         while time.monotonic() < deadline:
             status = await self.request('GET', f'{path}/{export_id}/status')
             if status.get('status') in ('ERROR', 'CANCELLED') or status.get('chunks_failed') or status.get('chunks_cancelled'):
@@ -72,10 +84,16 @@ class TenableClient:
                     raise TenableError('Unexpected export chunk format')
                 yield records
                 seen.add(chunk)
+            if progress:
+                outcome = progress(status, seen)
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                if outcome is False:
+                    raise TenableCancelled('Synchronization cancelled by user')
             if status.get('status') == 'FINISHED':
                 return
             await asyncio.sleep(2)
-        raise TenableError('Export timed out after five minutes; retry synchronization')
+        raise TenableError('Export did not finish within one hour; retry synchronization or narrow the Tenable export')
 
 def first(value):
     return value[0] if isinstance(value, list) and value else value if isinstance(value, str) else None
