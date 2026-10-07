@@ -8,12 +8,13 @@ ASSET_CONTEXT_KEYS = {'asset_criticality', 'business_criticality', 'data_classif
 def matches(rule: AssetRule, hostname: str, ip: str | None, tags: list) -> bool:
     if rule.match_type == 'All assets':
         return True
-    if rule.match_type == 'Hostname suffix':
-        # Accept both conventional suffixes ("-DB") and UI-friendly wildcards
-        # ("*-DB"). A hostname rule must never treat the wildcard literally.
-        suffix = rule.match_value.strip().casefold()
-        suffix = suffix[1:] if suffix.startswith('*') else suffix
-        return bool(suffix) and hostname.casefold().endswith(suffix)
+    if rule.match_type in ('Hostname prefix', 'Hostname suffix'):
+        # Wildcards are optional: aws and aws* mean prefix; -DB and *-DB mean suffix.
+        value = rule.match_value.strip().casefold().strip('*')
+        if not value:
+            return False
+        normalized_hostname = hostname.casefold()
+        return normalized_hostname.startswith(value) if rule.match_type == 'Hostname prefix' else normalized_hostname.endswith(value)
     if rule.match_type == 'Tag':
         value = rule.match_value.casefold()
         return any(value == str(tag).casefold() or value in str(tag).casefold() for tag in tags)

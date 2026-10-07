@@ -157,6 +157,17 @@ def test_asset_rule_applies_context_and_default_controls(client):
     assert created['controls'][0]['validated'] is False
     assert created['applied_rules'][0]['name']=='Critical data center subnet'
 
+def test_asset_rule_hostname_prefix_matches_wildcard_or_plain_prefix(client):
+    login(client)
+    rule={'name':'AWS servers','priority':10,'active':True,'match_type':'Hostname prefix','match_value':'aws*',
+          'context':{'environment':'Production','asset_type':'Cloud server'},'controls':[]}
+    assert client.post('/api/asset-rules',json=rule).status_code==201
+    matching=client.post('/api/findings',json={**DATA,'hostname':'aws-api-01','ip':'10.44.2.10','plugin_id':'aws-prefix'}).json()
+    non_matching=client.post('/api/findings',json={**DATA,'hostname':'prod-aws-api-01','ip':'10.44.2.11','plugin_id':'aws-prefix-other'}).json()
+    assert matching['context']['environment']=='Production'
+    assert matching['context']['asset_type']=='Cloud server'
+    assert not non_matching['applied_rules']
+
 def test_asset_context_is_authoritative_and_flags_reassessment(client):
     login(client); finding=create(client); payload=body(finding)
     saved=client.post(f"/api/findings/{finding['id']}/assessments",json=payload).json()

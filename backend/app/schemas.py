@@ -342,7 +342,7 @@ class AssetRuleInput(Strict):
     name: str = Field(min_length=1, max_length=200)
     priority: int = Field(default=100, ge=1, le=10000)
     active: bool = True
-    match_type: Literal['CIDR', 'Hostname suffix', 'Tag', 'All assets']
+    match_type: Literal['CIDR', 'Hostname prefix', 'Hostname suffix', 'Tag', 'All assets']
     match_value: str = Field(default='', max_length=300)
     context: AssetUpdate = Field(default_factory=AssetUpdate)
     controls: list[RuleControl] = Field(default_factory=list, max_length=50)
