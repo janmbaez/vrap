@@ -147,6 +147,22 @@ def test_asset_context_is_authoritative_and_flags_reassessment(client):
     assert refreshed['context']['regulatory']==['SOX']
     assert refreshed['reassessment_required'] is True
 
+def test_assets_are_paginated_searchable_and_support_crud(client):
+    login(client)
+    first = create(client)
+    second = client.post('/api/findings', json={**DATA, 'hostname':'TEST-02', 'ip':'10.0.0.2'}).json()
+    page = client.get('/api/assets?limit=1&offset=0').json()
+    assert page['total'] == 2 and len(page['items']) == 1
+    assert client.get('/api/assets?q=10.0.0.2&limit=50').json()['items'][0]['hostname'] == 'test-02'
+    changed = client.put(f"/api/assets/{first['asset']['id']}", json={'hostname':'RENAMED-01','ip':'10.0.0.10','os':'Linux','tags':['tier:1'],'business_owner':'Risk'} )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()['hostname'] == 'renamed-01' and changed.json()['ip'] == '10.0.0.10'
+    added = client.post('/api/assets', json={'hostname':'MANUAL-01','ip':'10.0.0.99','os':'Appliance','tags':['manual']})
+    assert added.status_code == 201, added.text
+    removed = client.delete(f"/api/assets/{second['asset']['id']}")
+    assert removed.status_code == 200 and removed.json()['findings_deleted'] == 1
+    assert client.get(f"/api/findings/{second['id']}").status_code == 404
+
 def test_assessment_groups_plugin_assets_and_bulk_context(client):
     login(client)
     first=create(client)

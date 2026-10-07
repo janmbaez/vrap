@@ -226,6 +226,30 @@ class AssetUpdate(Strict):
     application_owner: str | None = Field(default=None, max_length=200)
     asset_group: str | None = Field(default=None, max_length=200)
 
+class AssetEdit(AssetUpdate):
+    hostname: str | None = Field(default=None, min_length=1, max_length=255)
+    ip: str | None = Field(default=None, max_length=60)
+    os: str | None = Field(default=None, max_length=200)
+    external_id: str | None = Field(default=None, max_length=200)
+
+    @field_validator('hostname')
+    @classmethod
+    def valid_hostname(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError('Hostname must not be blank')
+        return value.strip() if value is not None else None
+
+    @field_validator('ip')
+    @classmethod
+    def valid_ip(cls, value):
+        if not value:
+            return None
+        ip_address(value)
+        return value
+
+class AssetCreate(AssetEdit):
+    hostname: str = Field(min_length=1, max_length=255)
+
 class SavedFilterInput(Strict):
     name: str = Field(min_length=1, max_length=100)
     filters: dict[str, str] = Field(max_length=20)

@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import select, update, func, case, cast, Float, or_
+from sqlalchemy import select, update, delete, func, case, cast, Float, or_
 from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetRuleInput, SavedFilterInput
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput
 from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -195,26 +195,92 @@ def history(id: int, request: Request, user=Depends(require_user), db=Depends(ge
     rows = db.scalars(select(Assessment).where(Assessment.instance_id == id).order_by(Assessment.revision.desc()))
     return [{'id': a.id, 'revision': a.revision, 'analyst': db.get(User, a.analyst_id).username, 'date': a.created_at.isoformat(), 'status': a.status, 'decision': a.decision, 'notes': a.notes, 'justification': a.justification, 'score': db.scalar(select(RiskScore).where(RiskScore.assessment_id == a.id)).result} for a in rows]
 
+def _asset_output(asset):
+    return {'id': asset.id, 'hostname': asset.hostname, 'external_id': asset.external_id, 'ip': asset.ip,
+            'os': asset.os, 'tags': asset.tags, 'context': asset.context}
+
 @router.get('/assets')
-def assets(request: Request, user=Depends(require_user), db=Depends(get_db)):
-    return [{'id': a.id, 'hostname': a.hostname, 'ip': a.ip, 'os': a.os, 'tags': a.tags, 'context': a.context}
-            for a in db.scalars(select(Asset).where(Asset.workspace == request.state.session.workspace).order_by(Asset.hostname))]
+def assets(request: Request, q: str = '', limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
+    workspace = request.state.session.workspace
+    query = select(Asset).where(Asset.workspace == workspace)
+    if q.strip():
+        term = f'%{q.strip()}%'
+        query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term), Asset.os.ilike(term), Asset.external_id.ilike(term),
+                                Asset.context['business_owner'].as_string().ilike(term), Asset.context['it_owner'].as_string().ilike(term),
+                                Asset.context['application_owner'].as_string().ilike(term), Asset.context['asset_group'].as_string().ilike(term)))
+    total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
+    rows = db.scalars(query.order_by(Asset.hostname, Asset.id).limit(limit).offset(offset)).all()
+    return {'items': [_asset_output(asset) for asset in rows], 'total': total, 'limit': limit, 'offset': offset}
+
+@router.post('/assets', status_code=201)
+def create_asset(data: AssetCreate, request: Request, user=Depends(writer), db=Depends(get_db)):
+    workspace = request.state.session.workspace
+    if db.scalar(select(Asset.id).where(Asset.workspace == workspace, Asset.hostname == data.hostname.lower())):
+        raise HTTPException(409, 'An asset with this hostname already exists in this environment')
+    if data.external_id and db.scalar(select(Asset.id).where(Asset.workspace == workspace, Asset.external_id == data.external_id)):
+        raise HTTPException(409, 'An asset with this external ID already exists in this environment')
+    fields = data.model_dump(exclude_none=True)
+    context = {key: fields.pop(key) for key in list(fields) if key in {'asset_criticality','business_criticality','data_classification','regulatory','environment','exposure','business_owner','it_owner','application_owner','asset_group'}}
+    asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context, **fields)
+    db.add(asset); db.flush()
+    db.add(Audit(actor_id=user.id, action='asset.created', entity='asset', entity_id=asset.id, details={'hostname':asset.hostname, 'workspace':workspace}))
+    db.commit(); db.refresh(asset)
+    return _asset_output(asset)
 
 @router.put('/assets/{id}')
-def update_asset(id: int, data: AssetUpdate, request: Request, user=Depends(writer), db=Depends(get_db)):
+def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer), db=Depends(get_db)):
     asset = db.get(Asset, id)
     if not asset or asset.workspace != request.state.session.workspace: raise HTTPException(404, 'Asset not found')
-    before = dict(asset.context)
+    before = _asset_output(asset)
     changes = data.model_dump(exclude_none=True)
+    if 'hostname' in changes:
+        hostname = changes.pop('hostname').lower()
+        duplicate = db.scalar(select(Asset.id).where(Asset.workspace == asset.workspace, Asset.hostname == hostname, Asset.id != asset.id))
+        if duplicate: raise HTTPException(409, 'An asset with this hostname already exists in this environment')
+        asset.hostname = hostname
+    for field in ('ip', 'os', 'external_id'):
+        if field in changes:
+            value = changes.pop(field)
+            if field == 'external_id' and value:
+                duplicate = db.scalar(select(Asset.id).where(Asset.workspace == asset.workspace, Asset.external_id == value, Asset.id != asset.id))
+                if duplicate: raise HTTPException(409, 'An asset with this external ID already exists in this environment')
+            setattr(asset, field, value)
     if 'tags' in changes:
         asset.tags = list(dict.fromkeys(changes.pop('tags')))[:100]
     asset.context = {**asset.context, **changes}
     findings = db.scalars(select(Finding).where(Finding.asset_id == id, Finding.workspace == request.state.session.workspace)).all()
     for record in findings: record.revision += 1
     db.add(Audit(actor_id=user.id, action='asset.context_updated', entity='asset', entity_id=id,
-                 details={'before': before, 'after': asset.context, 'findings_flagged': len(findings)}))
+                 details={'before': before, 'after': _asset_output(asset), 'findings_flagged': len(findings)}))
     db.commit()
-    return {'id': asset.id, 'context': asset.context, 'findings_flagged': len(findings)}
+    return {**_asset_output(asset), 'findings_flagged': len(findings)}
+
+@router.delete('/assets/{id}')
+def delete_asset(id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace: raise HTTPException(404, 'Asset not found')
+    finding_ids = select(Finding.id).where(Finding.asset_id == asset.id, Finding.workspace == asset.workspace)
+    campaign_reference = db.scalar(select(CampaignFinding.id).where(CampaignFinding.finding_id.in_(finding_ids)).limit(1))
+    evidence_reference = db.scalar(select(CampaignEvidence.id).where(CampaignEvidence.finding_id.in_(finding_ids)).limit(1))
+    if campaign_reference or evidence_reference:
+        raise HTTPException(409, 'This asset is retained by review-campaign history and cannot be deleted')
+    assessment_ids = select(Assessment.id).where(Assessment.instance_id.in_(finding_ids))
+    finding_count = db.scalar(select(func.count()).select_from(Finding).where(Finding.id.in_(finding_ids))) or 0
+    snapshot = _asset_output(asset)
+    try:
+        db.execute(delete(RiskException).where(RiskException.finding_id.in_(finding_ids)))
+        db.execute(delete(FindingWorkflow).where(FindingWorkflow.finding_id.in_(finding_ids)))
+        db.execute(delete(AssessmentControl).where(AssessmentControl.assessment_id.in_(assessment_ids)))
+        db.execute(delete(RiskScore).where(RiskScore.assessment_id.in_(assessment_ids)))
+        db.execute(delete(Assessment).where(Assessment.instance_id.in_(finding_ids)))
+        db.execute(update(ImportRow).where(ImportRow.instance_id.in_(finding_ids)).values(instance_id=None))
+        db.execute(delete(Finding).where(Finding.id.in_(finding_ids)))
+        db.delete(asset)
+        db.add(Audit(actor_id=user.id, action='asset.deleted', entity='asset', entity_id=id, details={'asset':snapshot, 'findings_deleted':finding_count, 'workspace':request.state.session.workspace}))
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    return {'deleted': id, 'findings_deleted': finding_count}
 
 @router.get('/asset-rules')
 def asset_rules(user=Depends(require_user), db=Depends(get_db)):
