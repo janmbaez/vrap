@@ -99,7 +99,8 @@ def get_details(campaign_id:int,request:Request,user=Depends(require_user),db=De
 @router.patch('/{campaign_id}')
 def edit_campaign(campaign_id:int,data:CampaignPatch,request:Request,user=Depends(writer),db=Depends(get_db)):
     campaign=get_campaign(db,campaign_id,workspace(request),user,manage=True,lock=True)
-    if campaign.status!='Draft': raise HTTPException(409,'Only Draft campaign details can be edited')
+    if campaign.status == 'Archived':
+        raise HTTPException(409, 'Archived campaigns are read-only')
     changes=data.model_dump(exclude_unset=True)
     if any(v is None for v in changes.values()): raise HTTPException(422,'Campaign fields cannot be null')
     original={k:getattr(campaign,k) for k in CampaignInput.model_fields if k!='reviewer_ids'}
@@ -112,7 +113,9 @@ def edit_campaign(campaign_id:int,data:CampaignPatch,request:Request,user=Depend
         record_event(db,campaign,user,'edited',{'before':{k:str(v) if isinstance(v,date) else v for k,v in original.items()},
                                               'after':validated.model_dump(mode='json')});db.commit()
     except Exception: db.rollback();raise
-    return campaign_output(db,campaign,user)
+    result = campaign_output(db,campaign,user)
+    result['population_unchanged'] = campaign.status != 'Draft'
+    return result
 
 @router.post('/{campaign_id}/activate')
 def activate_campaign(campaign_id:int,request:Request,user=Depends(writer),db=Depends(get_db)):

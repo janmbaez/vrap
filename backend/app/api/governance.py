@@ -2,12 +2,13 @@ from datetime import datetime, timezone, timedelta
 from io import BytesIO, StringIO
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-from sqlalchemy import select, func, case, update
+from sqlalchemy import select, func, case, update, delete
 from ..db import get_db
 from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
-                      PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary)
-from ..schemas import PluginTemplateInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput
+                      ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
+                      ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent)
+from ..schemas import PluginTemplateInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest
 from ..services import active_methodology, detail
 from ..risk.engine import calculate
 
@@ -162,7 +163,48 @@ def data_quality(request:Request,user=Depends(require_user),db=Depends(get_db)):
     # abandoned validation previews would otherwise permanently inflate this.
     rejected=db.scalar(select(func.coalesce(func.sum(ImportBatch.counts['rejected'].as_integer()),0)).where(ImportBatch.workspace==workspace,ImportBatch.status.in_(['Imported','Failed']))) or 0
     checks=[('Missing asset criticality',missing_context,total_assets,'Classify assets or apply an asset rule'),('Missing Business Owner',missing_business_owner,total_assets,'Assign the accountable business owner'),('Missing IT Owner / Remediator',missing_it_owner,total_assets,'Assign the infrastructure or IT remediation owner'),('Missing Application Owner / Remediator',missing_application_owner,total_assets,'Assign the application support owner'),('Missing IP address',missing_ip,total_assets,'Improve scanner asset identity mapping'),('Unassigned findings',unowned,total_findings,'Assign an analyst or plugin owner'),('Findings without CVE',no_cve,total_findings,'Review valid configuration findings and source mappings'),('Rejected import rows',rejected,None,'Download the import error details and correct the source')]
-    return {'assets':total_assets,'findings':total_findings,'checks':[{'name':n,'count':c,'percent':round(c*100/d,1) if d else None,'action':a,'status':'Good' if c==0 else 'Needs attention'} for n,c,d,a in checks]}
+    sync_running=bool(db.scalar(select(SyncJob.id).where(SyncJob.workspace==workspace,SyncJob.status.in_(['Running','Cancel requested'])).limit(1)))
+    return {'assets':total_assets,'findings':total_findings,'sync_running':sync_running,'can_clear':user.role=='Administrator','checks':[{'name':n,'count':c,'percent':round(c*100/d,1) if d else None,'action':a,'status':'Good' if c==0 else 'Needs attention'} for n,c,d,a in checks]}
+
+@router.post('/data-quality/clear-operational-data')
+def clear_operational_data(data: DataCleanupRequest, request: Request, user=Depends(admin), db=Depends(get_db)):
+    """Remove one workspace's imported operational data while retaining users, policy, rules, and audit evidence."""
+    workspace=_workspace(request)
+    if db.scalar(select(SyncJob.id).where(SyncJob.workspace==workspace,SyncJob.status.in_(['Running','Cancel requested'])).limit(1)):
+        raise HTTPException(409, 'Stop or wait for the active Tenable synchronization before clearing data')
+    finding_ids=select(Finding.id).where(Finding.workspace==workspace)
+    assessment_ids=select(Assessment.id).where(Assessment.instance_id.in_(finding_ids))
+    import_ids=select(ImportBatch.id).where(ImportBatch.workspace==workspace)
+    campaign_ids=select(ReviewCampaign.id).where(ReviewCampaign.workspace==workspace)
+    counts={
+        'findings': db.scalar(select(func.count()).select_from(Finding).where(Finding.workspace==workspace)) or 0,
+        'assets': db.scalar(select(func.count()).select_from(Asset).where(Asset.workspace==workspace)) or 0,
+        'campaigns': db.scalar(select(func.count()).select_from(ReviewCampaign).where(ReviewCampaign.workspace==workspace)) or 0,
+        'imports': db.scalar(select(func.count()).select_from(ImportBatch).where(ImportBatch.workspace==workspace)) or 0,
+    }
+    try:
+        db.execute(delete(CampaignFindingTag).where(CampaignFindingTag.campaign_id.in_(campaign_ids)))
+        db.execute(delete(CampaignEvidence).where(CampaignEvidence.campaign_id.in_(campaign_ids)))
+        db.execute(delete(CampaignAuditEvent).where(CampaignAuditEvent.campaign_id.in_(campaign_ids)))
+        db.execute(delete(CampaignFinding).where(CampaignFinding.campaign_id.in_(campaign_ids)))
+        db.execute(delete(CampaignReviewer).where(CampaignReviewer.campaign_id.in_(campaign_ids)))
+        db.execute(delete(ReviewCampaign).where(ReviewCampaign.workspace==workspace))
+        db.execute(delete(RiskException).where(RiskException.workspace==workspace))
+        db.execute(delete(FindingWorkflow).where(FindingWorkflow.finding_id.in_(finding_ids)))
+        db.execute(delete(PluginAssessmentTemplate).where(PluginAssessmentTemplate.workspace==workspace))
+        db.execute(delete(AssessmentControl).where(AssessmentControl.assessment_id.in_(assessment_ids)))
+        db.execute(delete(RiskScore).where(RiskScore.assessment_id.in_(assessment_ids)))
+        db.execute(delete(Assessment).where(Assessment.instance_id.in_(finding_ids)))
+        db.execute(delete(ImportRow).where(ImportRow.import_id.in_(import_ids)))
+        db.execute(delete(ImportBatch).where(ImportBatch.workspace==workspace))
+        db.execute(delete(SyncJob).where(SyncJob.workspace==workspace))
+        db.execute(delete(Finding).where(Finding.workspace==workspace))
+        db.execute(delete(Asset).where(Asset.workspace==workspace))
+        db.add(Audit(actor_id=user.id, action='workspace.operational_data_cleared', entity='workspace', details={'workspace':workspace, **counts}))
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    return {'message':'Operational vulnerability data cleared. Users, risk methodology, asset rules, Tenable configuration, and audit history were retained.', 'cleared':counts}
 
 @router.get('/operations')
 def operations(request:Request,user=Depends(require_user),db=Depends(get_db)):

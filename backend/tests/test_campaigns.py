@@ -104,7 +104,9 @@ def test_transitions_validation_and_clone_api(client,db):
     assert client.post(f'/api/review-campaigns/{cid}/complete').status_code==409
     assert client.post(f'/api/review-campaigns/{cid}/activate').status_code==200
     assert client.post(f'/api/review-campaigns/{cid}/activate').status_code==409
-    assert client.patch(f'/api/review-campaigns/{cid}',json={'scope':{}}).status_code==409
+    updated=client.patch(f'/api/review-campaigns/{cid}',json={'name':'Updated active review','scope':{}})
+    assert updated.status_code==200 and updated.json()['population_unchanged'] is True
+    assert client.get(f'/api/review-campaigns/{cid}/findings').json()['total']==2
     assert client.post(f'/api/review-campaigns/{cid}/complete').status_code==409
     assert client.patch(f'/api/review-campaigns/{cid}/findings/{ids[0]}',json={'status':'Reviewed'}).status_code==422
     assert client.patch(f'/api/review-campaigns/{cid}/findings/{ids[0]}',json={'status':'Skipped','skip_reason':'Other'}).status_code==422

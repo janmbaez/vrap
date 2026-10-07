@@ -3,9 +3,15 @@ import {api,post,User} from '../api'
 import {Badge,ErrorBox,PageTitle} from '../components/UI'
 
 export function DataQuality(){
- const [data,setData]=useState<any>(),[error,setError]=useState('')
- useEffect(()=>{api('/data-quality').then(setData).catch(e=>setError(e.message))},[])
- return <><PageTitle title="Data quality" description="Find gaps that make risk results incomplete or misleading."/><ErrorBox error={error}/>{data&&<section className="panel table-panel"><div className="section-head"><h2>{data.assets.toLocaleString()} assets · {data.findings.toLocaleString()} findings</h2></div><table><thead><tr><th>Check</th><th>Status</th><th>Affected</th><th>Rate</th><th>Recommended action</th></tr></thead><tbody>{data.checks.map((x:any)=><tr key={x.name}><td><strong>{x.name}</strong></td><td><Badge level={x.status==='Good'?'Low':'High'}>{x.status}</Badge></td><td>{x.count.toLocaleString()}</td><td>{x.percent==null?'—':`${x.percent}%`}</td><td>{x.action}</td></tr>)}</tbody></table></section>}</>
+ const [data,setData]=useState<any>(),[error,setError]=useState(''),[message,setMessage]=useState(''),[clearing,setClearing]=useState(false)
+ const load=()=>api('/data-quality').then(setData).catch(e=>setError(e.message))
+ useEffect(()=>{load()},[])
+ async function clearData(){
+  if(window.prompt('This permanently clears this environment’s operational vulnerability data. Type CLEAR DATA to continue.')!=='CLEAR DATA')return
+  setClearing(true);setError('');setMessage('')
+  try{const result=await post('/data-quality/clear-operational-data',{confirmation:'CLEAR DATA'});setMessage(result.message);load()}catch(e){setError((e as Error).message)}finally{setClearing(false)}
+ }
+ return <><PageTitle title="Data quality" description="Find gaps that make risk results incomplete or misleading."/><ErrorBox error={error}/>{message&&<div className="notice success">{message}</div>}{data&&<><section className="panel table-panel"><div className="section-head"><h2>{data.assets.toLocaleString()} assets · {data.findings.toLocaleString()} findings</h2></div><table><thead><tr><th>Check</th><th>Status</th><th>Affected</th><th>Rate</th><th>Recommended action</th></tr></thead><tbody>{data.checks.map((x:any)=><tr key={x.name}><td><strong>{x.name}</strong></td><td><Badge level={x.status==='Good'?'Low':'High'}>{x.status}</Badge></td><td>{x.count.toLocaleString()}</td><td>{x.percent==null?'—':`${x.percent}%`}</td><td>{x.action}</td></tr>)}</tbody></table></section>{data.can_clear&&<section className="panel"><div className="section-head"><div><h2>Reset operational data</h2><p>Clear findings, assets, imports, assessments, synchronization history, and review campaign snapshots for this environment.</p></div></div><p className="helper">Users, risk methodology, asset rules, Tenable credentials, and the audit history are retained. This cannot run while Tenable synchronization is active.</p><button className="danger" disabled={clearing||data.sync_running} onClick={clearData}>{clearing?'Clearing data…':data.sync_running?'Tenable sync is running':'Clear operational data'}</button></section>}</>}</>
 }
 
 export function Exceptions({user}:{user:User}){

@@ -30,6 +30,18 @@ def test_administrator_can_change_role_and_audit_it(client, db):
     login(client, 'viewer')
     assert client.patch(f"/api/users/{analyst['id']}/role", json={'role':'Administrator'}).status_code == 403
 
+def test_administrator_can_clear_workspace_operational_data(client, db):
+    login(client)
+    create(client)
+    assert client.get('/api/data-quality').json()['findings'] == 1
+    assert client.post('/api/data-quality/clear-operational-data', json={'confirmation':'CLEAR'}).status_code == 422
+    cleared = client.post('/api/data-quality/clear-operational-data', json={'confirmation':'CLEAR DATA'})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()['cleared']['findings'] == 1
+    quality = client.get('/api/data-quality').json()
+    assert quality['findings'] == 0 and quality['assets'] == 0 and quality['can_clear'] is True
+    assert db.scalar(select(Audit).where(Audit.action == 'workspace.operational_data_cleared')) is not None
+
 def test_final_administrator_cannot_be_demoted(client, db):
     db.query(User).filter_by(username='analyst').update({'role':'Viewer'})
     db.commit(); login(client)
