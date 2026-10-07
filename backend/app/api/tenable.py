@@ -7,7 +7,7 @@ from ..auth import admin
 from ..config import settings
 from ..db import get_db, SessionLocal
 from ..models import SyncJob, IntegrationSettings, Audit, Asset, now
-from ..services import ingest
+from ..services import cleanup_tenable_duplicates, ingest
 from ..integrations.tenable import TenableClient, TenableError, TenableCancelled, normalize, first, canonical_severity, normalized_asset_tags
 from ..schemas import TenableConfiguration
 
@@ -51,6 +51,10 @@ def sync_summary(job):
         parts.append(f"{counts['informational_skipped']:,} informational skipped")
     if counts.get('batches_processed'):
         parts.append(f"{counts['batches_processed']:,} batches complete")
+    if counts.get('duplicates_removed'):
+        parts.append(f"{counts['duplicates_removed']:,} duplicate findings removed")
+    if counts.get('duplicates_protected'):
+        parts.append(f"{counts['duplicates_protected']:,} duplicate findings retained for campaign history")
     if job.status == 'Running':
         parts.append(f"{counts.get('progress_percent', 0)}% in progress")
     return ' · '.join(parts)
@@ -182,6 +186,8 @@ async def run_sync(job_id, actor_id):
                     return
                 since_commit = 0
             counts['progress_percent'] = 100
+            if job.kind == 'vulnerabilities':
+                counts.update(cleanup_tenable_duplicates(db, job.workspace))
             job.status, job.counts, job.finished_at = 'Succeeded', counts, now()
             db.add(Audit(actor_id=actor_id, action='tenable.synced', entity='sync', entity_id=job.id, details=counts))
             db.commit()

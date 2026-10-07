@@ -1,8 +1,10 @@
 import hashlib
 from datetime import datetime, timezone
 from fastapi import HTTPException
-from sqlalchemy import select
-from .models import Asset, Vulnerability, Finding, Methodology, Assessment, AssessmentControl, RiskScore, FindingWorkflow
+from sqlalchemy import delete, select, update
+from .models import (Asset, Vulnerability, Finding, Methodology, Assessment,
+                     AssessmentControl, RiskScore, FindingWorkflow, RiskException,
+                     ImportRow, CampaignFinding, CampaignEvidence)
 from .risk.engine import calculate
 from .asset_rules import resolve_rules, ASSET_CONTEXT_KEYS
 
@@ -86,6 +88,76 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
     db.flush()
     findings[finding_key] = finding
     return finding, True
+
+
+def cleanup_tenable_duplicates(db, workspace):
+    """Merge legacy duplicate Tenable findings using Tenable's stable finding ID.
+
+    The normal ingestion path is an upsert, but older exports could leave more
+    than one row when a finding changed port.  A campaign's snapshot is audit
+    evidence, so any duplicate referenced by a campaign is deliberately left
+    intact rather than deleting history behind an active or completed review.
+    """
+    findings = db.scalars(
+        select(Finding).where(Finding.workspace == workspace, Finding.source == 'Tenable').order_by(Finding.id)
+    ).all()
+    groups = {}
+    for finding in findings:
+        source_record = finding.source_record if isinstance(finding.source_record, dict) else {}
+        stable_id = source_record.get('finding_id')
+        if stable_id is not None and str(stable_id).strip():
+            groups.setdefault((finding.asset_id, finding.vulnerability_id, str(stable_id)), []).append(finding)
+
+    removed = protected = 0
+    for duplicates in groups.values():
+        if len(duplicates) < 2:
+            continue
+        ids = [finding.id for finding in duplicates]
+        campaign_ids = set(db.scalars(select(CampaignFinding.finding_id).where(CampaignFinding.finding_id.in_(ids))))
+        if campaign_ids:
+            # Do not change a campaign population retroactively.  New syncs will
+            # continue to update its canonical record and no further duplicates
+            # will be created by ingest().
+            protected += len(duplicates) - 1
+            continue
+
+        canonical = max(duplicates, key=lambda finding: (finding.revision, finding.id))
+        for duplicate in (finding for finding in duplicates if finding.id != canonical.id):
+            # Preserve assessment history by moving it to the canonical finding.
+            next_revision = db.scalar(
+                select(Assessment.revision).where(Assessment.instance_id == canonical.id).order_by(Assessment.revision.desc())
+            ) or 0
+            for assessment in db.scalars(
+                select(Assessment).where(Assessment.instance_id == duplicate.id).order_by(Assessment.revision, Assessment.id)
+            ):
+                next_revision += 1
+                assessment.instance_id, assessment.revision = canonical.id, next_revision
+
+            duplicate_workflow = db.get(FindingWorkflow, duplicate.id)
+            canonical_workflow = db.get(FindingWorkflow, canonical.id)
+            if duplicate_workflow:
+                if not canonical_workflow:
+                    duplicate_workflow.finding_id = canonical.id
+                elif duplicate_workflow.updated_at > canonical_workflow.updated_at:
+                    canonical_workflow.status = duplicate_workflow.status
+                    canonical_workflow.owner_id = duplicate_workflow.owner_id
+                    canonical_workflow.updated_by = duplicate_workflow.updated_by
+                    canonical_workflow.review_state = duplicate_workflow.review_state
+                    canonical_workflow.reviewed_at = duplicate_workflow.reviewed_at
+                    canonical_workflow.reviewed_by = duplicate_workflow.reviewed_by
+                    canonical_workflow.review_decision = duplicate_workflow.review_decision
+                    canonical_workflow.review_notes = duplicate_workflow.review_notes
+                    db.delete(duplicate_workflow)
+                else:
+                    db.delete(duplicate_workflow)
+
+            db.execute(update(RiskException).where(RiskException.finding_id == duplicate.id).values(finding_id=canonical.id))
+            db.execute(update(CampaignEvidence).where(CampaignEvidence.finding_id == duplicate.id).values(finding_id=canonical.id))
+            db.execute(update(ImportRow).where(ImportRow.instance_id == duplicate.id).values(instance_id=canonical.id))
+            db.delete(duplicate)
+            removed += 1
+        db.flush()
+    return {'duplicates_removed': removed, 'duplicates_protected': protected}
 
 def get_finding(db, id):
     result = db.get(Finding, id)

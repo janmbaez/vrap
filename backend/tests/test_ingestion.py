@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import httpx,pytest
 from openpyxl import Workbook
 from app.integrations.tenable import normalize,TenableClient,TenableError,MAX_TENABLE_CHUNK_BYTES,normalized_asset_tags,EXPORT_TIMEOUT_SECONDS,VULNERABILITY_ASSETS_PER_CHUNK
-from app.services import ingest
-from app.models import FindingWorkflow
+from app.services import cleanup_tenable_duplicates, ingest
+from app.models import Finding, FindingWorkflow
 from app.api.tenable import MAX_ACTIONABLE_VULNERABILITIES, sync_summary
 from app.imports.parser import parse_file, normalize as normalize_import, MAX_BYTES, MAX_ROWS
 
@@ -16,7 +16,7 @@ def test_missing_fields():
 def test_tenable_chunk_limit_matches_import_limit():
     assert MAX_TENABLE_CHUNK_BYTES == 100 * 1024 * 1024
     assert MAX_ACTIONABLE_VULNERABILITIES == 500000
-    assert EXPORT_TIMEOUT_SECONDS == 60 * 60 and VULNERABILITY_ASSETS_PER_CHUNK == 2000
+    assert EXPORT_TIMEOUT_SECONDS == 60 * 60 and VULNERABILITY_ASSETS_PER_CHUNK == 250
 
 def test_tenable_sync_summary_is_human_readable():
     job = SimpleNamespace(status='Running', counts={
@@ -47,7 +47,8 @@ def test_export_chunks_safe_errors():
     def respond(request):
         if request.method=='POST':
             assert b'"since":0' in request.content
-            assert b'"num_assets":2000' in request.content
+            assert b'"num_assets":250' in request.content
+            assert b'"include_plugin_output":false' in request.content
             assert b'"severity":["low","medium","high","critical"]' in request.content
             return httpx.Response(200,json={'export_uuid':'abc-123'})
         if request.url.path.endswith('/status'):return httpx.Response(200,json={'status':'FINISHED','chunks_available':[3,1]})
@@ -116,3 +117,23 @@ def test_ingest_cache_prevents_duplicate_findings(db):
     first, created = ingest(db, data, 'Tenable', {'finding_id':'stable-1'}, update_existing=True, actor_id=1, cache=cache)
     second, created_again = ingest(db, data, 'Tenable', {'finding_id':'stable-1'}, update_existing=True, actor_id=1, cache=cache)
     assert created and not created_again and first.id == second.id
+
+
+def test_cleanup_tenable_duplicates_merges_same_stable_finding_id(db):
+    data = normalize({'asset': {'uuid': 'asset-1', 'hostname': ['server']},
+                      'plugin': {'id': 1, 'name': 'Finding'},
+                      'port': {'port': 443, 'protocol': 'tcp'},
+                      'severity': 'High', 'finding_id': 'stable-1'})
+    canonical, created = ingest(db, data, 'Tenable', {'finding_id': 'stable-1'}, update_existing=True, actor_id=1)
+    assert created
+    duplicate = Finding(asset_id=canonical.asset_id, vulnerability_id=canonical.vulnerability_id,
+                        port=8443, protocol='tcp', source='Tenable', workspace='Production',
+                        source_record={'finding_id': 'stable-1'}, observed=canonical.observed, revision=1)
+    db.add(duplicate)
+    db.flush()
+
+    result = cleanup_tenable_duplicates(db, 'Production')
+    assert result == {'duplicates_removed': 1, 'duplicates_protected': 0}
+    remaining = db.query(Finding).filter(Finding.source == 'Tenable').all()
+    assert len(remaining) == 1
+    assert remaining[0].source_record['finding_id'] == 'stable-1'

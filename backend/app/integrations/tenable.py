@@ -10,7 +10,12 @@ from ..schemas import FindingCreate
 # Keep connector exports consistent with the documented interactive-import limit.
 MAX_TENABLE_CHUNK_BYTES = 100 * 1024 * 1024
 EXPORT_TIMEOUT_SECONDS = 60 * 60
-VULNERABILITY_ASSETS_PER_CHUNK = 2000
+# A chunk is a group of assets, not a bounded number of findings.  A few
+# heavily-scanned assets can otherwise produce a response larger than our
+# 100 MiB memory guard.  Plugin output is both the largest part of an export
+# and is not used by VRAP's risk model, so request it only when an analyst
+# exports it directly from Tenable.
+VULNERABILITY_ASSETS_PER_CHUNK = 250
 
 class TenableError(Exception):
     pass
@@ -58,11 +63,10 @@ class TenableClient:
         path = '/vulns/export' if kind == 'vulnerabilities' else '/assets/export'
         # Vulnerability records can include large plugin output. Smaller asset groups
         # keep a single response below the bounded connector memory limit.
-        # Tenable recommends 1,000–3,000 assets per vulnerability chunk.  A larger
-        # chunk count makes large exports spend most of their time in queue/setup.
         # Filtering informational records upstream prevents them consuming export,
         # transfer, or VRAP processing capacity.
         payload = ({'num_assets': VULNERABILITY_ASSETS_PER_CHUNK,
+                    'include_plugin_output': False,
                     'filters': {'since': 0, 'severity': ['low', 'medium', 'high', 'critical']}}
                    if kind == 'vulnerabilities' else {'chunk_size': 500})
         job = await self.request('POST', path, json=payload)
