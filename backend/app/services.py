@@ -31,14 +31,26 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
     if not asset:
         rule_context, default_controls, applied_rules = resolve_rules(db, data.hostname, data.ip, data.asset_tags)
         supplied = {k: v for k, v in data.context.model_dump().items() if v not in (None, '', [])}
+        context = {**rule_context, **supplied, 'applied_rules': applied_rules}
+        provenance = {key: {'source_system': 'import' if key in supplied else 'asset_rule', 'approval_state': 'Provisional'}
+                      for key in context if key != 'applied_rules'}
         asset = Asset(hostname=data.hostname.lower(), external_id=data.external_id, ip=data.ip, os=data.os, tags=data.asset_tags,
-                      context={**rule_context, **supplied, 'applied_rules': applied_rules}, workspace=workspace)
+                      context=context, context_provenance=provenance, workspace=workspace)
         db.add(asset)
         db.flush()
     else:
         rule_context, default_controls, applied_rules = resolve_rules(db, asset.hostname, data.ip or asset.ip, data.asset_tags or asset.tags)
         if applied_rules:
-            asset.context = {**asset.context, **rule_context, 'applied_rules': applied_rules}
+            # Existing asset context wins. Rules only classify previously unknown fields.
+            additions = {key: value for key, value in rule_context.items() if (asset.context or {}).get(key) in (None, '', [])}
+            if additions:
+                asset.context = {**asset.context, **additions, 'applied_rules': applied_rules}
+                provenance = dict(asset.context_provenance or {})
+                provenance.update({key: {'source_system': 'asset_rule', 'approval_state': 'Provisional'} for key in additions})
+                asset.context_provenance = provenance
+                asset.context_version += 1
+            else:
+                asset.context = {**asset.context, 'applied_rules': applied_rules}
     assets[asset_key] = asset
     tech = data.model_dump(mode='json', exclude={'hostname', 'ip', 'os', 'external_id', 'context', 'name', 'cves', 'plugin_id', 'asset_tags', 'port', 'protocol'})
     vulnerability_identity = identity(data)

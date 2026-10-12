@@ -190,6 +190,22 @@ def test_disabling_or_deleting_rule_removes_its_inherited_effects(client):
     assert deleted.status_code==200 and deleted.json()['assets_reconciled']==1
     assert client.get(f"/api/findings/{finding['id']}").json()['applied_rules']==[]
 
+def test_disabling_rule_preserves_a_manual_context_value(client):
+    login(client)
+    rule={'name':'Production AWS','priority':10,'active':True,'match_type':'Hostname prefix','match_value':'aws',
+          'context':{'environment':'Production','regulatory':['PCI DSS']},'controls':[]}
+    rule_id=client.post('/api/asset-rules',json=rule).json()['id']
+    finding=client.post('/api/findings',json={**DATA,'hostname':'aws-finance-01','ip':'10.44.2.20','plugin_id':'aws-finance'}).json()
+    asset_id=finding['asset']['id']
+    changed=client.put(f'/api/assets/{asset_id}',json={'environment':'Production','regulatory':['PCI DSS','SOC 2']})
+    assert changed.status_code==200
+    assert changed.json()['context_provenance']['regulatory']['source_system']=='asset_management'
+    disabled=client.put(f'/api/asset-rules/{rule_id}',json={**rule,'active':False})
+    assert disabled.status_code==200
+    refreshed=client.get(f"/api/findings/{finding['id']}").json()
+    assert refreshed['context']['environment']=='Production'
+    assert refreshed['context']['regulatory']==['PCI DSS','SOC 2']
+
 def test_asset_context_is_authoritative_and_flags_reassessment(client):
     login(client); finding=create(client); payload=body(finding)
     saved=client.post(f"/api/findings/{finding['id']}/assessments",json=payload).json()
@@ -226,9 +242,27 @@ def test_assessment_groups_plugin_assets_and_bulk_context(client):
     assert group['assets']==2 and group['findings']==2 and group['assessed']==0
     detail=client.get(f"/api/assessment-groups/{group['id']}").json()
     assert {item['finding_id'] for item in detail['items']}=={first['id'],second['id']}
-    updated=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_criticality':'Critical'})
+    protected=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_criticality':'Critical'})
+    assert protected.status_code==422
+    updated=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_group':'Windows fleet'})
     assert updated.status_code==200 and updated.json()=={'assets_updated':2,'findings_flagged':3}
-    assert client.get(f"/api/findings/{other['id']}").json()['context']['asset_criticality']=='Critical'
+    assert client.get(f"/api/findings/{other['id']}").json()['context']['asset_group']=='Windows fleet'
+
+def test_rules_and_ingest_cannot_overwrite_existing_asset_classification(client):
+    login(client)
+    first=create(client)
+    asset_id=first['asset']['id']
+    protected=client.put(f'/api/assets/{asset_id}',json={'asset_criticality':'Critical','regulatory':['PCI DSS','SOC 2'],'environment':'Production'})
+    assert protected.status_code==200
+    assert protected.json()['context_version']==2
+    assert protected.json()['context_provenance']['regulatory']['source_system']=='asset_management'
+    rule={'name':'Unsafe source proposal','priority':1,'active':True,'match_type':'Hostname prefix','match_value':'test-',
+          'context':{'asset_criticality':'Low','regulatory':['None'],'environment':'Development'},'controls':[]}
+    assert client.post('/api/asset-rules',json=rule).status_code==201
+    second=client.post('/api/findings',json={**DATA,'plugin_id':'test-rule-proposal','name':'Rule proposal'}).json()
+    assert second['context']['asset_criticality']=='Critical'
+    assert second['context']['regulatory']==['PCI DSS','SOC 2']
+    assert second['context']['environment']=='Production'
 
 def test_tenable_configuration_is_encrypted_and_redacted(client,db):
     login(client)

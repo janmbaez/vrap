@@ -11,6 +11,7 @@ from ..models import (User, Asset, Vulnerability, Finding, Assessment, Assessmen
 from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
+from ..asset_rules import PROTECTED_CONTEXT_FIELDS
 
 router = APIRouter(tags=['Governance'])
 
@@ -30,7 +31,7 @@ def _owner(db, owner_id):
 
 # These fields belong to the asset record. A shared plugin scenario can never
 # replace its criticality, regulatory memberships, or exposure context.
-ASSET_AUTHORITY_FIELDS = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure', 'production', 'publicly_accessible'}
+ASSET_AUTHORITY_FIELDS = PROTECTED_CONTEXT_FIELDS | {'production', 'publicly_accessible'}
 
 def _bulk_context(asset, submitted):
     effective = submitted.model_dump()

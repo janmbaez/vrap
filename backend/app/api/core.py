@@ -7,7 +7,7 @@ from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
 from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput
-from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules, resolve_rule_list
+from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
@@ -105,6 +105,9 @@ def update_group_assets(vulnerability_id: int, data: AssetUpdate, request: Reque
     workspace = request.state.session.workspace
     changes = data.model_dump(exclude_none=True)
     if not changes: raise HTTPException(422, 'Select at least one asset context value')
+    protected = sorted(set(changes) & PROTECTED_CONTEXT_FIELDS)
+    if protected:
+        raise HTTPException(422, 'Shared plugin assessment cannot change asset classification fields: ' + ', '.join(protected))
     asset_ids = db.scalars(select(Finding.asset_id).where(Finding.workspace == workspace,
                                                           Finding.vulnerability_id == vulnerability_id).distinct()).all()
     if not asset_ids: raise HTTPException(404, 'Plugin group not found')
@@ -198,7 +201,7 @@ def history(id: int, request: Request, user=Depends(require_user), db=Depends(ge
 
 def _asset_output(asset):
     return {'id': asset.id, 'hostname': asset.hostname, 'external_id': asset.external_id, 'ip': asset.ip,
-            'os': asset.os, 'tags': asset.tags, 'context': asset.context}
+            'os': asset.os, 'tags': asset.tags, 'context': asset.context, 'context_version': asset.context_version, 'context_provenance': asset.context_provenance}
 
 @router.get('/assets')
 def assets(request: Request, q: str = '', asset_criticality: str = '', business_criticality: str = '', environment: str = '', asset_type: str = '', owner: str = '', tag: str = '', regulatory: str = '', data_classification: str = '', limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
@@ -235,7 +238,8 @@ def create_asset(data: AssetCreate, request: Request, user=Depends(writer), db=D
         raise HTTPException(409, 'An asset with this external ID already exists in this environment')
     fields = data.model_dump(exclude_none=True)
     context = {key: fields.pop(key) for key in list(fields) if key in {'asset_criticality','business_criticality','data_classification','regulatory','environment','exposure','business_owner','it_owner','application_owner','asset_group','asset_type'}}
-    asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context, **fields)
+    asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context,
+                  context_provenance={key: {'source_system': 'manual', 'approval_state': 'Pending verification'} for key in context}, **fields)
     db.add(asset); db.flush()
     db.add(Audit(actor_id=user.id, action='asset.created', entity='asset', entity_id=asset.id, details={'hostname':asset.hostname, 'workspace':workspace}))
     db.commit(); db.refresh(asset)
@@ -247,6 +251,9 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
     if not asset or asset.workspace != request.state.session.workspace: raise HTTPException(404, 'Asset not found')
     before = _asset_output(asset)
     changes = data.model_dump(exclude_none=True)
+    protected = {key for key in changes if key in PROTECTED_CONTEXT_FIELDS and changes[key] != (asset.context or {}).get(key)}
+    if protected and user.role != 'Administrator':
+        raise HTTPException(403, 'Only an Administrator can change protected asset classification fields')
     if 'hostname' in changes:
         hostname = changes.pop('hostname').lower()
         duplicate = db.scalar(select(Asset.id).where(Asset.workspace == asset.workspace, Asset.hostname == hostname, Asset.id != asset.id))
@@ -261,7 +268,13 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
             setattr(asset, field, value)
     if 'tags' in changes:
         asset.tags = list(dict.fromkeys(changes.pop('tags')))[:100]
-    asset.context = {**asset.context, **changes}
+    if changes:
+        provenance = dict(asset.context_provenance or {})
+        for key in changes:
+            provenance[key] = {'source_system': 'asset_management', 'approval_state': 'Pending verification', 'updated_by': user.id}
+        asset.context = {**asset.context, **changes}
+        asset.context_provenance = provenance
+        asset.context_version += 1
     findings = db.scalars(select(Finding).where(Finding.asset_id == id, Finding.workspace == request.state.session.workspace)).all()
     for record in findings: record.revision += 1
     db.add(Audit(actor_id=user.id, action='asset.context_updated', entity='asset', entity_id=id,
@@ -304,15 +317,25 @@ def _reconcile_asset_rule_effects(db, workspace, prior_rules):
         old_context, _, _ = resolve_rule_list(prior_rules, asset.hostname, asset.ip, asset.tags)
         new_context, new_controls, new_applied = resolve_rule_list(current_rules, asset.hostname, asset.ip, asset.tags)
         context = dict(asset.context or {})
-        previous_managed = context.pop('_rule_context', old_context)
+        provenance = dict(asset.context_provenance or {})
+        stored_managed = context.pop('_rule_context', None)
+        # Older assets did not have explicit rule ownership.  Treat only values
+        # with rule provenance as disposable; keeping an ambiguous legacy value is
+        # safer than clearing a business-approved classification.
+        previous_managed = stored_managed if stored_managed is not None else {
+            key: value for key, value in old_context.items()
+            if provenance.get(key, {}).get('source_system') == 'asset_rule'
+        }
         for key, value in previous_managed.items():
             if context.get(key) == value:
                 context.pop(key, None)
+                provenance.pop(key, None)
         managed = {}
         for key, value in new_context.items():
             if key not in context:
                 context[key] = value
                 managed[key] = value
+                provenance[key] = {'source_system': 'asset_rule', 'approval_state': 'Provisional'}
         if managed:
             context['_rule_context'] = managed
         context['applied_rules'] = new_applied
@@ -332,6 +355,8 @@ def _reconcile_asset_rule_effects(db, workspace, prior_rules):
                 finding_changed = True
         if context_changed:
             asset.context = context
+            asset.context_provenance = provenance
+            asset.context_version += 1
         if context_changed or finding_changed:
             changed += 1
     return changed
@@ -368,7 +393,7 @@ def update_asset_rule(id: int, data: AssetRuleInput, user=Depends(admin), db=Dep
     values['context'] = data.context.model_dump(exclude_none=True)
     for key, value in values.items():
         setattr(rule, key, value if key != 'match_value' else value.strip())
-    affected = _reconcile_asset_rule_effects(db, None, prior_rules) if not rule.active else 0
+    affected = _reconcile_asset_rule_effects(db, None, prior_rules)
     db.add(Audit(actor_id=user.id, action='asset_rule.updated', entity='asset_rule', entity_id=id, details={'name':rule.name,'active':rule.active,'match_type':rule.match_type,'match_value':rule.match_value,'assets_reconciled':affected}))
     db.commit(); return {'id': rule.id, 'name': rule.name, 'active': rule.active, 'assets_reconciled': affected}
 
@@ -390,7 +415,20 @@ def apply_asset_rule(id: int, request: Request, user=Depends(admin), db=Depends(
     for asset in db.scalars(select(Asset).where(Asset.workspace == request.state.session.workspace)):
         rule_context, controls, applied = resolve_rules(db, asset.hostname, asset.ip, asset.tags)
         if not any(item['id'] == id for item in applied): continue
-        asset.context = {**asset.context, **rule_context, 'applied_rules': applied}
+        context = dict(asset.context or {})
+        provenance = dict(asset.context_provenance or {})
+        managed = {}
+        for key, value in rule_context.items():
+            if context.get(key) in (None, '', []):
+                context[key] = value
+                managed[key] = value
+                provenance[key] = {'source_system': 'asset_rule', 'approval_state': 'Provisional'}
+        if managed:
+            context['_rule_context'] = managed
+            asset.context_version += 1
+        context['applied_rules'] = applied
+        asset.context = context
+        asset.context_provenance = provenance
         for record in db.scalars(select(Finding).where(Finding.asset_id == asset.id)):
             observed = dict(record.observed); observed['default_controls'] = controls; observed['applied_rules'] = applied
             record.observed = observed; record.revision += 1

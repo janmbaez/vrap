@@ -1,5 +1,5 @@
 from datetime import date, datetime, timezone
-from sqlalchemy import String, Integer, JSON, ForeignKey, Text, Boolean, DateTime, Date, UniqueConstraint, Float, Index
+from sqlalchemy import String, Integer, JSON, ForeignKey, Text, Boolean, DateTime, Date, UniqueConstraint, Float, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -32,6 +32,9 @@ class Asset(Base):
     os: Mapped[str | None] = mapped_column(String(200))
     tags: Mapped[list] = mapped_column(JSON, default=list)
     context: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Context is versioned so a later classification workflow can reject stale writes.
+    context_version: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
+    context_provenance: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
     workspace: Mapped[str] = mapped_column(String(20), default='Production')
 
 class Vulnerability(Base):

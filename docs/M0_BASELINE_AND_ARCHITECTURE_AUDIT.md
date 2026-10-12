@@ -34,7 +34,7 @@
 | Import object IDOR and duplicate scope | Broken | `imports.py` did not apply workspace to every mutation or duplicate lookup | Critical | Fixed in M1 slice. |
 | Plugin bulk assessment preserves per-asset context | Broken | `bulk_assess_plugin` reused submitted `Context` for all findings | Critical | Fixed in M1 slice. |
 | Risk acceptance governance | Partial | Individual/bulk admin path existed; no segregation-of-duties model | High | Bulk acceptance is now blocked; formal approval redesign remains M1/M2. |
-| Asset provenance and immutable regulatory memberships | Missing | Free-form JSON `Asset.context`, no provenance/version tables | Critical | Design/migration planned before classification UI. |
+| Asset provenance and immutable regulatory memberships | Transitional enforcement | Migration `0007` stores context version/provenance; imports/rules preserve existing values and bulk plugin updates cannot change classifications | Critical | Independent memberships, approvals, and effective dates remain M1/M2 work. |
 | Current assessment denominator | Partial | Dashboard checks assessment revision/methodology; campaign and report definitions need one shared service | High | M1 follow-up. |
 | Material-change fingerprint | Missing | `services.ingest()` increments revision on any Tenable update | High | M1 follow-up. |
 | Atomic Tenable snapshot publication | Missing | Records are committed in batches during export | High | M1 follow-up. |
@@ -53,10 +53,10 @@
 ## M1 implementation plan
 
 1. **P0 completed in this slice:** endpoint workspace enforcement, self-approval guard, per-asset bulk context, and explicit promotion boundary.
-2. **P0 next:** asset-context provenance/locking and regulatory-membership table; material evidence fingerprint; cross-workspace audit of every mutation route.
+2. **P0 in progress:** context version/provenance migration and asset/rule safeguards are implemented. Independent regulatory memberships, classification-change approvals, material evidence fingerprint, and cross-workspace audit of every mutation route remain.
 3. **P1:** current/stale/draft denominator service shared by dashboard, campaigns, reports; Tenable staging snapshot and retry worker boundary.
 4. **M2:** classification-change request, review/approval workflow and accessibility-first quest.
 
 ## Rollback notes
 
-This slice contains no schema migration. Reverting its commit restores prior endpoint behavior, but doing so would reintroduce cross-workspace mutation and bulk-classification vulnerabilities. Deployment behavior is intentionally changed: image publication/deployment must be manually approved.
+M1 adds migration `0007` with additive defaults for asset-context provenance. Its downgrade is intentionally non-destructive so audit evidence is retained. Reverting application code alone restores prior endpoint behavior and may reintroduce cross-workspace mutation or bulk-classification vulnerabilities. Deployment behavior is intentionally changed: image publication/deployment must be manually approved.

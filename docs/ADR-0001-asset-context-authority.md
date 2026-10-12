@@ -23,4 +23,4 @@ Bulk risk acceptance is prohibited. A requester cannot approve or reject their o
 
 ## Consequences
 
-Existing assets without provenance remain transitional. The next migration must introduce explicit provenance and classification-change records before source systems, rules, or questionnaires can be trusted as authoritative.
+Migration `0007` now records an incrementing context version and per-field provenance. Imports and rules fill only unknown asset values, and rule reconciliation deletes only values explicitly marked rule-derived. Existing assets without provenance remain transitional: VRAP preserves ambiguous legacy values rather than risk clearing an authoritative classification. A future schema must add independent regulatory memberships, approval/effective-date records, and formal classification-change requests.
