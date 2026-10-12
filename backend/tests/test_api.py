@@ -756,6 +756,7 @@ def test_raci_template_and_preview_import(client):
     assert response.status_code == 200
     book = Workbook(); book.remove(book.active)
     sheets = {
+        'START HERE':['TEMPLATE VERSION', 'IMPORT MODE'],
         'TEAM DIRECTORY':['Observed team / group'], 'ROUTING RULES':['Rule ID'],
         'ASSET OVERRIDES':['Asset UUID'], 'PLUGIN OVERRIDES':['Plugin ID'],
         'RACI MATRIX':['ID'], 'ROLE MAPPING':['Source role'], 'TECH LANES':['Technical lane']}
