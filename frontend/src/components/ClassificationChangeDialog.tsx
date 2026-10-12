@@ -52,12 +52,14 @@ export function ClassificationChangeDialog({ asset, onClose, onSubmitted }: { as
         current_step: nextStep, responses: { classification: { context, regulatory: selectedScopes, owners, answers } },
       }) })
       setStep(nextStep)
+      return true
     } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
+    return false
   }
   async function goNext() { await saveDraft(Math.min(5, step + 1)) }
   async function attachEvidence() {
     if (!evidenceReference.trim()) { setError('Enter an evidence reference first.'); return }
-    await saveDraft(5)
+    if (!await saveDraft(5)) return
     setBusy(true)
     try {
       const added = await api<any>(`/assets/${asset.id}/classification-mission/evidence`, { method: 'POST', body: JSON.stringify({ evidence_type: evidenceType, reference: evidenceReference.trim() }) })
