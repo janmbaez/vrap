@@ -372,6 +372,8 @@ class RemediationPackageInput(Strict):
     finding_ids: list[int] = Field(default_factory=list, max_length=5000)
 
 class RemediationPackageUpdate(Strict):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    remediation_action: str | None = Field(default=None, min_length=1, max_length=10000)
     status: Literal['Open', 'In Progress', 'Blocked', 'Pending Verification', 'Verified Closed', 'Reopened'] | None = None
     owner_id: int | None = None
     jira_reference: str | None = Field(default=None, max_length=300)
