@@ -17,6 +17,7 @@
 - Finding evidence fingerprints now keep an unchanged Tenable rescan from advancing assessment revision; scan freshness and lifecycle transitions are stored separately.
 - The asset editor supplies the context version it loaded; stale protected-context writes are rejected with a conflict response.
 - Assessment-group detail is workspace-scoped, and the CI publish workflow’s malformed shell footer was removed and YAML-validated.
+- Tenable ingestion now keeps live writes in one transaction while progress uses a separate transaction; a failed or cancelled export cannot publish a partial finding population.
 
 ## Migration and rollback
 

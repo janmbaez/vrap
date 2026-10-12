@@ -154,3 +154,37 @@ def test_cleanup_tenable_duplicates_merges_same_stable_finding_id(db):
     remaining = db.query(Finding).filter(Finding.source == 'Tenable').all()
     assert len(remaining) == 1
     assert remaining[0].source_record['finding_id'] == 'stable-1'
+
+def test_failed_tenable_sync_does_not_publish_partial_findings(tmp_path, monkeypatch):
+    """The worker may update progress, but live findings publish only on success."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.db import Base
+    from app.models import SyncJob, User
+    from app.api import tenable as tenable_api
+
+    engine = create_engine(f'sqlite:///{tmp_path}/sync-atomic.db')
+    Base.metadata.create_all(engine)
+    Local = sessionmaker(engine, expire_on_commit=False)
+    with Local() as db:
+        db.add(User(id=1, username='sync-user', password_hash='test', role='Administrator', active=True))
+        job = SyncJob(kind='vulnerabilities', workspace='Production')
+        db.add(job); db.commit(); job_id = job.id
+
+    class FailingClient:
+        def __init__(self, *_args, **_kwargs): pass
+        async def export(self, _kind, progress=None):
+            if progress:
+                assert await progress({'status':'PROCESSING','total_chunks':1,'chunks_available_count':1}, {1})
+            yield [{'asset':{'uuid':'sync-asset','hostname':['sync-host']}, 'plugin':{'id':55,'name':'Sync test'},
+                    'port':{'port':443,'protocol':'tcp'}, 'severity':'High', 'finding_id':'sync-1'}]
+            raise TenableError('simulated export failure')
+        async def close(self): pass
+
+    monkeypatch.setattr(tenable_api, 'SessionLocal', Local)
+    monkeypatch.setattr(tenable_api, 'TenableClient', FailingClient)
+    asyncio.run(tenable_api.run_sync(job_id, 1))
+    with Local() as db:
+        assert db.query(Finding).count() == 0
+        assert db.get(SyncJob, job_id).status == 'Failed'
+    engine.dispose()

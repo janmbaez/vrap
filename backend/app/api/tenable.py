@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from types import SimpleNamespace
 from urllib.parse import urlparse
 from cryptography.fernet import Fernet, InvalidToken
@@ -110,6 +111,7 @@ async def test(user=Depends(admin), db=Depends(get_db)):
     return {'message': 'Connection authenticated successfully'}
 
 async def run_sync(job_id, actor_id):
+    """Synchronize into one transaction; progress is visible without publishing partial findings."""
     client = None
     try:
         with SessionLocal() as db:
@@ -119,35 +121,42 @@ async def run_sync(job_id, actor_id):
             counts = {'received': 0, 'created': 0, 'updated': 0, 'informational_skipped': 0,
                       'batches_processed': 0, 'progress_percent': 0}
             identity_cache = {}
-            since_commit = 0
-            async def export_progress(status, seen):
-                """Persist Tenable queue/chunk progress even before a first chunk arrives."""
-                db.refresh(job)
-                if job.status == 'Cancel requested':
-                    job.status, job.finished_at = 'Cancelled', now()
-                    job.counts = dict(counts)
-                    db.commit()
-                    return False
-                total = status.get('total_chunks') or status.get('chunks_total') or 0
-                available = status.get('chunks_available_count') or status.get('finished_chunks') or len(seen)
-                counts.update({'export_status': status.get('status', 'PROCESSING'), 'export_total_chunks': total,
-                               'export_available_chunks': available})
-                counts['progress_percent'] = min(99, int((len(seen) * 100 / total) if total else (3 if status.get('status') == 'QUEUED' else 5)))
-                job.counts = dict(counts)
-                db.commit()
-                return True
+
+            def progress_update(status=None, *, terminal=None):
+                """Use an independent transaction so status is observable, never publishing live rows."""
+                with SessionLocal() as progress_db:
+                    progress_job = progress_db.get(SyncJob, job_id)
+                    if not progress_job or progress_job.status == 'Cancel requested':
+                        return False
+                    if status:
+                        total = status.get('total_chunks') or status.get('chunks_total') or 0
+                        available = status.get('chunks_available_count') or status.get('finished_chunks') or 0
+                        counts.update({'export_status': status.get('status', 'PROCESSING'), 'export_total_chunks': total,
+                                       'export_available_chunks': available})
+                        counts['progress_percent'] = min(99, int((available * 100 / total) if total else (3 if status.get('status') == 'QUEUED' else 5)))
+                    progress_job.counts = dict(counts)
+                    try:
+                        progress_db.commit()
+                    except OperationalError:
+                        # SQLite permits a single writer. Keep correctness over a
+                        # transient progress update while an ingestion transaction is open.
+                        progress_db.rollback()
+                    return True
+
+            async def export_progress(status, _seen):
+                return progress_update(status)
+
             async for rows in client.export(job.kind, progress=export_progress):
                 for row in rows:
                     if job.kind == 'vulnerabilities':
-                        # Filter before accounting: informational records never consume
-                        # capacity or create/update a VRAP finding.
                         if canonical_severity(row.get('severity')) == 'Informational':
                             counts['informational_skipped'] += 1
                             continue
                         counts['received'] += 1
                         if counts['received'] > MAX_ACTIONABLE_VULNERABILITIES:
                             raise TenableError('Sync limit of 500,000 actionable vulnerabilities exceeded; narrow the Tenable export or use a durable worker for larger exports')
-                        _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True, workspace=job.workspace, actor_id=actor_id, cache=identity_cache)
+                        _, created = ingest(db, normalize(row), 'Tenable', row, update_existing=True,
+                                            workspace=job.workspace, actor_id=actor_id, cache=identity_cache)
                     else:
                         counts['received'] += 1
                         external = row.get('id') or row.get('uuid')
@@ -161,30 +170,15 @@ async def run_sync(job_id, actor_id):
                             db.add(asset)
                         asset.external_id, asset.ip, asset.os, asset.tags = external, first(row.get('ipv4s')), first(row.get('operating_systems')), normalized_asset_tags(row.get('tags'))
                     counts['created' if created else 'updated'] += 1
-                    since_commit += 1
-                    if since_commit >= PROGRESS_COMMIT_INTERVAL:
-                        # Publish partial findings and visible job progress while the
-                        # export continues. This avoids a long all-or-nothing wait.
-                        job.counts = dict(counts)
-                        db.commit()
-                        db.refresh(job)
-                        if job.status == 'Cancel requested':
-                            job.status, job.finished_at = 'Cancelled', now()
-                            job.counts = dict(counts)
-                            db.commit()
-                            return
-                        since_commit = 0
+                    if counts['received'] and counts['received'] % PROGRESS_COMMIT_INTERVAL == 0:
+                        db.flush()
+                        if not progress_update():
+                            raise TenableCancelled('Synchronization cancelled')
                 counts['batches_processed'] += 1
                 counts['progress_percent'] = min(99, counts['batches_processed'])
-                job.counts = dict(counts)
-                db.commit()
-                db.refresh(job)
-                if job.status == 'Cancel requested':
-                    job.status, job.finished_at = 'Cancelled', now()
-                    job.counts = dict(counts)
-                    db.commit()
-                    return
-                since_commit = 0
+                db.flush()
+                if not progress_update():
+                    raise TenableCancelled('Synchronization cancelled')
             counts['progress_percent'] = 100
             if job.kind == 'vulnerabilities':
                 counts.update(cleanup_tenable_duplicates(db, job.workspace))
@@ -199,7 +193,7 @@ async def run_sync(job_id, actor_id):
                 db.add(Audit(actor_id=actor_id, action='tenable.sync_cancelled', entity='sync', entity_id=job.id))
             else:
                 job.status, job.finished_at = 'Failed', now()
-                job.error = str(exc) if isinstance(exc, TenableError) else 'Sync stopped while normalizing or persisting upstream data; completed batches remain available.'
+                job.error = str(exc) if isinstance(exc, TenableError) else 'Sync stopped while normalizing or persisting upstream data; no partial findings were published.'
                 db.add(Audit(actor_id=actor_id, action='tenable.sync_failed', entity='sync', entity_id=job.id, details={'error': job.error}))
             db.commit()
     finally:
