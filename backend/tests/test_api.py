@@ -80,6 +80,20 @@ def test_atomic_revision_and_replay(client,db):
     assert h[0]['score']['inputs']['technical']['cvss']==9.8
     assert db.scalar(select(Audit).where(Audit.action=='assessment.saved'))
 
+def test_dashboard_and_executive_report_share_current_assessment_definition(client):
+    login(client)
+    finding=create(client)
+    assert client.post(f"/api/findings/{finding['id']}/assessments",json=body(finding)).status_code==201
+    dashboard=client.get('/api/dashboard').json()
+    report=client.get('/api/executive-report').json()
+    assert dashboard['completed']==1 and report['summary']['assessed']==1
+    config=deepcopy(DEFAULT); config['appetite']='Critical'
+    assert client.post('/api/methodologies',json={'version':'currentness-test','configuration':config}).status_code==201
+    dashboard=client.get('/api/dashboard').json()
+    report=client.get('/api/executive-report').json()
+    assert dashboard['completed']==0 and report['summary']['assessed']==0
+    assert report['assessment_posture']['stale_assessments']==1
+
 def test_methodology_immutable(client):
     login(client);f=create(client);payload=body(f)
     assert client.post(f"/api/findings/{f['id']}/assessments",json=payload).status_code==201

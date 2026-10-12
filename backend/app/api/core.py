@@ -11,6 +11,7 @@ from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
+from ..assessment_state import assessment_currency, latest_assessment_revision
 
 router = APIRouter(tags=['Workbench'])
 
@@ -450,11 +451,9 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     severity_counts = dict(db.execute(select(severity_value, func.count()).select_from(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, active).group_by(severity_value)).all())
     # Dashboard summaries must remain fast for six-figure finding volumes.  Join the
     # most recent assessment in one query instead of calling detail() for every row.
-    latest = (select(Assessment.instance_id.label('finding_id'), func.max(Assessment.revision).label('revision'))
-              .join(Finding, Assessment.instance_id == Finding.id)
-              .where(Finding.workspace == workspace).group_by(Assessment.instance_id).subquery())
+    latest = latest_assessment_revision()
     assessment_rows = db.execute(
-        select(Finding.id, Finding.revision.label('finding_revision'), Assessment.revision.label('assessment_revision'),
+        select(Finding.id, Assessment.id.label('assessment_id'), Finding.revision.label('finding_revision'), Assessment.revision.label('assessment_revision'),
                Assessment.methodology_id, Assessment.status, RiskScore.result)
         .join(latest, latest.c.finding_id == Finding.id)
         .join(Assessment, (Assessment.instance_id == latest.c.finding_id) & (Assessment.revision == latest.c.revision))
@@ -462,9 +461,12 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
         .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
         .where(Finding.workspace == workspace, active)
     ).all()
-    draft_statuses = {'Assessment In Progress', 'Context Required', 'Pending Validation'}
-    current_scores = [row for row in assessment_rows if row.result is not None and row.status not in draft_statuses
-                      and row.assessment_revision == row.finding_revision and row.methodology_id == methodology.id]
+    currencies = {row.id: assessment_currency(
+        assessment_id=row.assessment_id, assessment_revision=row.assessment_revision,
+        finding_revision=row.finding_revision, methodology_id=row.methodology_id,
+        active_methodology_id=methodology.id, status=row.status, score_present=row.result is not None)
+        for row in assessment_rows}
+    current_scores = [row for row in assessment_rows if currencies[row.id] == 'Current']
     rank = case((severity_value == 'Critical', 4), (severity_value == 'High', 3), (severity_value == 'Medium', 2), (severity_value == 'Low', 1), else_=0)
     vpr = cast(Finding.observed['vpr'].as_string(), Float)
     cvss = cast(Finding.observed['cvss'].as_string(), Float)
