@@ -389,6 +389,25 @@ def test_governance_workflow_template_exception_control_and_reporting(client):
     assert pdf.status_code==200 and pdf.headers['content-type']=='application/pdf'
     assert pdf.content.startswith(b'%PDF-') and len(pdf.content)>3000
 
+def test_plugin_template_versions_preview_and_preserve_workflow(client):
+    login(client); finding = create(client)
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    saved=client.put(f"/api/assessment-groups/{group['id']}/template",json={
+        'owner_id':2,'status':'Closed','notes':'Shared rationale','justification':'Template review completed',
+        'decision':'Remediation Required','technical_rationale':'Same vendor remediation applies',
+        'applicability':{},'controls':[]})
+    assert saved.status_code == 200
+    template=client.get(f"/api/assessment-groups/{group['id']}/template").json()
+    assert template['template_version']==1 and len(template['revisions'])==1
+    assert client.put(f"/api/findings/{finding['id']}/workflow",json={'owner_id':3,'status':'Investigating'}).status_code==200
+    preview=client.post(f"/api/assessment-groups/{group['id']}/template/apply?preview=true")
+    assert preview.status_code==200 and preview.json()['changed'] + preview.json()['unchanged'] >= 1
+    applied=client.post(f"/api/assessment-groups/{group['id']}/template/apply")
+    assert applied.status_code==200
+    detail=client.get(f"/api/findings/{finding['id']}").json()
+    assert detail['workflow_status']=='Investigating' and detail['asset']['hostname']
+    replay=client.post(f"/api/assessment-groups/{group['id']}/template/apply")
+    assert replay.status_code==200 and replay.json()['skipped'] >= 1
 def test_bulk_plugin_assessment_preserves_asset_authoritative_context(client):
     login(client)
     first=create(client)

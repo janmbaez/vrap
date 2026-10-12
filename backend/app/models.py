@@ -258,8 +258,22 @@ class PluginAssessmentTemplate(Base):
     justification: Mapped[str] = mapped_column(Text, default='')
     decision: Mapped[str] = mapped_column(String(60), default='Needs Further Assessment')
     controls: Mapped[list] = mapped_column(JSON, default=list)
+    template_version: Mapped[int] = mapped_column(Integer, default=1)
+    applicability: Mapped[dict] = mapped_column(JSON, default=dict)
+    technical_rationale: Mapped[str] = mapped_column(Text, default='')
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+class PluginAssessmentTemplateRevision(Base):
+    __tablename__ = 'plugin_assessment_template_revisions'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    template_id: Mapped[int] = mapped_column(ForeignKey('plugin_assessment_templates.id'), index=True)
+    workspace: Mapped[str] = mapped_column(String(20))
+    vulnerability_id: Mapped[int] = mapped_column(ForeignKey('vulnerabilities.id'))
+    version: Mapped[int] = mapped_column(Integer)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    changed_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 class BulkAssessmentJob(Base):
     __tablename__ = 'bulk_assessment_jobs'

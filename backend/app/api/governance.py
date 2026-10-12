@@ -11,7 +11,7 @@ from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent,
-                      BulkAssessmentJob, BulkAssessmentItem)
+                      BulkAssessmentJob, BulkAssessmentItem, PluginAssessmentTemplateRevision)
 from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
@@ -37,6 +37,16 @@ def _owner(db, owner_id):
     user = db.get(User, owner_id)
     if not user or not user.active: raise HTTPException(422, 'Owner is not an active user')
     return user
+
+def _template_applies(template, asset):
+    rules = template.applicability or {}
+    context = asset.context or {}
+    for key, expected in rules.items():
+        if key == 'tags':
+            if not set(expected or []).intersection(set(asset.tags or [])): return False
+        elif expected not in (None, '') and context.get(key) != expected:
+            return False
+    return True
 
 # These fields belong to the asset record. A shared plugin scenario can never
 # replace its criticality, regulatory memberships, or exposure context.
@@ -147,7 +157,10 @@ def get_template(vulnerability_id: int, request: Request, user=Depends(require_u
     if not item: return None
     return {'id': item.id, 'owner_id': item.owner_id, 'owner': db.get(User, item.owner_id).username if item.owner_id else None,
             'status': item.status, 'notes': item.notes, 'justification': item.justification, 'decision': item.decision,
-            'controls': item.controls, 'updated_at': item.updated_at.isoformat()}
+            'controls': item.controls, 'template_version': item.template_version, 'applicability': item.applicability,
+            'technical_rationale': item.technical_rationale, 'updated_at': item.updated_at.isoformat(),
+            'revisions': [{'version': r.version, 'created_at': r.created_at.isoformat(), 'changed_by': r.changed_by}
+                          for r in db.scalars(select(PluginAssessmentTemplateRevision).where(PluginAssessmentTemplateRevision.template_id == item.id).order_by(PluginAssessmentTemplateRevision.version.desc()))]}
 
 @router.put('/assessment-groups/{vulnerability_id}/template')
 def save_template(vulnerability_id: int, data: PluginTemplateInput, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -157,27 +170,47 @@ def save_template(vulnerability_id: int, data: PluginTemplateInput, request: Req
     item = db.scalar(select(PluginAssessmentTemplate).where(PluginAssessmentTemplate.workspace == workspace, PluginAssessmentTemplate.vulnerability_id == vulnerability_id))
     if not item:
         item = PluginAssessmentTemplate(workspace=workspace, vulnerability_id=vulnerability_id, updated_by=user.id); db.add(item)
-    for key, value in data.model_dump(mode='json').items(): setattr(item, key, value)
+    previous = {'owner_id': item.owner_id, 'status': item.status, 'notes': item.notes, 'justification': item.justification,
+                'decision': item.decision, 'controls': item.controls, 'applicability': item.applicability,
+                'technical_rationale': item.technical_rationale, 'template_version': item.template_version}
+    item.template_version = (item.template_version or 0) + 1
+    for key in ('owner_id', 'status', 'notes', 'justification', 'decision', 'controls', 'applicability', 'technical_rationale'):
+        setattr(item, key, getattr(data, key))
     item.updated_by = user.id; item.updated_at = datetime.now(timezone.utc)
-    db.add(Audit(actor_id=user.id, action='plugin_template.saved', entity='vulnerability', entity_id=vulnerability_id, details={'status': data.status, 'owner_id': data.owner_id}))
+    db.flush()
+    db.add(PluginAssessmentTemplateRevision(template_id=item.id, workspace=workspace, vulnerability_id=vulnerability_id,
+        version=item.template_version, snapshot={**previous, 'new': {key: getattr(item, key) for key in ('owner_id','status','notes','justification','decision','controls','applicability','technical_rationale','template_version')}}, changed_by=user.id))
+    db.add(Audit(actor_id=user.id, action='plugin_template.saved', entity='vulnerability', entity_id=vulnerability_id, details={'status': data.status, 'owner_id': data.owner_id, 'template_version': item.template_version}))
     db.commit(); return {'id': item.id, 'message': 'Plugin assessment template saved'}
 
 @router.post('/assessment-groups/{vulnerability_id}/template/apply')
-def apply_template(vulnerability_id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+def apply_template(vulnerability_id: int, request: Request, preview: bool = False, user=Depends(writer), db=Depends(get_db)):
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace)
     template = db.scalar(select(PluginAssessmentTemplate).where(PluginAssessmentTemplate.workspace == workspace, PluginAssessmentTemplate.vulnerability_id == vulnerability_id))
     if not template: raise HTTPException(409, 'Save a plugin template before applying it')
     if not template.justification.strip(): raise HTTPException(422, 'Template justification is required before applying')
-    method = active_methodology(db); rules = {c['name']: c for c in method.configuration['controls']}; applied = 0
+    method = active_methodology(db); rules = {c['name']: c for c in method.configuration['controls']}; applied = skipped = excluded = 0; changes = []
     for finding in db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)):
-        asset = db.get(Asset, finding.asset_id); controls = template.controls or []
+        asset = db.get(Asset, finding.asset_id)
+        if not _template_applies(template, asset): excluded += 1; continue
+        controls = template.controls or []
         technical = {**vulnerability.technical, **finding.observed}
         result = calculate(technical, asset.context or {}, controls, method.configuration, datetime.now(timezone.utc).date())
         result.update({'methodology_id': method.id, 'methodology_version': method.version, 'asset_snapshot': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}})
+        signature = hashlib.sha256(json.dumps({'template_id': template.id, 'template_version': template.template_version, 'context': asset.context or {}, 'controls': controls, 'rationale': template.technical_rationale}, sort_keys=True, default=str).encode()).hexdigest()
+        latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+        if latest and latest.context.get('_template_signature') == signature and latest.revision == finding.revision:
+            skipped += 1; continue
+        changes.append({'finding_id': finding.id, 'asset_id': asset.id, 'current_revision': finding.revision})
+        if preview: continue
         finding.revision += 1
+        prior_workflow = db.get(FindingWorkflow, finding.id)
+        decision = latest.decision if latest else template.decision
+        status = latest.status if latest else ('Assessed' if template.status not in ('New','Investigating') else 'Assessment In Progress')
+        context_snapshot = dict(asset.context or {}); context_snapshot['_template_signature'] = signature
         assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=user.id,
-                                context=asset.context or {}, notes=template.notes, justification=template.justification,
-                                decision=template.decision, status='Assessed' if template.status not in ('New','Investigating') else 'Assessment In Progress')
+                                context=context_snapshot, notes=template.notes, justification=template.justification,
+                                decision=decision, status=status)
         db.add(assessment); db.flush()
         for control in controls:
             rule = rules.get(control['name']);
@@ -186,10 +219,16 @@ def apply_template(vulnerability_id: int, request: Request, user=Depends(writer)
         workflow = db.get(FindingWorkflow, finding.id)
         if not workflow:
             workflow = FindingWorkflow(finding_id=finding.id, updated_by=user.id); db.add(workflow)
-        workflow.owner_id, workflow.status, workflow.updated_by = template.owner_id, template.status, user.id
+        # Existing ownership/workflow/decisions remain authoritative. A template
+        # can provide defaults only for an unassigned/new finding.
+        if workflow.owner_id is None: workflow.owner_id = template.owner_id
+        if workflow.status in (None, 'New'): workflow.status = template.status
+        workflow.updated_by = user.id
         applied += 1
-    db.add(Audit(actor_id=user.id, action='plugin_template.applied', entity='vulnerability', entity_id=vulnerability_id, details={'findings': applied}))
-    db.commit(); return {'findings_assessed': applied}
+    if preview:
+        return {'preview': True, 'template_version': template.template_version, 'changed': len(changes), 'unchanged': skipped, 'excluded': excluded, 'changes': changes}
+    db.add(Audit(actor_id=user.id, action='plugin_template.applied', entity='vulnerability', entity_id=vulnerability_id, details={'findings': applied, 'skipped': skipped, 'excluded': excluded, 'template_version': template.template_version}))
+    db.commit(); return {'findings_assessed': applied, 'skipped': skipped, 'excluded': excluded, 'template_version': template.template_version}
 
 @router.post('/assessment-groups/{vulnerability_id}/bulk-assess')
 def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):

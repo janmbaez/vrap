@@ -323,6 +323,10 @@ class PluginTemplateInput(Strict):
     justification: str = Field(default='', max_length=5000)
     decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required'] = 'Needs Further Assessment'
     controls: list[Control] = Field(default_factory=list, max_length=50)
+    applicability: dict[str, Any] = Field(default_factory=dict, max_length=20)
+    technical_rationale: str = Field(default='', max_length=10000)
+    overwrite_workflow: bool = False
+    overwrite_decision: bool = False
 
 class PluginBulkAssessmentInput(Strict):
     context: Context
