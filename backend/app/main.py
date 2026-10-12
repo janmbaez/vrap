@@ -45,6 +45,16 @@ async def security_headers(request: Request, call_next):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Referrer-Policy'] = 'no-referrer'
     response.headers['Cache-Control'] = 'no-store'
+    # The API only returns data, never executable page content. Keep its
+    # browser policy deliberately restrictive even when the SPA is hosted by a
+    # separate reverse proxy.
+    response.headers['Content-Security-Policy'] = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    response.headers['Cross-Origin-Resource-Policy'] = 'same-site'
+    response.headers['Permissions-Policy'] = 'camera=(), geolocation=(), microphone=()'
+    response.headers['X-Permitted-Cross-Domain-Policies'] = 'none'
+    if request.url.scheme == 'https':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
 
 @app.exception_handler(IntegrityError)

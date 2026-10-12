@@ -43,3 +43,8 @@
 - Writers can request changes to protected classification fields; administrators decide them. A requester cannot decide their own request, and Demo users cannot access a Production request by guessed identifier.
 - Approval performs a single version-checked update: it applies the requested protected context, records provenance, updates regulatory-scope memberships (including approved removals), increments context/finding revisions, and writes an audit record. A stale request is not applied.
 - This is an API-first governed workflow. The dedicated Classification Quest and reviewer UI remain M2 work; normal asset editing continues to reject scope removal so it cannot bypass this decision trail.
+
+### API browser hardening (current slice)
+
+- Every API response now carries a data-only Content Security Policy, frame denial, no-referrer/no-store defaults, cross-origin isolation policies, a disabled camera/geolocation/microphone permissions policy, and no cross-domain-policy files. HSTS is emitted only when the request is served over HTTPS.
+- The SPA is hosted separately, so these policies intentionally protect API responses without imposing a brittle script/style policy on the UI proxy.

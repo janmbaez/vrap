@@ -11,6 +11,15 @@ def create(client):
     r=client.post('/api/findings',json=DATA); assert r.status_code==201,r.text
     return r.json()
 def body(f): return {'expected_revision':f['revision'],'methodology_id':f['methodology_id'],'context':CONTEXT,'controls':[],'justification':'Reviewed business context','decision':'Remediation Required','status':'Assessed'}
+def test_api_security_headers_are_restrictive(client):
+    response = client.get('/api/health')
+    assert response.headers['content-security-policy'] == "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    assert response.headers['cross-origin-opener-policy'] == 'same-origin'
+    assert response.headers['cross-origin-resource-policy'] == 'same-site'
+    assert response.headers['permissions-policy'] == 'camera=(), geolocation=(), microphone=()'
+    assert response.headers['x-permitted-cross-domain-policies'] == 'none'
+
+
 def test_auth_rbac_csrf(client):
     assert client.get('/api/findings').status_code==401
     login(client,'viewer'); assert client.get('/api/findings').status_code==200
