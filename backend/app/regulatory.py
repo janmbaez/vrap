@@ -26,7 +26,7 @@ def active_scopes(db, asset):
     return persisted | legacy_scopes(asset)
 
 
-def add_scope_memberships(db, asset, scopes, *, source_system, approval_state='Pending verification', source_record_id=None):
+def add_scope_memberships(db, asset, scopes, *, source_system, approval_state='Pending verification', source_record_id=None, verified_by=None, verified_at=None):
     requested = set(normalize_scopes(scopes))
     persisted = set(db.scalars(select(AssetRegulatoryScope.scope).where(
         AssetRegulatoryScope.asset_id == asset.id,
@@ -39,5 +39,7 @@ def add_scope_memberships(db, asset, scopes, *, source_system, approval_state='P
             source_system=source_system,
             source_record_id=source_record_id,
             approval_state=approval_state,
+            verified_by=verified_by,
+            verified_at=verified_at,
         ))
     return active_scopes(db, asset) | requested

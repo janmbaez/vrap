@@ -227,6 +227,24 @@ class AssetUpdate(Strict):
     asset_group: str | None = Field(default=None, max_length=200)
     asset_type: str | None = Field(default=None, max_length=100)
 
+class ClassificationChangeRequestInput(Strict):
+    changes: AssetUpdate
+    expected_context_version: int = Field(ge=1)
+    justification: str = Field(min_length=1, max_length=5000)
+    evidence: str = Field(default='', max_length=10000)
+
+    @model_validator(mode='after')
+    def has_protected_change(self):
+        protected = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure'}
+        if not (set(self.changes.model_dump(exclude_none=True)) & protected):
+            raise ValueError('At least one protected asset classification field is required')
+        return self
+
+class ClassificationChangeDecision(Strict):
+    status: Literal['Approved', 'Rejected']
+    justification: str = Field(min_length=1, max_length=5000)
+
+
 class AssetEdit(AssetUpdate):
     # Supplied by the asset editor to reject stale protected-context writes.
     expected_context_version: int | None = Field(default=None, ge=1)

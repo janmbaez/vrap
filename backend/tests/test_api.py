@@ -428,3 +428,56 @@ def test_saved_filters_are_personal_and_workspace_scoped(client):
     assert updated.status_code==201 and client.get('/api/saved-filters').json()[0]['filters']=={'severity':'High'}
     assert client.delete(f"/api/saved-filters/{saved[0]['id']}").status_code==200
     assert client.get('/api/saved-filters').json()==[]
+
+def test_classification_change_request_requires_independent_approval(client, db):
+    login(client)
+    asset = client.post('/api/assets', json={
+        'hostname': 'governed-scope-asset', 'regulatory': ['PCI DSS', 'SOC 2'],
+    }).json()
+    asset_id = asset['id']
+
+    login(client, 'analyst')
+    request = client.post(f'/api/assets/{asset_id}/classification-change-requests', json={
+        'expected_context_version': asset['context_version'],
+        'changes': {'regulatory': ['SOC 2']},
+        'justification': 'The PCI system was decommissioned and scope was validated.',
+        'evidence': 'Approved decommission record DC-001.',
+    })
+    assert request.status_code == 201, request.text
+    change = request.json()
+    assert change['before_context']['regulatory'] == ['PCI DSS', 'SOC 2']
+    assert change['proposed_context']['regulatory'] == ['SOC 2']
+    assert client.put(f"/api/classification-change-requests/{change['id']}", json={
+        'status': 'Approved', 'justification': 'Self approval must be blocked.',
+    }).status_code == 403
+
+    login(client)
+    approved = client.put(f"/api/classification-change-requests/{change['id']}", json={
+        'status': 'Approved', 'justification': 'GRC evidence reviewed and approved.',
+    })
+    assert approved.status_code == 200, approved.text
+    assert approved.json()['status'] == 'Approved' and approved.json()['applied_at']
+    saved = client.get('/api/assets').json()['items'][0]
+    assert saved['context']['regulatory'] == ['SOC 2']
+    memberships = db.scalars(select(AssetRegulatoryScope).where(
+        AssetRegulatoryScope.asset_id == asset_id,
+    )).all()
+    by_scope = {row.scope: row for row in memberships}
+    assert by_scope['PCI DSS'].active is False
+    assert by_scope['SOC 2'].active is True
+    assert by_scope['SOC 2'].approval_state == 'Approved'
+
+
+def test_classification_change_request_is_workspace_scoped(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'production-governed-asset'}).json()
+    change = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'],
+        'changes': {'asset_criticality': 'High'},
+        'justification': 'Business impact review.',
+    }).json()
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, environment='Demo')
+    assert client.put(f"/api/classification-change-requests/{change['id']}", json={
+        'status': 'Approved', 'justification': 'Guessed ID.'
+    }).status_code == 404

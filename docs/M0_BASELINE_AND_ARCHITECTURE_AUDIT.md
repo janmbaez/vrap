@@ -54,7 +54,7 @@
 ## M1 implementation plan
 
 1. **P0 completed in this slice:** endpoint workspace enforcement, self-approval guard, per-asset bulk context, and explicit promotion boundary.
-2. **P0 in progress:** context version/provenance migration and asset/rule safeguards are implemented. Independent regulatory memberships, classification-change approvals, material evidence fingerprint, and cross-workspace audit of every mutation route remain.
+2. **P0 in progress:** context version/provenance migration and asset/rule safeguards are implemented. Classification-change approvals are now API-enforced; remaining M1 work includes snapshot-based Tenable ingestion, a complete mutation-route audit, and the dedicated M2 reviewer/quest UI.
 3. **P1:** current/stale/draft denominator service shared by dashboard, campaigns, reports; Tenable staging snapshot and retry worker boundary.
 4. **M2:** classification-change request, review/approval workflow and accessibility-first quest.
 

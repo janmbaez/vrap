@@ -52,6 +52,24 @@ class AssetRegulatoryScope(Base):
     valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+class AssetClassificationChangeRequest(Base):
+    __tablename__ = 'asset_classification_change_requests'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    approved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    status: Mapped[str] = mapped_column(String(30), default='Requested')
+    expected_context_version: Mapped[int] = mapped_column(Integer)
+    before_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    proposed_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    justification: Mapped[str] = mapped_column(Text)
+    evidence: Mapped[str] = mapped_column(Text, default='')
+    decision_justification: Mapped[str] = mapped_column(Text, default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
 class Vulnerability(Base):
     __tablename__ = 'vulnerabilities'
     id: Mapped[int] = mapped_column(primary_key=True)

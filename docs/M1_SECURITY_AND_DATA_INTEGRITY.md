@@ -36,3 +36,10 @@
 - Asset creation and imports write additive memberships. The existing JSON field remains available to the current UI, reports and filters while later M2 work can move them to the membership table.
 - Ordinary asset edits can add scope membership, but cannot remove a scope. Removal returns HTTP 409 until an authorized classification-change workflow records the request, review and approval. This prevents a local edit, import, or rule change from silently clearing PCI DSS or SOC 2 applicability.
 - Rollback: application rollback is safe because the compatibility projection is retained; the additive membership table and its audit history are intentionally not dropped by downgrade.
+
+### Governed classification-change requests (current slice)
+
+- Migration `0010` adds workspace-scoped, immutable-before/after classification-change request records with requester, evidence, expected context version, independent approver, decision rationale and applied timestamp.
+- Writers can request changes to protected classification fields; administrators decide them. A requester cannot decide their own request, and Demo users cannot access a Production request by guessed identifier.
+- Approval performs a single version-checked update: it applies the requested protected context, records provenance, updates regulatory-scope memberships (including approved removals), increments context/finding revisions, and writes an audit record. A stale request is not applied.
+- This is an API-first governed workflow. The dedicated Classification Quest and reviewer UI remain M2 work; normal asset editing continues to reject scope removal so it cannot bypass this decision trail.

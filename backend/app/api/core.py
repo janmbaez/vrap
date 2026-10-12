@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -305,6 +305,125 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
                  details={'before': before, 'after': _asset_output(asset), 'findings_flagged': len(findings)}))
     db.commit()
     return {**_asset_output(asset), 'findings_flagged': len(findings)}
+
+def _classification_request_output(db, item):
+    asset = db.get(Asset, item.asset_id)
+    return {
+        'id': item.id, 'asset_id': item.asset_id, 'asset_hostname': asset.hostname if asset else None,
+        'workspace': item.workspace, 'status': item.status,
+        'expected_context_version': item.expected_context_version,
+        'before_context': item.before_context, 'proposed_context': item.proposed_context,
+        'justification': item.justification, 'evidence': item.evidence,
+        'decision_justification': item.decision_justification,
+        'requested_by': item.requested_by, 'approved_by': item.approved_by,
+        'created_at': item.created_at.isoformat(),
+        'reviewed_at': item.reviewed_at.isoformat() if item.reviewed_at else None,
+        'applied_at': item.applied_at.isoformat() if item.applied_at else None,
+    }
+
+
+@router.get('/classification-change-requests')
+def classification_change_requests(request: Request, status: str = '', user=Depends(require_user), db=Depends(get_db)):
+    query = select(AssetClassificationChangeRequest).where(
+        AssetClassificationChangeRequest.workspace == request.state.session.workspace,
+    )
+    if status:
+        query = query.where(AssetClassificationChangeRequest.status == status)
+    rows = db.scalars(query.order_by(AssetClassificationChangeRequest.id.desc())).all()
+    return [_classification_request_output(db, item) for item in rows]
+
+
+@router.post('/assets/{id}/classification-change-requests', status_code=201)
+def request_classification_change(id: int, data: ClassificationChangeRequestInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    if data.expected_context_version != asset.context_version:
+        raise HTTPException(409, 'Asset context changed. Reload before requesting a classification change.')
+    proposed = data.changes.model_dump(exclude_none=True)
+    protected = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure'}
+    proposed = {key: value for key, value in proposed.items() if key in protected}
+    before = {key: (asset.context or {}).get(key) for key in proposed}
+    item = AssetClassificationChangeRequest(
+        asset_id=asset.id, workspace=asset.workspace, requested_by=user.id,
+        expected_context_version=asset.context_version, before_context=before,
+        proposed_context=proposed, justification=data.justification.strip(), evidence=data.evidence.strip(),
+    )
+    db.add(item); db.flush()
+    db.add(Audit(actor_id=user.id, action='asset.classification_change_requested', entity='asset', entity_id=asset.id,
+                 details={'request_id': item.id, 'before': before, 'proposed': proposed}))
+    db.commit(); db.refresh(item)
+    return _classification_request_output(db, item)
+
+
+@router.put('/classification-change-requests/{id}')
+def decide_classification_change(id: int, data: ClassificationChangeDecision, request: Request, user=Depends(admin), db=Depends(get_db)):
+    item = db.get(AssetClassificationChangeRequest, id)
+    if not item or item.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Classification change request not found')
+    if item.status != 'Requested':
+        raise HTTPException(409, 'Classification change request has already been decided')
+    if item.requested_by == user.id:
+        raise HTTPException(403, 'A requester cannot approve or reject their own classification change')
+    item.status = data.status
+    item.approved_by = user.id
+    item.reviewed_at = datetime.now(timezone.utc)
+    item.decision_justification = data.justification.strip()
+    asset = db.get(Asset, item.asset_id)
+    if data.status == 'Approved':
+        if not asset or asset.workspace != request.state.session.workspace:
+            raise HTTPException(404, 'Asset not found')
+        if asset.context_version != item.expected_context_version:
+            raise HTTPException(409, 'Asset context changed since this request was submitted; submit a new request.')
+        proposed = dict(item.proposed_context or {})
+        context = dict(asset.context or {})
+        if 'regulatory' in proposed:
+            current = active_scopes(db, asset)
+            # Ensure legacy projection values receive their own membership record
+            # before an approved removal is recorded.
+            add_scope_memberships(db, asset, current, source_system='legacy')
+            target = set(normalize_scopes(proposed['regulatory']))
+            for membership in db.scalars(select(AssetRegulatoryScope).where(
+                AssetRegulatoryScope.asset_id == asset.id,
+                AssetRegulatoryScope.active.is_(True),
+                AssetRegulatoryScope.scope.in_(current - target),
+            )):
+                membership.active = False
+                membership.removed_at = datetime.now(timezone.utc)
+                membership.approval_state = 'Removed by approved change'
+                membership.verified_by = user.id
+                membership.verified_at = datetime.now(timezone.utc)
+            reviewed_at = datetime.now(timezone.utc)
+            add_scope_memberships(db, asset, target - current,
+                                  source_system='classification_change_request',
+                                  source_record_id=str(item.id), approval_state='Approved',
+                                  verified_by=user.id, verified_at=reviewed_at)
+            for membership in db.scalars(select(AssetRegulatoryScope).where(
+                AssetRegulatoryScope.asset_id == asset.id,
+                AssetRegulatoryScope.active.is_(True),
+                AssetRegulatoryScope.scope.in_(target),
+            )):
+                membership.approval_state = 'Approved'
+                membership.verified_by = user.id
+                membership.verified_at = reviewed_at
+            proposed['regulatory'] = sorted(target) or ['None']
+        context.update(proposed)
+        provenance = dict(asset.context_provenance or {})
+        for key in proposed:
+            provenance[key] = {'source_system': 'classification_change_request', 'source_record_id': str(item.id),
+                               'approval_state': 'Approved', 'verified_by': user.id,
+                               'verified_at': datetime.now(timezone.utc).isoformat()}
+        asset.context = context
+        asset.context_provenance = provenance
+        asset.context_version += 1
+        for finding in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.workspace == asset.workspace)):
+            finding.revision += 1
+        item.applied_at = datetime.now(timezone.utc)
+    db.add(Audit(actor_id=user.id, action='asset.classification_change_' + data.status.casefold(), entity='asset', entity_id=item.asset_id,
+                 details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification}))
+    db.commit(); db.refresh(item)
+    return _classification_request_output(db, item)
+
 
 @router.delete('/assets/{id}')
 def delete_asset(id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
