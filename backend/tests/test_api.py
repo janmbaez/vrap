@@ -506,3 +506,24 @@ def test_classification_mission_draft_is_resumable_and_workspace_scoped(client):
     assert client.post('/api/auth/logout').status_code == 200
     login(client, environment='Demo')
     assert client.get(f"/api/assets/{asset['id']}/classification-mission").status_code == 404
+
+def test_classification_change_request_can_govern_owner_assignment(client):
+    login(client)
+    asset = client.post('/api/assets', json={'hostname': 'owner-governed-asset'}).json()
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, 'analyst')
+    request = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'],
+        'changes': {'business_owner': 'Payments leadership', 'it_owner': 'Endpoint engineering'},
+        'justification': 'Owner attestation completed.', 'evidence': 'BIA-123',
+    })
+    assert request.status_code == 201, request.text
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client)
+    approved = client.put(f"/api/classification-change-requests/{request.json()['id']}", json={
+        'status': 'Approved', 'justification': 'Attestation verified.',
+    })
+    assert approved.status_code == 200
+    current = next(item for item in client.get('/api/assets').json()['items'] if item['id'] == asset['id'])
+    assert current['context']['business_owner'] == 'Payments leadership'
+    assert current['context']['it_owner'] == 'Endpoint engineering'

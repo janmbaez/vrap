@@ -235,9 +235,9 @@ class ClassificationChangeRequestInput(Strict):
 
     @model_validator(mode='after')
     def has_protected_change(self):
-        protected = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure'}
-        if not (set(self.changes.model_dump(exclude_none=True)) & protected):
-            raise ValueError('At least one protected asset classification field is required')
+        governed = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure', 'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+        if not (set(self.changes.model_dump(exclude_none=True)) & governed):
+            raise ValueError('At least one governed asset field is required')
         return self
 
 class ClassificationChangeDecision(Strict):

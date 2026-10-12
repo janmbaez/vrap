@@ -388,8 +388,8 @@ def request_classification_change(id: int, data: ClassificationChangeRequestInpu
     if data.expected_context_version != asset.context_version:
         raise HTTPException(409, 'Asset context changed. Reload before requesting a classification change.')
     proposed = data.changes.model_dump(exclude_none=True)
-    protected = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure'}
-    proposed = {key: value for key, value in proposed.items() if key in protected}
+    governed = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure', 'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+    proposed = {key: value for key, value in proposed.items() if key in governed}
     before = {key: (asset.context or {}).get(key) for key in proposed}
     item = AssetClassificationChangeRequest(
         asset_id=asset.id, workspace=asset.workspace, requested_by=user.id,
