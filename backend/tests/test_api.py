@@ -141,6 +141,15 @@ def test_bad_upload_logout(client):
     assert client.post('/api/auth/logout').status_code==200
     assert client.get('/api/findings').status_code==401
 
+def test_assessment_group_detail_does_not_leak_between_workspaces(client):
+    login(client, environment='Production')
+    finding=create(client)
+    group_id=next(item for item in client.get('/api/assessment-groups').json()['items'] if item['plugin_id']=='test-100')['id']
+    assert group_id == finding['id'] or group_id > 0
+    assert client.post('/api/auth/logout').status_code==200
+    login(client, environment='Demo')
+    assert client.get(f'/api/assessment-groups/{group_id}').status_code==404
+
 def test_environment_isolation(client):
     login(client, environment='Demo'); demo=create(client)
     assert client.get('/api/auth/me').json()['environment']=='Demo'

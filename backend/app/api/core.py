@@ -91,7 +91,9 @@ def assessment_groups(request: Request, q: str = '', severity: str = '', limit: 
 @router.get('/assessment-groups/{vulnerability_id}')
 def assessment_group(vulnerability_id: int, request: Request, limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     vulnerability = db.get(Vulnerability, vulnerability_id)
-    if not vulnerability: raise HTTPException(404, 'Plugin group not found')
+    exists = db.scalar(select(Finding.id).where(Finding.workspace == request.state.session.workspace,
+                                                  Finding.vulnerability_id == vulnerability_id).limit(1))
+    if not vulnerability or not exists: raise HTTPException(404, 'Plugin group not found')
     base = (select(Finding).join(Asset).where(Finding.workspace == request.state.session.workspace,
                                                 Finding.vulnerability_id == vulnerability_id).order_by(Asset.hostname, Finding.id))
     total = db.scalar(select(func.count()).select_from(base.order_by(None).subquery())) or 0

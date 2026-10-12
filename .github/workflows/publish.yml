@@ -85,4 +85,3 @@ jobs:
             shyhotboy/vrap-web:${{ github.sha }}
       - name: Promotion boundary
         run: echo 'Images published. Deploy through an approved staging or production promotion runbook.'
-          fi
