@@ -2,7 +2,8 @@ from copy import deepcopy
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,User
+from app.models import Assessment,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,SyncJob,User,now
+from app.api.tenable import recover_stale_syncs
 from app.risk.policy import DEFAULT
 from conftest import login
 DATA={'hostname':'TEST-01','name':'Synthetic RCE','plugin_id':'test-100','severity':'Critical','cvss':9.8,'vpr':9.4}
@@ -28,6 +29,17 @@ def test_auth_rbac_csrf(client):
     login(client); client.headers.pop('X-CSRF-Token')
     assert client.post('/api/findings',json=DATA).status_code==403
     assert client.post('/api/auth/login',headers={'Origin':'https://evil.example'},json={'username':'admin','password':'Test-password-123!'}).status_code==403
+
+def test_stale_tenable_job_is_recovered_without_touching_active_job(db):
+    from datetime import timedelta
+    stale = SyncJob(kind='vulnerabilities', workspace='Production', started_at=now()-timedelta(hours=2))
+    active = SyncJob(kind='assets', workspace='Production', started_at=now())
+    db.add_all([stale, active]); db.commit()
+    recovered = recover_stale_syncs(db, 'Production')
+    assert [job.id for job in recovered] == [stale.id]
+    db.refresh(stale); db.refresh(active)
+    assert stale.status == 'Failed' and stale.counts['recovered_stale_job'] is True
+    assert active.status == 'Running'
 
 def test_administrator_can_change_role_and_audit_it(client, db):
     login(client)

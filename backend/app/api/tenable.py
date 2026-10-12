@@ -3,6 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from types import SimpleNamespace
 from urllib.parse import urlparse
+from datetime import timedelta
 from cryptography.fernet import Fernet, InvalidToken
 from ..auth import admin
 from ..config import settings
@@ -15,6 +16,29 @@ from ..schemas import TenableConfiguration
 router = APIRouter(prefix='/tenable', tags=['Tenable'])
 MAX_ACTIONABLE_VULNERABILITIES = 500000
 PROGRESS_COMMIT_INTERVAL = 250
+STALE_SYNC_AFTER = timedelta(minutes=30)
+
+def recover_stale_syncs(db, workspace):
+    """Release the single-sync lock after a worker/process dies.
+
+    BackgroundTasks are intentionally lightweight, so a process restart can leave
+    a job marked Running forever. Only old jobs are recovered; active work keeps
+    its lock and remains cancellable.
+    """
+    cutoff = now() - STALE_SYNC_AFTER
+    stale = db.scalars(select(SyncJob).where(
+        SyncJob.workspace == workspace,
+        SyncJob.status.in_(('Running', 'Cancel requested')),
+        SyncJob.started_at < cutoff,
+    )).all()
+    for job in stale:
+        job.status = 'Failed'
+        job.finished_at = now()
+        job.error = 'Synchronization worker stopped; retry the synchronization.'
+        job.counts = {**(job.counts or {}), 'recovered_stale_job': True}
+    if stale:
+        db.commit()
+    return stale
 
 def cipher():
     key = settings().credential_encryption_key
@@ -209,7 +233,9 @@ def sync(kind: str, background: BackgroundTasks, request: Request, user=Depends(
         raise HTTPException(409, 'Enable the integration first')
     if not ((state.access_key_encrypted and state.secret_key_encrypted) or (settings().tenable_access_key and settings().tenable_secret_key)):
         raise HTTPException(409, 'Configure credentials on the server first')
-    if db.scalar(select(SyncJob).where(SyncJob.status.in_(('Running', 'Cancel requested')))):
+    recover_stale_syncs(db, request.state.session.workspace)
+    if db.scalar(select(SyncJob).where(SyncJob.workspace == request.state.session.workspace,
+                                       SyncJob.status.in_(('Running', 'Cancel requested')))):
         raise HTTPException(409, 'A sync is already running')
     job = SyncJob(kind=kind, workspace=request.state.session.workspace)
     db.add(job)
