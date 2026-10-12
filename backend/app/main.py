@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -57,4 +57,15 @@ async def safe_error(request, exc):
 
 @app.get('/api/health')
 def health():
+    """Liveness only: the process can answer HTTP."""
     return {'status': 'ok'}
+
+@app.get('/api/health/ready')
+def readiness():
+    """Readiness: database access is available before a proxy sends traffic."""
+    try:
+        with SessionLocal() as db:
+            db.execute(select(1))
+    except OperationalError:
+        raise HTTPException(503, 'Database is not ready')
+    return {'status': 'ready'}

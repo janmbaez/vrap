@@ -255,8 +255,10 @@ def test_governance_workflow_template_exception_control_and_reporting(client):
     assert client.get(f"/api/findings/{first['id']}").json()['status']=='Assessment In Progress'
     workflow=client.put(f"/api/findings/{second['id']}/workflow",json={'owner_id':2,'status':'Remediation Planned'})
     assert workflow.status_code==200 and workflow.json()['owner_id']==2
+    login(client,'analyst')
     exception=client.post(f"/api/findings/{first['id']}/exceptions",json={'justification':'Temporary operational dependency requires documented acceptance','evidence':'Change record CAB-42','expires_at':'2030-01-01T00:00:00Z','review_frequency_days':30})
     assert exception.status_code==201
+    login(client)
     assert client.put(f"/api/exceptions/{exception.json()['id']}",json={'status':'Approved'}).status_code==200
     control=client.post('/api/controls',json={'name':'Privileged access review','description':'Quarterly review','evidence_requirements':'Approved review record','mappings':{'NIST':['PR.AA-05']},'design_maturity':3,'operating_effectiveness':4,'active':True})
     assert control.status_code==201
@@ -268,6 +270,43 @@ def test_governance_workflow_template_exception_control_and_reporting(client):
     pdf=client.get('/api/executive-report.pdf')
     assert pdf.status_code==200 and pdf.headers['content-type']=='application/pdf'
     assert pdf.content.startswith(b'%PDF-') and len(pdf.content)>3000
+
+def test_bulk_plugin_assessment_preserves_asset_authoritative_context(client):
+    login(client)
+    first=create(client)
+    second=client.post('/api/findings',json={**DATA,'hostname':'TEST-02'}).json()
+    first_asset=client.get(f"/api/findings/{first['id']}").json()['asset']['id']
+    second_asset=client.get(f"/api/findings/{second['id']}").json()['asset']['id']
+    assert client.put(f'/api/assets/{first_asset}',json={'asset_criticality':'Critical','regulatory':['PCI DSS','SOC 2'],'environment':'Production'}).status_code==200
+    assert client.put(f'/api/assets/{second_asset}',json={'asset_criticality':'Low','regulatory':['SOC 2'],'environment':'Test'}).status_code==200
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    submitted={**CONTEXT,'asset_criticality':'Low','regulatory':['None'],'environment':'Development'}
+    response=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json={
+        'context':submitted,'controls':[],'owner_id':1,'workflow_status':'Risk Review','notes':'Shared technical scenario',
+        'justification':'Preserve approved asset context','decision':'Remediation Required','status':'Assessed'})
+    assert response.status_code==200,response.text
+    first_assessment=client.get(f"/api/findings/{first['id']}/history").json()[0]
+    second_assessment=client.get(f"/api/findings/{second['id']}/history").json()[0]
+    assert first_assessment['score']['inputs']['context']['asset_criticality']=='Critical'
+    assert first_assessment['score']['inputs']['context']['regulatory']==['PCI DSS','SOC 2']
+    assert second_assessment['score']['inputs']['context']['asset_criticality']=='Low'
+    assert second_assessment['score']['inputs']['context']['environment']=='Test'
+
+def test_workspace_idor_is_blocked_for_exceptions_and_imports(client):
+    login(client)
+    finding=create(client)
+    exception=client.post(f"/api/findings/{finding['id']}/exceptions",json={'justification':'Production exception for isolation test','evidence':'CAB-77','expires_at':'2030-01-01T00:00:00Z','review_frequency_days':30}).json()
+    csv=b'hostname,name,plugin_id\nimport-host,Import test,import-plugin\n'
+    batch=client.post('/api/imports/preview',files={'file':('production.csv',csv,'text/csv')}).json()['id']
+    login(client,environment='Demo')
+    assert client.put(f"/api/exceptions/{exception['id']}",json={'status':'Approved'}).status_code==404
+    assert client.post(f'/api/imports/{batch}/validate',json={'mapping':{}}).status_code==404
+
+def test_exception_requester_cannot_self_approve(client):
+    login(client)
+    finding=create(client)
+    exception=client.post(f"/api/findings/{finding['id']}/exceptions",json={'justification':'Self approval must be blocked','evidence':'CAB-88','expires_at':'2030-01-01T00:00:00Z','review_frequency_days':30}).json()
+    assert client.put(f"/api/exceptions/{exception['id']}",json={'status':'Approved'}).status_code==403
 
 def test_plugin_bulk_assessment_applies_full_workbench_context(client):
     login(client); first=create(client)

@@ -8,7 +8,7 @@ from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent)
-from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput
+from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
 
@@ -27,6 +27,23 @@ def _owner(db, owner_id):
     user = db.get(User, owner_id)
     if not user or not user.active: raise HTTPException(422, 'Owner is not an active user')
     return user
+
+# These fields belong to the asset record. A shared plugin scenario can never
+# replace its criticality, regulatory memberships, or exposure context.
+ASSET_AUTHORITY_FIELDS = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure', 'production', 'publicly_accessible'}
+
+def _bulk_context(asset, submitted):
+    effective = submitted.model_dump()
+    for key in ASSET_AUTHORITY_FIELDS:
+        value = (asset.context or {}).get(key)
+        if value not in (None, '', []):
+            effective[key] = value
+    # These are derived by Context from the protected environment/exposure values.
+    if (asset.context or {}).get('environment') not in (None, ''):
+        effective['production'] = None
+    if (asset.context or {}).get('exposure') not in (None, ''):
+        effective['publicly_accessible'] = None
+    return Context(**effective)
 
 @router.get('/owners')
 def owners(user=Depends(require_user), db=Depends(get_db)):
@@ -91,25 +108,26 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, r
     findings = list(db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)))
     if not findings: raise HTTPException(404, 'No findings are available for this plugin')
     if data.decision == 'Risk Accepted' or data.status == 'Risk Accepted':
-        if user.role != 'Administrator': raise HTTPException(403, 'Only an Administrator can approve risk acceptance')
-        if data.decision != 'Risk Accepted' or data.status != 'Risk Accepted': raise HTTPException(422, 'Risk acceptance decision and status must agree')
+        raise HTTPException(422, 'Bulk assessment cannot approve risk acceptance; use the governed exception workflow')
     methodology = active_methodology(db)
     prepared=[]
     for finding in findings:
-        assessment_data = AssessmentInput(context=data.context, controls=data.controls, methodology_id=methodology.id,
+        asset = db.get(Asset, finding.asset_id)
+        effective_context = _bulk_context(asset, data.context)
+        assessment_data = AssessmentInput(context=effective_context, controls=data.controls, methodology_id=methodology.id,
             expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
         method, result = preview_score(db, finding, assessment_data)
         if data.decision == 'Within Risk Appetite' and result['above_appetite']:
             raise HTTPException(422, 'Residual risk is above appetite for one or more affected assets')
         if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
             raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
-        prepared.append((finding, method, result))
+        prepared.append((finding, method, result, effective_context))
     rules = {rule['name']: rule for rule in prepared[0][1].configuration['controls']}
     try:
-        for finding, method, result in prepared:
+        for finding, method, result, effective_context in prepared:
             finding.revision += 1
             assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=user.id,
-                context=data.context.model_dump(), notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+                context=effective_context.model_dump(), notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
             db.add(assessment); db.flush()
             for control in data.controls:
                 db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
@@ -125,7 +143,7 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, r
         db.commit()
     except Exception:
         db.rollback(); raise
-    return {'findings_assessed':len(prepared), 'assets_affected':len({finding.asset_id for finding,_,_ in prepared})}
+    return {'findings_assessed':len(prepared), 'assets_affected':len({finding.asset_id for finding,_,_,_ in prepared})}
 
 @router.put('/findings/{finding_id}/workflow')
 def update_workflow(finding_id: int, data: WorkflowInput, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -174,11 +192,13 @@ def request_exception(finding_id:int, data:ExceptionInput, request:Request, user
     db.add(item);db.flush();db.add(Audit(actor_id=user.id,action='exception.requested',entity='exception',entity_id=item.id,details={'finding_id':finding_id,'expires_at':expiry.isoformat()}));db.commit();return {'id':item.id,'status':item.status}
 
 @router.put('/exceptions/{id}')
-def decide_exception(id:int,data:ExceptionDecision,user=Depends(admin),db=Depends(get_db)):
+def decide_exception(id:int,data:ExceptionDecision,request:Request,user=Depends(admin),db=Depends(get_db)):
     item=db.get(RiskException,id)
-    if not item: raise HTTPException(404,'Exception not found')
+    if not item or item.workspace != _workspace(request): raise HTTPException(404,'Exception not found')
+    if item.requested_by == user.id:
+        raise HTTPException(403, 'A requester cannot approve or reject their own exception')
     item.status=data.status;item.approved_by=user.id;item.reviewed_at=datetime.now(timezone.utc)
-    db.add(Audit(actor_id=user.id,action='exception.'+data.status.lower(),entity='exception',entity_id=id));db.commit();return {'id':id,'status':item.status}
+    db.add(Audit(actor_id=user.id,action='exception.'+data.status.lower(),entity='exception',entity_id=id,details={'workspace':_workspace(request)}));db.commit();return {'id':id,'status':item.status}
 
 @router.get('/controls')
 def controls(request:Request,user=Depends(require_user),db=Depends(get_db)):
