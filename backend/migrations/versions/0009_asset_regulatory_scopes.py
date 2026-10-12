@@ -40,8 +40,6 @@ def upgrade():
                 exists = bind.execute(sa.text('SELECT 1 FROM asset_regulatory_scopes WHERE asset_id = :asset_id AND scope = :scope'), {'asset_id': row['id'], 'scope': str(scope)}).scalar()
                 if not exists:
                     bind.execute(sa.text("INSERT INTO asset_regulatory_scopes (asset_id, scope, active, source_system, approval_state, valid_from) VALUES (:asset_id, :scope, TRUE, 'legacy', 'Pending verification', CURRENT_TIMESTAMP)"), {'asset_id': row['id'], 'scope': str(scope)})
-    # Normalize legacy integer defaults when upgrading an existing PostgreSQL table.
-    bind.execute(sa.text("UPDATE asset_regulatory_scopes SET active = TRUE WHERE active = 1"))
 
 def downgrade():
     # Membership history is retained for audit even if application code is rolled back.

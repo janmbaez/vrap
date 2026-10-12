@@ -40,7 +40,7 @@ def preservation_check(engine):
             assert [{k: row[k] for k in rows[0]} for row in after] == rows
         assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0013'
         assert 'review_campaigns' in inspect(connection).get_table_names()
-        assert connection.scalar(text("SELECT scope FROM asset_regulatory_scopes WHERE asset_id = 910001 AND active = 1")) == 'PCI DSS'
+        assert connection.scalar(text("SELECT scope FROM asset_regulatory_scopes WHERE asset_id = 910001 AND active IS TRUE")) == 'PCI DSS'
         assert connection.scalar(text("SELECT source_system FROM asset_regulatory_scopes WHERE asset_id = 910001 AND scope = 'PCI DSS'")) == 'legacy'
         assert 'reviewed_at' in {column['name'] for column in inspect(connection).get_columns('finding_workflows')}
 
