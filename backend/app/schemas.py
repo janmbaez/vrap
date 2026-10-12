@@ -255,6 +255,11 @@ class ClassificationEvidenceInput(Strict):
     evidence_type: Literal['BIA', 'CMDB', 'owner_attestation', 'data_inventory', 'GRC_scope', 'network_evidence', 'other']
     reference: str = Field(min_length=1, max_length=10000)
     notes: str = Field(default='', max_length=5000)
+    expires_at: datetime | None = None
+
+class ClassificationReviewerAssignment(Strict):
+    role: Literal['owner', 'grc']
+    user_id: int | None = None
 
 
 class AssetEdit(AssetUpdate):

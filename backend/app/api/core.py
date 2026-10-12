@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -21,7 +21,7 @@ def _question_contract():
     return {question['id']: question for step in QUESTIONNAIRE['steps'] for question in step['questions']}
 
 def _validate_mission_responses(data: ClassificationMissionDraft):
-    if data.questionnaire_version != QUESTIONNAIRE['version']:
+    if data.questionnaire_version not in {QUESTIONNAIRE['version'], '1.0-provisional'}:
         raise HTTPException(409, 'Questionnaire version is no longer supported; start a new mission with the current version.')
     contract = _question_contract()
     # Drafts created before the versioned question contract used a small set of
@@ -44,6 +44,16 @@ def _validate_mission_responses(data: ClassificationMissionDraft):
                 raise HTTPException(422, f'Invalid values for {question_id}')
         if question['type'] == 'text' and (not isinstance(value, str) or len(value) > 200):
             raise HTTPException(422, f'Invalid value for {question_id}')
+    for question_id, question in contract.items():
+        condition = question.get('when')
+        if not condition:
+            continue
+        actual = data.responses.get(condition['question'])
+        active = actual in condition.get('in', [])
+        if active and question.get('required') and data.current_step >= 5 and not data.responses.get(question_id):
+            raise HTTPException(422, f'Response required for {question_id}')
+        if not active and data.responses.get(question_id):
+            raise HTTPException(422, f'{question_id} is not applicable for the selected context')
 
 def _mission_history(db, mission, actor_id, action):
     db.add(AssetClassificationMissionHistory(
@@ -378,7 +388,8 @@ def _mission_output(item):
             'questionnaire_version': item.questionnaire_version, 'status': item.status,
             'current_step': item.current_step, 'responses': item.responses,
             'created_by': item.created_by, 'updated_by': item.updated_by,
-            'updated_at': item.updated_at.isoformat()}
+            'updated_at': item.updated_at.isoformat(), 'owner_reviewer_id': item.owner_reviewer_id,
+            'grc_reviewer_id': item.grc_reviewer_id}
 
 
 @router.get('/assets/{id}/classification-mission')
@@ -404,6 +415,8 @@ def save_classification_mission(id: int, data: ClassificationMissionDraft, reque
         AssetClassificationMission.workspace == asset.workspace,
     ))
     if item:
+        if item.status in {'Approved', 'Cancelled'}:
+            raise HTTPException(409, 'This mission is closed and cannot be edited.')
         item.questionnaire_version = data.questionnaire_version
         item.current_step = data.current_step
         item.responses = data.responses
@@ -440,6 +453,24 @@ def classification_mission_history(id: int, request: Request, user=Depends(requi
                 AssetClassificationMissionHistory.workspace == asset.workspace,
             ).order_by(AssetClassificationMissionHistory.id.desc()))]
 
+@router.put('/assets/{id}/classification-mission/reviewers')
+def assign_classification_reviewer(id: int, data: ClassificationReviewerAssignment, request: Request, user=Depends(admin), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(AssetClassificationMission.asset_id == id, AssetClassificationMission.workspace == asset.workspace))
+    if not mission:
+        raise HTTPException(404, 'Classification mission not found')
+    if data.user_id is not None:
+        reviewer = db.get(User, data.user_id)
+        if not reviewer or not reviewer.active:
+            raise HTTPException(422, 'Reviewer is not active')
+    if data.role == 'owner': mission.owner_reviewer_id = data.user_id
+    else: mission.grc_reviewer_id = data.user_id
+    _mission_history(db, mission, user.id, f'{data.role}_reviewer_assigned')
+    db.commit(); db.refresh(mission)
+    return _mission_output(mission)
+
 
 @router.get('/assets/{id}/classification-mission/evidence')
 def classification_evidence(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
@@ -451,7 +482,9 @@ def classification_evidence(id: int, request: Request, user=Depends(require_user
     if not mission:
         return []
     return [{'id': row.id, 'evidence_type': row.evidence_type, 'reference': row.reference,
-             'notes': row.notes, 'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
+             'notes': row.notes, 'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+             'expired': bool(row.expires_at and row.expires_at <= datetime.now(timezone.utc)),
+             'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
             for row in db.scalars(select(AssetClassificationEvidence).where(
                 AssetClassificationEvidence.mission_id == mission.id).order_by(AssetClassificationEvidence.id.desc()))]
 
@@ -466,12 +499,15 @@ def add_classification_evidence(id: int, data: ClassificationEvidenceInput, requ
     if not mission:
         raise HTTPException(409, 'Save a classification mission draft before attaching evidence')
     row = AssetClassificationEvidence(mission_id=mission.id, asset_id=id, workspace=asset.workspace,
-        evidence_type=data.evidence_type, reference=data.reference.strip(), notes=data.notes.strip(), created_by=user.id)
+        evidence_type=data.evidence_type, reference=data.reference.strip(), notes=data.notes.strip(),
+        expires_at=data.expires_at, created_by=user.id)
     db.add(row); db.flush()
     db.add(Audit(actor_id=user.id, action='asset.classification_evidence_added', entity='asset', entity_id=id,
                  details={'mission_id': mission.id, 'evidence_id': row.id, 'evidence_type': row.evidence_type}))
     db.commit(); db.refresh(row)
     return {'id': row.id, 'evidence_type': row.evidence_type, 'reference': row.reference, 'notes': row.notes,
+            'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+            'expired': bool(row.expires_at and row.expires_at <= datetime.now(timezone.utc)),
             'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
 
 

@@ -84,6 +84,8 @@ class AssetClassificationMission(Base):
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    owner_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    grc_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
 
 class AssetClassificationMissionHistory(Base):
     __tablename__ = 'asset_classification_mission_history'
@@ -110,6 +112,7 @@ class AssetClassificationEvidence(Base):
     notes: Mapped[str] = mapped_column(Text, default='')
     created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class Vulnerability(Base):
     __tablename__ = 'vulnerabilities'
