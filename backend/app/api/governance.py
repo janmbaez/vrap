@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 router = APIRouter(tags=['Governance'])
 
 RACI_SHEETS = {
+    'START HERE': ['TEMPLATE VERSION', 'IMPORT MODE'],
     'TEAM DIRECTORY': ['Observed team / group', 'Source tag type', 'Support Owner assets', 'Change Owner assets', 'Patching Group assets', 'Proposed function', 'Jira project (APPROVED)', 'Jira team / queue (APPROVED)', 'Accountable manager (APPROVED)', 'Approval state', 'Auto ticket enabled?', 'Approval / evidence reference', 'Notes'],
     'ROUTING RULES': ['Rule ID', 'Priority', 'Source', 'Match value', 'Technical lane', 'Device type', 'OS', 'Responsible candidate', 'Accountable role', 'Prerequisite', 'Confidence', 'Auto action', 'Approval state', 'Guardrails'],
     'ASSET OVERRIDES': ['Asset UUID', 'Asset / hostname', 'Business Service ID', 'Remediation action', 'Technical lane', 'Remediation team (approved name)', 'Support Owner', 'Change Owner', 'Patching Group', 'Accountable manager', 'Approval state', 'Approval / evidence reference', 'Notes / exception reason'],
