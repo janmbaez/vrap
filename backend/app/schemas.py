@@ -228,6 +228,8 @@ class AssetUpdate(Strict):
     asset_type: str | None = Field(default=None, max_length=100)
 
 class AssetEdit(AssetUpdate):
+    # Supplied by the asset editor to reject stale protected-context writes.
+    expected_context_version: int | None = Field(default=None, ge=1)
     hostname: str | None = Field(default=None, min_length=1, max_length=255)
     ip: str | None = Field(default=None, max_length=60)
     os: str | None = Field(default=None, max_length=200)

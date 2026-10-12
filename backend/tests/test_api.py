@@ -262,6 +262,17 @@ def test_assessment_groups_plugin_assets_and_bulk_context(client):
     assert updated.status_code==200 and updated.json()=={'assets_updated':2,'findings_flagged':3}
     assert client.get(f"/api/findings/{other['id']}").json()['context']['asset_group']=='Windows fleet'
 
+def test_protected_asset_context_rejects_a_stale_editor_version(client):
+    login(client)
+    finding=create(client)
+    asset_id=finding['asset']['id']
+    first=client.put(f'/api/assets/{asset_id}',json={'asset_criticality':'High','expected_context_version':1})
+    assert first.status_code==200 and first.json()['context_version']==2
+    stale=client.put(f'/api/assets/{asset_id}',json={'asset_criticality':'Critical','expected_context_version':1})
+    assert stale.status_code==409
+    current=client.get('/api/assets').json()['items'][0]
+    assert current['context']['asset_criticality']=='High' and current['context_version']==2
+
 def test_rules_and_ingest_cannot_overwrite_existing_asset_classification(client):
     login(client)
     first=create(client)

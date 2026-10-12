@@ -238,6 +238,7 @@ def create_asset(data: AssetCreate, request: Request, user=Depends(writer), db=D
     if data.external_id and db.scalar(select(Asset.id).where(Asset.workspace == workspace, Asset.external_id == data.external_id)):
         raise HTTPException(409, 'An asset with this external ID already exists in this environment')
     fields = data.model_dump(exclude_none=True)
+    fields.pop('expected_context_version', None)
     context = {key: fields.pop(key) for key in list(fields) if key in {'asset_criticality','business_criticality','data_classification','regulatory','environment','exposure','business_owner','it_owner','application_owner','asset_group','asset_type'}}
     asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context,
                   context_provenance={key: {'source_system': 'manual', 'approval_state': 'Pending verification'} for key in context}, **fields)
@@ -252,9 +253,12 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
     if not asset or asset.workspace != request.state.session.workspace: raise HTTPException(404, 'Asset not found')
     before = _asset_output(asset)
     changes = data.model_dump(exclude_none=True)
+    expected_context_version = changes.pop('expected_context_version', None)
     protected = {key for key in changes if key in PROTECTED_CONTEXT_FIELDS and changes[key] != (asset.context or {}).get(key)}
     if protected and user.role != 'Administrator':
         raise HTTPException(403, 'Only an Administrator can change protected asset classification fields')
+    if protected and expected_context_version is not None and expected_context_version != asset.context_version:
+        raise HTTPException(409, 'Asset context changed. Reload the asset before saving classification fields.')
     if 'hostname' in changes:
         hostname = changes.pop('hostname').lower()
         duplicate = db.scalar(select(Asset.id).where(Asset.workspace == asset.workspace, Asset.hostname == hostname, Asset.id != asset.id))

@@ -15,6 +15,7 @@
 - Rule disable/delete reconciles only explicitly rule-derived values, preserving manual and ambiguous legacy context.
 - Shared assessment-currency rules now drive live dashboard counts, campaign score snapshots, and executive reporting. A current assessment is latest, completed, methodology-matching, revision-valid, and scored.
 - Finding evidence fingerprints now keep an unchanged Tenable rescan from advancing assessment revision; scan freshness and lifecycle transitions are stored separately.
+- The asset editor supplies the context version it loaded; stale protected-context writes are rejected with a conflict response.
 
 ## Migration and rollback
 
