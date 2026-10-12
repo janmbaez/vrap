@@ -512,12 +512,14 @@ def test_classification_change_request_can_govern_owner_assignment(client):
     asset = client.post('/api/assets', json={'hostname': 'owner-governed-asset'}).json()
     assert client.post('/api/auth/logout').status_code == 200
     login(client, 'analyst')
+    assert client.put(f"/api/assets/{asset['id']}/classification-mission", json={'current_step': 1, 'responses': {}}).status_code == 200
     request = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
         'expected_context_version': asset['context_version'],
         'changes': {'business_owner': 'Payments leadership', 'it_owner': 'Endpoint engineering'},
         'justification': 'Owner attestation completed.', 'evidence': 'BIA-123',
     })
     assert request.status_code == 201, request.text
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission").json()['status'] == 'Pending Owner Validation'
     assert client.post('/api/auth/logout').status_code == 200
     login(client)
     approved = client.put(f"/api/classification-change-requests/{request.json()['id']}", json={

@@ -442,7 +442,9 @@ def request_classification_change(id: int, data: ClassificationChangeRequestInpu
         AssetClassificationMission.workspace == asset.workspace,
     ))
     if mission:
-        mission.status = 'Pending GRC Approval'
+        mission.status = ('Pending Owner Validation'
+                          if set(proposed) & {'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+                          else 'Pending GRC Approval')
         mission.current_step = 5
         mission.updated_by = user.id
     db.add(Audit(actor_id=user.id, action='asset.classification_change_requested', entity='asset', entity_id=asset.id,
