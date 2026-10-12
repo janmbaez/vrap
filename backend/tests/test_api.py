@@ -527,3 +527,25 @@ def test_classification_change_request_can_govern_owner_assignment(client):
     current = next(item for item in client.get('/api/assets').json()['items'] if item['id'] == asset['id'])
     assert current['context']['business_owner'] == 'Payments leadership'
     assert current['context']['it_owner'] == 'Endpoint engineering'
+
+def test_classification_mission_tracks_review_decision(client):
+    login(client)
+    asset = client.post('/api/assets', json={'hostname': 'mission-decision-asset'}).json()
+    assert client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'current_step': 4, 'responses': {'classification': {'context': {'asset_criticality': 'High'}}},
+    }).status_code == 200
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, 'analyst')
+    request = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'], 'changes': {'asset_criticality': 'High'},
+        'justification': 'BIA completed.',
+    })
+    assert request.status_code == 201
+    pending = client.get(f"/api/assets/{asset['id']}/classification-mission").json()
+    assert pending['status'] == 'Pending GRC Approval' and pending['current_step'] == 5
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client)
+    assert client.put(f"/api/classification-change-requests/{request.json()['id']}", json={
+        'status': 'Rejected', 'justification': 'Evidence is incomplete.',
+    }).status_code == 200
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission").json()['status'] == 'Rejected'

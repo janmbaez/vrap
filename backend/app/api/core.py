@@ -397,6 +397,14 @@ def request_classification_change(id: int, data: ClassificationChangeRequestInpu
         proposed_context=proposed, justification=data.justification.strip(), evidence=data.evidence.strip(),
     )
     db.add(item); db.flush()
+    mission = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == asset.id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    if mission:
+        mission.status = 'Pending GRC Approval'
+        mission.current_step = 5
+        mission.updated_by = user.id
     db.add(Audit(actor_id=user.id, action='asset.classification_change_requested', entity='asset', entity_id=asset.id,
                  details={'request_id': item.id, 'before': before, 'proposed': proposed}))
     db.commit(); db.refresh(item)
@@ -466,6 +474,13 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
         for finding in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.workspace == asset.workspace)):
             finding.revision += 1
         item.applied_at = datetime.now(timezone.utc)
+    mission = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == item.asset_id,
+        AssetClassificationMission.workspace == item.workspace,
+    ))
+    if mission:
+        mission.status = data.status
+        mission.updated_by = user.id
     db.add(Audit(actor_id=user.id, action='asset.classification_change_' + data.status.casefold(), entity='asset', entity_id=item.asset_id,
                  details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification}))
     db.commit(); db.refresh(item)

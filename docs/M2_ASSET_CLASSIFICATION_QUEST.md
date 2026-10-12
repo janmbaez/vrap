@@ -30,3 +30,5 @@ This is a governed request/review flow, not yet the full five-stage accessible q
 The protected classification form is now a five-stage flow: identity, business context, data/regulatory scope, exposure, and review. Each forward step persists a resumable draft. The final stage presents the proposed context and submits a governed approval request; it does not publish a classification directly.
 
 The identity stage now supports governed proposals for business, IT and application owners plus asset group. Owner assignments are never created as verified merely by completing the quest; they become operative only after the existing independent review decision.
+
+Quest drafts now transition to **Pending GRC Approval** when their protected change request is submitted, and to **Approved** or **Rejected** with the independent decision. These states remain distinct from the operative asset context and from vulnerability-review status.
