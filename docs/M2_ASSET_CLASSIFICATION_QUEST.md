@@ -32,3 +32,7 @@ The protected classification form is now a five-stage flow: identity, business c
 The identity stage now supports governed proposals for business, IT and application owners plus asset group. Owner assignments are never created as verified merely by completing the quest; they become operative only after the existing independent review decision.
 
 Quest drafts now transition to **Pending GRC Approval** when their protected change request is submitted, and to **Approved** or **Rejected** with the independent decision. These states remain distinct from the operative asset context and from vulnerability-review status.
+
+## Versioned questionnaire contract
+
+`GET /api/classification-questionnaire` exposes the source-controlled `1.0-provisional` question bank. Each question has a stable ID, field mapping, response type, allowed values where applicable, and supported evidence-source types. Quest drafts persist an `answers` map keyed by these IDs. Later questionnaire versions must add new IDs rather than reinterpret saved answers.

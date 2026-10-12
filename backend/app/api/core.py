@@ -13,6 +13,7 @@ from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
 from ..assessment_state import assessment_currency, latest_assessment_revision
 from ..regulatory import active_scopes, add_scope_memberships, normalize_scopes
+from ..classification_questionnaire import QUESTIONNAIRE
 
 router = APIRouter(tags=['Workbench'])
 
@@ -320,6 +321,11 @@ def _classification_request_output(db, item):
         'reviewed_at': item.reviewed_at.isoformat() if item.reviewed_at else None,
         'applied_at': item.applied_at.isoformat() if item.applied_at else None,
     }
+
+
+@router.get('/classification-questionnaire')
+def classification_questionnaire(user=Depends(require_user)):
+    return QUESTIONNAIRE
 
 
 @router.get('/classification-change-requests')

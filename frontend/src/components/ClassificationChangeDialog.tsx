@@ -38,8 +38,14 @@ export function ClassificationChangeDialog({ asset, onClose, onSubmitted }: { as
   async function saveDraft(nextStep = step) {
     setError(''); setBusy(true)
     try {
+      const answers = {
+        'identity.business_owner': owners.business_owner, 'identity.it_owner': owners.it_owner,
+        'identity.application_owner': owners.application_owner, 'business.criticality': context.business_criticality,
+        'business.asset_criticality': context.asset_criticality, 'data.classification': context.data_classification,
+        'scope.regulatory': selectedScopes, 'exposure.environment': context.environment, 'exposure.network': context.exposure,
+      }
       await api(`/assets/${asset.id}/classification-mission`, { method: 'PUT', body: JSON.stringify({
-        current_step: nextStep, responses: { classification: { context, regulatory: selectedScopes, owners } },
+        current_step: nextStep, responses: { classification: { context, regulatory: selectedScopes, owners, answers } },
       }) })
       setStep(nextStep)
     } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }

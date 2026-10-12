@@ -549,3 +549,11 @@ def test_classification_mission_tracks_review_decision(client):
         'status': 'Rejected', 'justification': 'Evidence is incomplete.',
     }).status_code == 200
     assert client.get(f"/api/assets/{asset['id']}/classification-mission").json()['status'] == 'Rejected'
+
+def test_classification_questionnaire_uses_stable_versioned_ids(client):
+    login(client)
+    questionnaire = client.get('/api/classification-questionnaire').json()
+    assert questionnaire['version'] == '1.0-provisional'
+    question_ids = [question['id'] for step in questionnaire['steps'] for question in step['questions']]
+    assert len(question_ids) == len(set(question_ids))
+    assert {'identity.business_owner', 'scope.regulatory', 'exposure.network'} <= set(question_ids)
