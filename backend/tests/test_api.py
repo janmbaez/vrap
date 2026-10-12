@@ -467,11 +467,31 @@ def test_plugin_bulk_assessment_applies_full_workbench_context(client):
         'notes':'Shared validation completed','justification':'The plugin has the same exposure across this asset group',
         'decision':'Remediation Required','status':'Assessed'})
     assert response.status_code==200,response.text
-    assert response.json()=={'findings_assessed':2,'assets_affected':2}
+    body = response.json()
+    assert body['total'] == 2 and body['status'] in ('Queued', 'Running') and body['correlation_id']
+    body = client.get(f"/api/bulk-assessment-jobs/{body['id']}").json()
+    assert body['succeeded'] == 2 and body['processed'] == 2 and body['failed'] == 0
     for finding in (first,second):
         detail=client.get(f"/api/findings/{finding['id']}").json()
         assert detail['status']=='Assessed' and detail['context']['asset_criticality']=='Critical'
 
+def test_plugin_bulk_job_is_idempotent_and_reports_progress(client):
+    login(client); create(client)
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    payload={'context':CONTEXT,'controls':[],'owner_id':1,'workflow_status':'Risk Review',
+             'notes':'Idempotent job','justification':'Retry-safe bulk assessment',
+             'decision':'Remediation Required','status':'Assessed','idempotency_key':'bulk-test-key-001'}
+    first=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json=payload)
+    assert first.status_code == 200
+    original=first.json()
+    original=client.get(f"/api/bulk-assessment-jobs/{original['id']}").json()
+    assert original['status']=='Completed' and original['progress_percent']==100
+    retry=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json=payload)
+    assert retry.status_code == 200
+    assert retry.json()['id'] == original['id']
+    assert retry.json()['succeeded'] == original['succeeded']
+    status=client.get(f"/api/bulk-assessment-jobs/{original['id']}")
+    assert status.status_code == 200 and status.json()['correlation_id'] == original['correlation_id']
 def test_saved_filters_are_personal_and_workspace_scoped(client):
     login(client)
     created=client.post('/api/saved-filters',json={'name':'Critical unassessed','filters':{'severity':'Critical','status':'Not Assessed','q':''}})

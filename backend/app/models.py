@@ -261,6 +261,40 @@ class PluginAssessmentTemplate(Base):
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
+class BulkAssessmentJob(Base):
+    __tablename__ = 'bulk_assessment_jobs'
+    __table_args__ = (UniqueConstraint('workspace', 'vulnerability_id', 'idempotency_key'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), index=True)
+    vulnerability_id: Mapped[int] = mapped_column(ForeignKey('vulnerabilities.id'), index=True)
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(30), default='Queued', index=True)
+    active_only: Mapped[bool] = mapped_column(Boolean, default=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    finding_ids: Mapped[list] = mapped_column(JSON, default=list)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    correlation_id: Mapped[str] = mapped_column(String(64), unique=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+class BulkAssessmentItem(Base):
+    __tablename__ = 'bulk_assessment_items'
+    __table_args__ = (UniqueConstraint('job_id', 'finding_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey('bulk_assessment_jobs.id'), index=True)
+    finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), index=True)
+    status: Mapped[str] = mapped_column(String(30), default='Pending', index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    assessment_id: Mapped[int | None] = mapped_column(ForeignKey('assessments.id'))
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
 class FindingWorkflow(Base):
     __tablename__ = 'finding_workflows'
     finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), primary_key=True)

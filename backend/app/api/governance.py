@@ -1,13 +1,17 @@
 from datetime import datetime, timezone, timedelta
+import hashlib
+import json
+import uuid
 from io import BytesIO, StringIO
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select, func, case, update, delete
 from ..db import get_db
 from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
-                      ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent)
+                      ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent,
+                      BulkAssessmentJob, BulkAssessmentItem)
 from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
@@ -45,6 +49,87 @@ def _bulk_context(asset, submitted):
     if (asset.context or {}).get('exposure') not in (None, ''):
         effective['publicly_accessible'] = None
     return Context(**effective)
+
+def _bulk_signature(finding, context, data):
+    payload = {'finding_revision': finding.revision, 'context': context.model_dump(mode='json'),
+               'controls': [c.model_dump(mode='json') for c in data.controls],
+               'notes': data.notes, 'justification': data.justification,
+               'decision': data.decision, 'status': data.status, 'workflow_status': data.workflow_status,
+               'owner_id': data.owner_id}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+def _bulk_job_output(db, job):
+    errors = [{'finding_id': row.finding_id, 'error': row.error} for row in db.scalars(
+        select(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed'))]
+    return {'id': job.id, 'status': job.status, 'vulnerability_id': job.vulnerability_id,
+            'correlation_id': job.correlation_id, 'total': job.total, 'processed': job.processed,
+            'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed,
+            'progress_percent': round((job.processed / job.total) * 100) if job.total else 100,
+            'error': job.error, 'errors': errors,
+            'created_at': job.created_at.isoformat(), 'started_at': job.started_at.isoformat() if job.started_at else None,
+            'finished_at': job.finished_at.isoformat() if job.finished_at else None}
+
+def run_bulk_assessment_job(job_id: int, request_db=None):
+    """Process one finding per transaction so a crash can resume without duplicate revisions."""
+    from .core import preview_score
+    from ..db import SessionLocal
+    session_context = request_db or SessionLocal()
+    with session_context as db:
+        job = db.get(BulkAssessmentJob, job_id)
+        if not job or job.status in ('Completed', 'Cancelled'): return
+        job.status, job.started_at, job.error = 'Running', job.started_at or datetime.now(timezone.utc), None
+        db.commit()
+        payload = dict(job.payload)
+        snapshot_revisions = payload.pop('finding_revisions', {})
+        data = PluginBulkAssessmentInput(**payload)
+        for item in db.scalars(select(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Pending').order_by(BulkAssessmentItem.id)).all():
+            db.refresh(job)
+            if job.status == 'Cancel requested':
+                job.status, job.finished_at = 'Cancelled', datetime.now(timezone.utc)
+                db.commit(); return
+            finding = db.get(Finding, item.finding_id)
+            try:
+                if not finding or finding.workspace != job.workspace:
+                    raise ValueError('Finding is no longer available in this workspace')
+                snapshot_revision = snapshot_revisions.get(str(finding.id))
+                if snapshot_revision is not None and finding.revision != snapshot_revision:
+                    raise ValueError('Finding changed after preflight; review conflict before retrying')
+                asset = db.get(Asset, finding.asset_id)
+                effective_context = _bulk_context(asset, data.context)
+                method, result = preview_score(db, finding, AssessmentInput(context=effective_context, controls=data.controls, methodology_id=active_methodology(db).id, expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status))
+                signature = _bulk_signature(finding, effective_context, data)
+                latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+                if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision:
+                    item.status, job.skipped = 'Skipped', job.skipped + 1
+                else:
+                    finding.revision += 1
+                    context_json = effective_context.model_dump(mode='json'); context_json['_bulk_signature'] = signature
+                    assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=job.requested_by, context=context_json, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+                    db.add(assessment); db.flush()
+                    rules = {rule['name']: rule for rule in method.configuration['controls']}
+                    for control in data.controls:
+                        db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
+                    asset_snapshot = {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}
+                    result.update({'methodology_id': method.id, 'methodology_version': method.version, 'asset_snapshot': asset_snapshot})
+                    db.add(RiskScore(assessment_id=assessment.id, result=result))
+                    workflow = db.get(FindingWorkflow, finding.id)
+                    if not workflow:
+                        workflow = FindingWorkflow(finding_id=finding.id, updated_by=job.requested_by); db.add(workflow)
+                    # Deliberately preserve ownership and decisions unless explicitly supplied on a new workflow.
+                    if workflow.owner_id is None and data.owner_id is not None: workflow.owner_id = data.owner_id
+                    if workflow.status in (None, 'New'): workflow.status = data.workflow_status
+                    workflow.updated_by = job.requested_by
+                    item.status, item.assessment_id, job.succeeded = 'Succeeded', assessment.id, job.succeeded + 1
+                item.processed_at = datetime.now(timezone.utc); job.processed += 1
+                db.commit()
+            except Exception as exc:
+                db.rollback(); job = db.get(BulkAssessmentJob, job_id); item = db.get(BulkAssessmentItem, item.id)
+                item.status, item.error, item.processed_at = 'Failed', str(exc), datetime.now(timezone.utc)
+                job.failed += 1; job.processed += 1; db.commit()
+        job = db.get(BulkAssessmentJob, job_id)
+        job.status, job.finished_at = ('Failed' if job.failed else 'Completed'), datetime.now(timezone.utc)
+        db.add(Audit(actor_id=job.requested_by, action='plugin_assessment.bulk_finished', entity='bulk_assessment_job', entity_id=job.id, details={'correlation_id': job.correlation_id, 'processed': job.processed, 'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed}))
+        db.commit()
 
 @router.get('/owners')
 def owners(user=Depends(require_user), db=Depends(get_db)):
@@ -102,7 +187,7 @@ def apply_template(vulnerability_id: int, request: Request, user=Depends(writer)
     db.commit(); return {'findings_assessed': applied}
 
 @router.post('/assessment-groups/{vulnerability_id}/bulk-assess')
-def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):
     """Apply the complete workbench assessment once across a plugin's current finding population."""
     from .core import preview_score
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace); _owner(db, data.owner_id)
@@ -137,28 +222,52 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, r
         return {'dry_run': True, 'findings': len(prepared), 'assets_affected': len({finding.asset_id for finding,_,_,_ in prepared}),
                 'conflicts': conflicts, 'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
                                                          'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required'])}}
-    rules = {rule['name']: rule for rule in prepared[0][1].configuration['controls']}
-    try:
-        for finding, method, result, effective_context in prepared:
-            finding.revision += 1
-            assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=user.id,
-                context=effective_context.model_dump(), notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
-            db.add(assessment); db.flush()
-            for control in data.controls:
-                db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
-            asset=db.get(Asset, finding.asset_id)
-            result.update({'methodology_id':method.id, 'methodology_version':method.version, 'asset_snapshot':{'id':asset.id,'hostname':asset.hostname,'ip':asset.ip,'os':asset.os,'tags':asset.tags}})
-            db.add(RiskScore(assessment_id=assessment.id, result=result))
-            workflow=db.get(FindingWorkflow,finding.id)
-            if not workflow:
-                workflow=FindingWorkflow(finding_id=finding.id,updated_by=user.id); db.add(workflow)
-            workflow.owner_id, workflow.status, workflow.updated_by = data.owner_id, data.workflow_status, user.id
-        db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_applied', entity='vulnerability', entity_id=vulnerability_id,
-            details={'findings':len(prepared),'decision':data.decision,'status':data.status,'workflow_status':data.workflow_status,'context':data.context.model_dump()}))
-        db.commit()
-    except Exception:
-        db.rollback(); raise
-    return {'findings_assessed':len(prepared), 'assets_affected':len({finding.asset_id for finding,_,_,_ in prepared})}
+    key = data.idempotency_key or str(uuid.uuid4())
+    existing = db.scalar(select(BulkAssessmentJob).where(BulkAssessmentJob.workspace == workspace, BulkAssessmentJob.vulnerability_id == vulnerability_id, BulkAssessmentJob.idempotency_key == key))
+    if existing:
+        return _bulk_job_output(db, existing)
+    finding_ids = [finding.id for finding, _, _, _ in prepared]
+    payload = data.model_dump(mode='json', exclude={'dry_run', 'idempotency_key'})
+    payload['finding_revisions'] = {str(f.id): f.revision for f in findings}
+    job = BulkAssessmentJob(workspace=workspace, vulnerability_id=vulnerability_id, requested_by=user.id,
+        idempotency_key=key, status='Queued', active_only=data.active_only, payload=payload,
+        finding_ids=finding_ids, total=len(finding_ids), correlation_id=uuid.uuid4().hex)
+    db.add(job); db.flush()
+    db.add_all([BulkAssessmentItem(job_id=job.id, finding_id=finding_id) for finding_id in finding_ids])
+    db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_started', entity='bulk_assessment_job', entity_id=job.id,
+                 details={'correlation_id': job.correlation_id, 'vulnerability_id': vulnerability_id, 'active_only': data.active_only, 'total': len(finding_ids)}))
+    db.commit(); db.refresh(job)
+    # Tests use an isolated in-memory database that is not the application's
+    # SessionLocal engine; pass that session so legacy synchronous tests remain
+    # deterministic while deployed jobs use an independent worker session.
+    # SQLite test/demo sessions may be isolated in-memory engines; reuse that
+    # session so the request and worker see the same schema. PostgreSQL uses a
+    # fresh SessionLocal worker for restart-safe execution.
+    background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
+    return _bulk_job_output(db, job) | {'status': 'Queued'}
+
+@router.get('/bulk-assessment-jobs/{job_id}')
+def bulk_job(job_id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    job = db.get(BulkAssessmentJob, job_id)
+    if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
+    return _bulk_job_output(db, job)
+
+@router.post('/bulk-assessment-jobs/{job_id}/cancel')
+def cancel_bulk_job(job_id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+    job = db.get(BulkAssessmentJob, job_id)
+    if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
+    if job.status not in ('Queued', 'Running'): raise HTTPException(409, 'Only queued or running jobs can be cancelled')
+    job.status = 'Cancel requested'; db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_cancel_requested', entity='bulk_assessment_job', entity_id=job.id, details={'correlation_id': job.correlation_id})); db.commit()
+    return _bulk_job_output(db, job)
+
+@router.post('/bulk-assessment-jobs/{job_id}/resume')
+def resume_bulk_job(job_id: int, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):
+    job = db.get(BulkAssessmentJob, job_id)
+    if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
+    if job.status not in ('Failed', 'Cancelled', 'Interrupted'): raise HTTPException(409, 'Only failed, cancelled, or interrupted jobs can resume')
+    db.execute(update(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed').values(status='Pending', error=None, processed_at=None))
+    job.status = 'Queued'; job.error = None; job.failed = 0; db.commit(); background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
+    return _bulk_job_output(db, job)
 
 @router.put('/findings/{finding_id}/workflow')
 def update_workflow(finding_id: int, data: WorkflowInput, request: Request, user=Depends(writer), db=Depends(get_db)):
