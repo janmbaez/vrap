@@ -18,11 +18,11 @@ const label = (value:string) => value.replaceAll('_',' ').replace(/\b\w/g, lette
 export default function AssessmentGroups({ user }: { user:User }) {
   const [groups,setGroups] = useState<Group[]>([]), [total,setTotal] = useState(0), [offset,setOffset] = useState(0), [q,setQ] = useState(''), [severity,setSeverity] = useState('')
   const [selected,setSelected] = useState<Group>(), [detail,setDetail] = useState<GroupDetail>(), [owners,setOwners] = useState<any[]>([]), [controlDefs,setControlDefs] = useState<any[]>([]), [controls,setControls] = useState<Control[]>([])
-  const [error,setError] = useState(''), [message,setMessage] = useState(''), [busy,setBusy] = useState(false)
+  const [error,setError] = useState(''), [message,setMessage] = useState(''), [busy,setBusy] = useState(false), [questStep,setQuestStep] = useState(1), [preview,setPreview] = useState<any>(null)
   const load = () => api<any>(`/assessment-groups?${new URLSearchParams({ q, severity, limit:'50', offset:String(offset) })}`).then(data => { setGroups(data.items); setTotal(data.total); setError('') }).catch(err => setError(err.message))
   useEffect(() => { const timer = setTimeout(load,200); return () => clearTimeout(timer) }, [q,severity,offset])
   async function open(group:Group) {
-    setSelected(group); setDetail(undefined); setControls([]); setMessage(''); setError('')
+    setSelected(group); setDetail(undefined); setControls([]); setMessage(''); setError(''); setQuestStep(1); setPreview(null)
     try { const [items,people,methods] = await Promise.all([api<GroupDetail>(`/assessment-groups/${group.id}`),api<any[]>('/owners'),api<any[]>('/methodologies')]); setDetail(items); setOwners(people); setControlDefs(methods[0]?.configuration?.controls || []) } catch (err) { setError((err as Error).message) }
   }
   function assessmentContext(form:FormData) {
@@ -36,7 +36,8 @@ export default function AssessmentGroups({ user }: { user:User }) {
     if (!window.confirm(`Apply this complete assessment to all ${detail.total.toLocaleString()} findings for ${selected.name}? Each finding will retain its asset relationship and its own audit record.`)) return
     const form = new FormData(event.currentTarget); setBusy(true); setError('')
     try {
-      const result = await api<any>(`/assessment-groups/${selected.id}/bulk-assess`,{method:'POST',body:JSON.stringify({ context:assessmentContext(form), controls, owner_id:form.get('owner_id') ? Number(form.get('owner_id')) : null, workflow_status:form.get('workflow_status'), status:form.get('status'), decision:form.get('decision'), notes:form.get('notes'), justification:form.get('justification') })})
+      const result = await api<any>(`/assessment-groups/${selected.id}/bulk-assess`,{method:'POST',body:JSON.stringify({ context:assessmentContext(form), controls, owner_id:form.get('owner_id') ? Number(form.get('owner_id')) : null, workflow_status:form.get('workflow_status'), status:form.get('status'), decision:form.get('decision'), notes:form.get('notes'), justification:form.get('justification'), active_only:form.get('active_only') === 'on', dry_run:questStep < 4 })})
+      if (questStep < 4) { setPreview(result); setQuestStep(4); setMessage(`Preview ready: ${result.findings.toLocaleString()} findings across ${result.assets_affected.toLocaleString()} assets. Review the conflict and risk summary, then submit again to confirm.`); return }
       setDetail(await api(`/assessment-groups/${selected.id}`)); setMessage(`Complete assessment applied to ${result.findings_assessed.toLocaleString()} findings across ${result.assets_affected.toLocaleString()} assets.`); load()
     } catch (err) { setError((err as Error).message) } finally { setBusy(false) }
   }

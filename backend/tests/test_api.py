@@ -410,6 +410,21 @@ def test_bulk_plugin_assessment_preserves_asset_authoritative_context(client):
     assert second_assessment['score']['inputs']['context']['asset_criticality']=='Low'
     assert second_assessment['score']['inputs']['context']['environment']=='Test'
 
+def test_plugin_bulk_dry_run_reports_conflicts_without_mutation(client):
+    login(client)
+    finding = create(client)
+    asset_id = client.get(f"/api/findings/{finding['id']}").json()['asset']['id']
+    assert client.put(f'/api/assets/{asset_id}', json={'asset_criticality':'Critical','regulatory':['PCI DSS']}).status_code == 200
+    group = next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    response = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json={
+        'context': {**CONTEXT, 'asset_criticality':'Low', 'regulatory':['None']},
+        'justification':'Preview only', 'dry_run':True, 'active_only':True,
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()['dry_run'] is True and response.json()['findings'] == 1
+    assert response.json()['conflicts']
+    assert client.get(f"/api/findings/{finding['id']}/history").json() == []
+
 def test_workspace_idor_is_blocked_for_exceptions_and_imports(client):
     login(client)
     finding=create(client)

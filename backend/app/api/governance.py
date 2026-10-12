@@ -106,15 +106,25 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, r
     """Apply the complete workbench assessment once across a plugin's current finding population."""
     from .core import preview_score
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace); _owner(db, data.owner_id)
-    findings = list(db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)))
+    query = select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)
+    findings = list(db.scalars(query))
+    if data.active_only:
+        findings = [finding for finding in findings if (db.get(FindingWorkflow, finding.id) or FindingWorkflow(status='New')).status != 'Closed']
     if not findings: raise HTTPException(404, 'No findings are available for this plugin')
     if data.decision == 'Risk Accepted' or data.status == 'Risk Accepted':
         raise HTTPException(422, 'Bulk assessment cannot approve risk acceptance; use the governed exception workflow')
     methodology = active_methodology(db)
-    prepared=[]
+    prepared=[]; conflicts=[]
     for finding in findings:
         asset = db.get(Asset, finding.asset_id)
         effective_context = _bulk_context(asset, data.context)
+        submitted = data.context.model_dump()
+        protected_conflicts = {key: {'asset': (asset.context or {}).get(key), 'requested': submitted.get(key)}
+                               for key in ASSET_AUTHORITY_FIELDS
+                               if submitted.get(key) not in (None, '', []) and (asset.context or {}).get(key) not in (None, '', [])
+                               and submitted.get(key) != (asset.context or {}).get(key)}
+        if protected_conflicts:
+            conflicts.append({'finding_id': finding.id, 'asset_id': asset.id, 'fields': protected_conflicts})
         assessment_data = AssessmentInput(context=effective_context, controls=data.controls, methodology_id=methodology.id,
             expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
         method, result = preview_score(db, finding, assessment_data)
@@ -123,6 +133,10 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, r
         if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
             raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
         prepared.append((finding, method, result, effective_context))
+    if data.dry_run:
+        return {'dry_run': True, 'findings': len(prepared), 'assets_affected': len({finding.asset_id for finding,_,_,_ in prepared}),
+                'conflicts': conflicts, 'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
+                                                         'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required'])}}
     rules = {rule['name']: rule for rule in prepared[0][1].configuration['controls']}
     try:
         for finding, method, result, effective_context in prepared:

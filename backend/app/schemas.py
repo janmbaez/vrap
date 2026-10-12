@@ -333,6 +333,9 @@ class PluginBulkAssessmentInput(Strict):
     justification: str = Field(min_length=1, max_length=5000)
     decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Risk Accepted'] = 'Needs Further Assessment'
     status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
+    active_only: bool = True
+    dry_run: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=120)
 
     @model_validator(mode='after')
     def unique_controls(self):
