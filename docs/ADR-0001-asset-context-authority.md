@@ -9,7 +9,7 @@ Plugin assessment submissions represent shared technical scenario information. T
 
 For every finding in a bulk plugin assessment, VRAP merges shared scenario fields with the current asset-held values. Non-empty asset-held authority fields win. The resulting context is persisted with that individual assessment and evaluated per finding.
 
-Bulk risk acceptance is prohibited. A requester cannot approve or reject their own exception. Formal separation of duties, provenance, effective dates, and classification-change requests require the planned M1/M2 schema extension.
+Bulk risk acceptance is prohibited. A requester cannot approve or reject their own exception. The delivered M1 schema extension now records governed classification-change requests and independent regulatory memberships. Delegated authority, questionnaire state and richer evidence lifecycle remain M2 work.
 
 ## Authority matrix
 

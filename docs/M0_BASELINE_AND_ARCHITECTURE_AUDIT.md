@@ -35,13 +35,13 @@
 | Import object IDOR and duplicate scope | Broken | `imports.py` did not apply workspace to every mutation or duplicate lookup | Critical | Fixed in M1 slice. |
 | Plugin bulk assessment preserves per-asset context | Broken | `bulk_assess_plugin` reused submitted `Context` for all findings | Critical | Fixed in M1 slice. |
 | Risk acceptance governance | Partial | Individual/bulk admin path existed; no segregation-of-duties model | High | Bulk acceptance is now blocked; formal approval redesign remains M1/M2. |
-| Asset provenance and immutable regulatory memberships | Transitional enforcement | Migration `0007` stores context version/provenance; imports/rules preserve existing values and bulk plugin updates cannot change classifications | Critical | Independent memberships, approvals, and effective dates remain M1/M2 work. |
+| Asset provenance and immutable regulatory memberships | Transitional enforcement | Migration `0007` stores context version/provenance; imports/rules preserve existing values and bulk plugin updates cannot change classifications | Critical | Independent memberships, provenance/effective dates, controlled removal, and API-backed independent approvals are now implemented; the versioned questionnaire and richer attestation workflow remain M2 work. |
 | Current assessment denominator | Transitional enforcement | `assessment_state.py` supplies shared latest/current/stale predicates to dashboard, campaign snapshot and executive report | High | Extend to all queues/exports and add material evidence fingerprint. |
 | Material-change fingerprint | Transitional enforcement | `0008` stores evidence fingerprint, source freshness, and lifecycle revision; unchanged rescans retain assessment revision | High | Define materiality for non-scanner evidence and extend lifecycle monitoring. |
 | Atomic Tenable snapshot publication | Transitional enforcement | Live Tenable writes remain uncommitted until the export completes; independent job-progress commits do not publish findings | High | Replace the long transaction with a durable staging snapshot/worker for very large production exports. |
 | TLS/trusted proxy/cookie deployment safety | Partial | Headers/cookies exist; Docker used unrestricted forwarded headers and main push redeployed | High | Automatic deployment removed; proxy boundary narrowed. |
 | Control evidence lifecycle | Partial | Assessment controls have evidence and validation fields, no expiry/recertification | Medium | M5. |
-| Mission Center / classification quest | Missing | No authoritative proposal/wizard models | Medium | M2/M3. |
+| Mission Center / classification quest | Missing | API-backed protected change requests and a review UI now exist; versioned questionnaire, persisted drafts and branching wizard remain missing | Medium | M2/M3. |
 
 ## Threat model summary
 
@@ -56,7 +56,7 @@
 1. **P0 completed in this slice:** endpoint workspace enforcement, self-approval guard, per-asset bulk context, and explicit promotion boundary.
 2. **P0 in progress:** context version/provenance migration and asset/rule safeguards are implemented. Classification-change approvals are now API-enforced; remaining M1 work includes snapshot-based Tenable ingestion, a complete mutation-route audit, and the dedicated M2 reviewer/quest UI.
 3. **P1:** current/stale/draft denominator service shared by dashboard, campaigns, reports; Tenable staging snapshot and retry worker boundary.
-4. **M2:** classification-change request, review/approval workflow and accessibility-first quest.
+4. **M2:** extend the delivered change-request UI into an accessibility-first, versioned classification quest with drafts, branching, evidence lifecycle and owner/GRC assignments.
 
 ## Rollback notes
 
