@@ -148,6 +148,9 @@ class Methodology(Base):
     configuration: Mapped[dict] = mapped_column(JSON)
     created_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    lifecycle_status: Mapped[str] = mapped_column(String(30), default='Provisional')
+    approved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class Assessment(Base):
     __tablename__ = 'assessments'
@@ -418,6 +421,10 @@ class ControlLibrary(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    validator_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recertification_days: Mapped[int] = mapped_column(Integer, default=365)
 
 class SavedFilter(Base):
     __tablename__ = 'saved_filters'

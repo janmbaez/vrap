@@ -842,7 +842,7 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
 
 @router.get('/methodologies')
 def methodologies(user=Depends(require_user), db=Depends(get_db)):
-    return [{'id': m.id, 'version': m.version, 'configuration': m.configuration, 'created_at': m.created_at.isoformat()} for m in db.scalars(select(Methodology).order_by(Methodology.id.desc()))]
+    return [{'id': m.id, 'version': m.version, 'configuration': m.configuration, 'lifecycle_status': m.lifecycle_status, 'approved_by': m.approved_by, 'created_at': m.created_at.isoformat()} for m in db.scalars(select(Methodology).order_by(Methodology.id.desc()))]
 
 @router.post('/methodologies', status_code=201)
 def add_methodology(data: MethodologyCreate, user=Depends(admin), db=Depends(get_db)):
@@ -854,6 +854,15 @@ def add_methodology(data: MethodologyCreate, user=Depends(admin), db=Depends(get
     db.add(Audit(actor_id=user.id, action='methodology.published', entity='methodology', entity_id=method.id, details={'version': method.version}))
     db.commit()
     return {'id': method.id, 'version': method.version}
+
+@router.post('/methodologies/{id}/approve')
+def approve_methodology(id: int, user=Depends(admin), db=Depends(get_db)):
+    method = db.get(Methodology, id)
+    if not method: raise HTTPException(404, 'Methodology not found')
+    if method.created_by == user.id: raise HTTPException(409, 'Methodology approval requires separation of duties')
+    method.lifecycle_status = 'Approved'; method.approved_by = user.id; method.approved_at = datetime.now(timezone.utc)
+    db.add(Audit(actor_id=user.id, action='methodology.approved', entity='methodology', entity_id=id, details={'version': method.version})); db.commit()
+    return {'id': id, 'version': method.version, 'lifecycle_status': method.lifecycle_status}
 
 @router.get('/audit')
 def audit(request: Request, user=Depends(require_user), db=Depends(get_db)):

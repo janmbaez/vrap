@@ -410,6 +410,9 @@ class ControlLibraryInput(Strict):
     operating_effectiveness: int | None = Field(default=None, ge=1, le=5)
     last_tested_at: datetime | None = None
     active: bool = True
+    validator_id: int | None = None
+    expires_at: datetime | None = None
+    recertification_days: int = Field(default=365, ge=1, le=3650)
 
 class RuleControl(Control):
     validated: bool = False
