@@ -94,17 +94,34 @@ def raci_apply(import_id: int, request: Request, user=Depends(admin), db=Depends
     assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all(); asset_rows = batch.mapping.get('ASSET OVERRIDES', [])
     applied = conflicts = unmatched = 0; matched_ids = set()
     for row in asset_rows:
-        candidates = [a for a in assets if (row.get('Asset UUID') and a.external_id == str(row['Asset UUID'])) or (row.get('Asset / hostname') and a.hostname.lower() == str(row['Asset / hostname']).lower())]
+        candidates = [a for a in assets if (row.get('Asset UUID') and a.external_id == str(row['Asset UUID'])) or (row.get('Asset / hostname') and a.hostname.lower() == str(row['Asset / hostname']).lower()) or (row.get('IP') and a.ip == str(row['IP'])) or (row.get('Business Service ID') and (a.context or {}).get('business_service') == str(row['Business Service ID']))]
         if len(candidates) > 1: conflicts += 1; continue
         if not candidates: unmatched += 1; continue
-        if str(row.get('Approval state','')).lower() not in ('approved','approved by admin'): continue
+        if str(row.get('Approval state','')).lower() in ('rejected','disabled'): continue
         asset = candidates[0]; context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {})
-        for column, key in [('Support Owner','support_owner'),('Change Owner','change_owner'),('Patching Group','patching_group'),('Accountable manager','business_owner')]:
+        for column, key in [('Support Owner','it_owner'),('Change Owner','application_owner'),('Patching Group','patching_group'),('Accountable manager','business_owner'),('Remediation team (approved name)','remediation_owner')]:
             if row.get(column): context[key] = str(row[column]); provenance[key] = {'source':'raci','approval_state':'Approved'}
+        context['raci_enabled'] = True; context['raci_roles'] = {k: row.get(k) for k in ('Support Owner','Change Owner','Patching Group','Accountable manager') if row.get(k)}
         asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; matched_ids.add(asset.id); applied += 1
     batch.status = 'Applied'; batch.counts = {**(batch.counts or {}), 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
     db.add(Audit(actor_id=user.id, action='raci.applied', entity='raci_import', entity_id=batch.id, details=batch.counts)); db.commit()
     return {'status': batch.status, 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
+
+@router.post('/raci/imports/{import_id}/toggle')
+def raci_toggle(import_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    batch = db.get(ImportBatch, import_id)
+    if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
+    batch.status = 'Disabled' if batch.status != 'Disabled' else 'Approved'
+    db.add(Audit(actor_id=user.id, action='raci.toggled', entity='raci_import', entity_id=batch.id, details={'status': batch.status})); db.commit()
+    return {'id': batch.id, 'status': batch.status}
+
+@router.get('/assets.csv')
+def assets_csv(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    import csv
+    out = StringIO(); writer = csv.writer(out); writer.writerow(['id','external_id','hostname','ip','os','business_owner','it_owner','application_owner','patching_group','remediation_owner','raci_enabled','workspace'])
+    for asset in db.scalars(select(Asset).where(Asset.workspace == _workspace(request)).order_by(Asset.id)).all():
+        c = asset.context or {}; writer.writerow([asset.id, asset.external_id or '', asset.hostname, asset.ip or '', asset.os or '', c.get('business_owner',''), c.get('it_owner',''), c.get('application_owner',''), c.get('patching_group',''), c.get('remediation_owner',''), c.get('raci_enabled',False), asset.workspace])
+    return StreamingResponse(iter([out.getvalue()]), media_type='text/csv', headers={'Content-Disposition':'attachment; filename=vrap-assets.csv'})
 
 @router.get('/assessment-questionnaire')
 def assessment_questionnaire(user=Depends(require_user)):
