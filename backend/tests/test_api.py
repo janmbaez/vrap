@@ -1,4 +1,5 @@
 from copy import deepcopy
+import pytest
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
@@ -745,3 +746,21 @@ def test_classification_evidence_requires_mission_and_is_workspace_scoped(client
     assert client.post('/api/auth/logout').status_code == 200
     login(client, environment='Demo')
     assert client.get(f"/api/assets/{asset['id']}/classification-mission/evidence").status_code == 404
+
+def test_raci_template_and_preview_import(client):
+    pytest.importorskip('openpyxl')
+    from io import BytesIO
+    from openpyxl import Workbook
+    login(client)
+    response = client.get('/api/raci/template')
+    assert response.status_code == 200
+    book = Workbook(); book.remove(book.active)
+    sheets = {
+        'TEAM DIRECTORY':['Observed team / group'], 'ROUTING RULES':['Rule ID'],
+        'ASSET OVERRIDES':['Asset UUID'], 'PLUGIN OVERRIDES':['Plugin ID'],
+        'RACI MATRIX':['ID'], 'ROLE MAPPING':['Source role'], 'TECH LANES':['Technical lane']}
+    for name, headers in sheets.items(): book.create_sheet(name).append(headers)
+    output = BytesIO(); book.save(output); output.seek(0)
+    upload = client.post('/api/raci/import', files={'file':('raci.xlsx', output.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')})
+    assert upload.status_code == 201
+    assert upload.json()['status'] == 'Preview'
