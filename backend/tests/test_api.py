@@ -2,7 +2,7 @@ from copy import deepcopy
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,Audit,ImportRow,IntegrationSettings,User
+from app.models import Assessment,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,User
 from app.risk.policy import DEFAULT
 from conftest import login
 DATA={'hostname':'TEST-01','name':'Synthetic RCE','plugin_id':'test-100','severity':'Critical','cvss':9.8,'vpr':9.4}
@@ -238,6 +238,35 @@ def test_asset_context_is_authoritative_and_flags_reassessment(client):
     assert refreshed['context']['asset_criticality']=='Low'
     assert refreshed['context']['regulatory']==['SOX']
     assert refreshed['reassessment_required'] is True
+
+def test_regulatory_scope_memberships_are_additive_and_governed(client, db):
+    login(client)
+    created = client.post('/api/assets', json={
+        'hostname': 'scope-asset', 'regulatory': ['PCI DSS'],
+    })
+    assert created.status_code == 201, created.text
+    asset_id = created.json()['id']
+    membership = db.scalar(select(AssetRegulatoryScope).where(
+        AssetRegulatoryScope.asset_id == asset_id,
+        AssetRegulatoryScope.scope == 'PCI DSS',
+    ))
+    assert membership and membership.active and membership.source_system == 'asset_management'
+
+    expanded = client.put(f'/api/assets/{asset_id}', json={
+        'regulatory': ['PCI DSS', 'SOC 2'],
+    })
+    assert expanded.status_code == 200, expanded.text
+    assert expanded.json()['context']['regulatory'] == ['PCI DSS', 'SOC 2']
+    assert db.scalar(select(AssetRegulatoryScope).where(
+        AssetRegulatoryScope.asset_id == asset_id,
+        AssetRegulatoryScope.scope == 'SOC 2',
+        AssetRegulatoryScope.active.is_(True),
+    )) is not None
+
+    removed = client.put(f'/api/assets/{asset_id}', json={'regulatory': ['PCI DSS']})
+    assert removed.status_code == 409
+    assert 'governed classification change request' in removed.json()['detail']
+
 
 def test_assets_are_paginated_searchable_and_support_crud(client):
     login(client)

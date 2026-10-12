@@ -29,3 +29,10 @@
 - Extend the shared current/stale/draft assessment denominator to every queue and export route, and define the operational policy for which non-scanner asset/control changes are material.
 - Complete the mutation-route workspace audit and add snapshot-based Tenable ingestion.
 - Add delegated risk-owner/GRC approval workflow for formal acceptance.
+
+### Governed regulatory-scope memberships (current slice)
+
+- `asset_regulatory_scopes` stores each asset/scope membership separately with active state, source, approval state, verifier and validity timestamps. Migration `0009` backfills the legacy `assets.context.regulatory` JSON values as `legacy` memberships without changing the existing JSON projection.
+- Asset creation and imports write additive memberships. The existing JSON field remains available to the current UI, reports and filters while later M2 work can move them to the membership table.
+- Ordinary asset edits can add scope membership, but cannot remove a scope. Removal returns HTTP 409 until an authorized classification-change workflow records the request, review and approval. This prevents a local edit, import, or rule change from silently clearing PCI DSS or SOC 2 applicability.
+- Rollback: application rollback is safe because the compatibility projection is retained; the additive membership table and its audit history are intentionally not dropped by downgrade.

@@ -37,6 +37,21 @@ class Asset(Base):
     context_provenance: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
     workspace: Mapped[str] = mapped_column(String(20), default='Production')
 
+class AssetRegulatoryScope(Base):
+    __tablename__ = 'asset_regulatory_scopes'
+    __table_args__ = (UniqueConstraint('asset_id', 'scope'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    scope: Mapped[str] = mapped_column(String(40))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default='1')
+    source_system: Mapped[str] = mapped_column(String(80), default='legacy')
+    source_record_id: Mapped[str | None] = mapped_column(String(200))
+    approval_state: Mapped[str] = mapped_column(String(40), default='Pending verification')
+    verified_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
 class Vulnerability(Base):
     __tablename__ = 'vulnerabilities'
     id: Mapped[int] = mapped_column(primary_key=True)

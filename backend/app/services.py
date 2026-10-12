@@ -6,6 +6,7 @@ from sqlalchemy import delete, select, update
 from .models import (Asset, Vulnerability, Finding, Methodology, Assessment,
                      AssessmentControl, RiskScore, FindingWorkflow, RiskException,
                      ImportRow, CampaignFinding, CampaignEvidence)
+from .regulatory import add_scope_memberships, normalize_scopes
 from .risk.engine import calculate
 from .asset_rules import resolve_rules, ASSET_CONTEXT_KEYS
 
@@ -55,6 +56,11 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
                       context=context, context_provenance=provenance, workspace=workspace)
         db.add(asset)
         db.flush()
+        scopes = normalize_scopes(context.get('regulatory', []))
+        if scopes:
+            scope_source = 'import' if 'regulatory' in supplied else 'asset_rule'
+            add_scope_memberships(db, asset, scopes, source_system=scope_source, approval_state='Provisional')
+            asset.context = {**asset.context, 'regulatory': scopes}
     else:
         rule_context, default_controls, applied_rules = resolve_rules(db, asset.hostname, data.ip or asset.ip, data.asset_tags or asset.tags)
         if applied_rules:

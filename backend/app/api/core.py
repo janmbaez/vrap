@@ -12,6 +12,7 @@ from ..services import active_methodology, ingest, get_finding, detail, latest_a
 from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
 from ..assessment_state import assessment_currency, latest_assessment_revision
+from ..regulatory import active_scopes, add_scope_memberships, normalize_scopes
 
 router = APIRouter(tags=['Workbench'])
 
@@ -245,6 +246,10 @@ def create_asset(data: AssetCreate, request: Request, user=Depends(writer), db=D
     asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context,
                   context_provenance={key: {'source_system': 'manual', 'approval_state': 'Pending verification'} for key in context}, **fields)
     db.add(asset); db.flush()
+    scopes = normalize_scopes(context.get('regulatory', []))
+    if scopes:
+        add_scope_memberships(db, asset, scopes, source_system='asset_management')
+        asset.context = {**asset.context, 'regulatory': scopes}
     db.add(Audit(actor_id=user.id, action='asset.created', entity='asset', entity_id=asset.id, details={'hostname':asset.hostname, 'workspace':workspace}))
     db.commit(); db.refresh(asset)
     return _asset_output(asset)
@@ -256,6 +261,18 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
     before = _asset_output(asset)
     changes = data.model_dump(exclude_none=True)
     expected_context_version = changes.pop('expected_context_version', None)
+    requested_regulatory = changes.get('regulatory')
+    existing_regulatory = active_scopes(db, asset)
+    if requested_regulatory is not None:
+        requested_set = set(normalize_scopes(requested_regulatory))
+        removed_scopes = existing_regulatory - requested_set
+        if removed_scopes:
+            raise HTTPException(409, 'Regulatory scope removal requires a governed classification change request.')
+        additions = requested_set - existing_regulatory
+        if additions:
+            add_scope_memberships(db, asset, additions, source_system='asset_management')
+        # Preserve legacy memberships in the compatibility JSON projection.
+        changes['regulatory'] = sorted(existing_regulatory | requested_set) or ['None']
     protected = {key for key in changes if key in PROTECTED_CONTEXT_FIELDS and changes[key] != (asset.context or {}).get(key)}
     if protected and user.role != 'Administrator':
         raise HTTPException(403, 'Only an Administrator can change protected asset classification fields')
