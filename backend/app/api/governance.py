@@ -137,13 +137,18 @@ def run_bulk_assessment_job(job_id: int, request_db=None):
                     if workflow.status in (None, 'New'): workflow.status = data.workflow_status
                     workflow.updated_by = job.requested_by
                     item.status, item.assessment_id, job.succeeded = 'Succeeded', assessment.id, job.succeeded + 1
-                item.processed_at = datetime.now(timezone.utc); job.processed += 1
+                item.processed_at = datetime.now(timezone.utc)
+                job.processed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status.in_(['Succeeded','Skipped','Failed']))) or 0
                 db.commit()
             except Exception as exc:
                 db.rollback(); job = db.get(BulkAssessmentJob, job_id); item = db.get(BulkAssessmentItem, item.id)
                 item.status, item.error, item.processed_at = 'Failed', str(exc), datetime.now(timezone.utc)
-                job.failed += 1; job.processed += 1; db.commit()
+                job.failed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed')) or 0
+                job.processed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status.in_(['Succeeded','Skipped','Failed']))) or 0
+                db.commit()
         job = db.get(BulkAssessmentJob, job_id)
+        job.processed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status.in_(['Succeeded','Skipped','Failed']))) or 0
+        job.failed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed')) or 0
         job.status, job.finished_at = ('Failed' if job.failed else 'Completed'), datetime.now(timezone.utc)
         db.add(Audit(actor_id=job.requested_by, action='plugin_assessment.bulk_finished', entity='bulk_assessment_job', entity_id=job.id, details={'correlation_id': job.correlation_id, 'processed': job.processed, 'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed}))
         db.commit()
@@ -329,7 +334,12 @@ def resume_bulk_job(job_id: int, background: BackgroundTasks, request: Request, 
     if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
     if job.status not in ('Failed', 'Cancelled', 'Interrupted'): raise HTTPException(409, 'Only failed, cancelled, or interrupted jobs can resume')
     db.execute(update(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed').values(status='Pending', error=None, processed_at=None))
-    job.status = 'Queued'; job.error = None; job.failed = 0; db.commit(); background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
+    job.status = 'Queued'; job.error = None
+    job.failed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed')) or 0
+    job.succeeded = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Succeeded')) or 0
+    job.skipped = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Skipped')) or 0
+    job.processed = job.succeeded + job.skipped
+    db.commit(); background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
     return _bulk_job_output(db, job)
 
 @router.put('/findings/{finding_id}/workflow')

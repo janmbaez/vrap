@@ -530,6 +530,7 @@ def test_plugin_bulk_job_is_idempotent_and_reports_progress(client):
     assert retry.json()['succeeded'] == original['succeeded']
     status=client.get(f"/api/bulk-assessment-jobs/{original['id']}")
     assert status.status_code == 200 and status.json()['correlation_id'] == original['correlation_id']
+    assert status.json()['processed'] <= status.json()['total']
 
 def test_vulnerability_questionnaire_and_preview_explain_cohorts(client):
     login(client); create(client)
