@@ -18,6 +18,7 @@ from ..services import active_methodology, cleanup_tenable_duplicates, detail, t
 from ..risk.engine import calculate
 from ..asset_rules import PROTECTED_CONTEXT_FIELDS
 from ..vulnerability_questionnaire import QUESTIONNAIRE
+from ..kpis import calculate_kpis
 
 router = APIRouter(tags=['Governance'])
 
@@ -483,6 +484,11 @@ def operations(request:Request,user=Depends(require_user),db=Depends(get_db)):
     stale=db.scalar(select(func.count(Finding.id)).where(Finding.workspace==workspace,Finding.observed['last_seen'].as_string()<thirty)) or 0
     exceptions_open=db.scalar(select(func.count(RiskException.id)).where(RiskException.workspace==workspace,RiskException.status.in_(['Requested','Approved']))) or 0
     return {'total':total,'stale':stale,'open_exceptions':exceptions_open,'statuses':[{'name':s or 'New','value':c} for s,c in status_rows],'owners':[{'name':n or 'Unassigned','value':c} for n,c in owner_rows]}
+
+@router.get('/kpis')
+def kpis(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    """Single denominator/as-of KPI contract for dashboards, exports and reports."""
+    return calculate_kpis(db, _workspace(request))
 
 @router.get('/mission-center')
 def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str = '', owner_id: int | None = None, user=Depends(require_user), db=Depends(get_db)):
