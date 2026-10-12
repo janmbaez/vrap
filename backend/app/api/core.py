@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -384,6 +384,40 @@ def save_classification_mission(id: int, data: ClassificationMissionDraft, reque
                  details={'mission_id': item.id, 'step': data.current_step, 'questionnaire_version': data.questionnaire_version}))
     db.commit(); db.refresh(item)
     return _mission_output(item)
+
+
+@router.get('/assets/{id}/classification-mission/evidence')
+def classification_evidence(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace))
+    if not mission:
+        return []
+    return [{'id': row.id, 'evidence_type': row.evidence_type, 'reference': row.reference,
+             'notes': row.notes, 'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
+            for row in db.scalars(select(AssetClassificationEvidence).where(
+                AssetClassificationEvidence.mission_id == mission.id).order_by(AssetClassificationEvidence.id.desc()))]
+
+
+@router.post('/assets/{id}/classification-mission/evidence', status_code=201)
+def add_classification_evidence(id: int, data: ClassificationEvidenceInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace))
+    if not mission:
+        raise HTTPException(409, 'Save a classification mission draft before attaching evidence')
+    row = AssetClassificationEvidence(mission_id=mission.id, asset_id=id, workspace=asset.workspace,
+        evidence_type=data.evidence_type, reference=data.reference.strip(), notes=data.notes.strip(), created_by=user.id)
+    db.add(row); db.flush()
+    db.add(Audit(actor_id=user.id, action='asset.classification_evidence_added', entity='asset', entity_id=id,
+                 details={'mission_id': mission.id, 'evidence_id': row.id, 'evidence_type': row.evidence_type}))
+    db.commit(); db.refresh(row)
+    return {'id': row.id, 'evidence_type': row.evidence_type, 'reference': row.reference, 'notes': row.notes,
+            'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
 
 
 @router.post('/assets/{id}/classification-change-requests', status_code=201)

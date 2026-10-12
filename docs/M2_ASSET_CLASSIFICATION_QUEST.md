@@ -36,3 +36,7 @@ Quest drafts now transition to **Pending GRC Approval** when their protected cha
 ## Versioned questionnaire contract
 
 `GET /api/classification-questionnaire` exposes the source-controlled `1.0-provisional` question bank. Each question has a stable ID, field mapping, response type, allowed values where applicable, and supported evidence-source types. Quest drafts persist an `answers` map keyed by these IDs. Later questionnaire versions must add new IDs rather than reinterpret saved answers.
+
+## Evidence lineage slice
+
+Migration `0012` introduces immutable, workspace-scoped mission evidence records. Each record captures the controlled source type, reference, notes, author and timestamp. Evidence attachment requires an existing mission draft, and API tests cover that precondition and workspace isolation. File upload/retention policy remains separate operational work; this slice deliberately stores references rather than raw sensitive artifacts.

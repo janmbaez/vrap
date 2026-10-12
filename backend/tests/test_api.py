@@ -557,3 +557,17 @@ def test_classification_questionnaire_uses_stable_versioned_ids(client):
     question_ids = [question['id'] for step in questionnaire['steps'] for question in step['questions']]
     assert len(question_ids) == len(set(question_ids))
     assert {'identity.business_owner', 'scope.regulatory', 'exposure.network'} <= set(question_ids)
+
+def test_classification_evidence_requires_mission_and_is_workspace_scoped(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'evidence-asset'}).json()
+    payload = {'evidence_type': 'BIA', 'reference': 'BIA-77', 'notes': 'Business impact assessment.'}
+    assert client.post(f"/api/assets/{asset['id']}/classification-mission/evidence", json=payload).status_code == 409
+    assert client.put(f"/api/assets/{asset['id']}/classification-mission", json={'current_step': 2, 'responses': {}}).status_code == 200
+    added = client.post(f"/api/assets/{asset['id']}/classification-mission/evidence", json=payload)
+    assert added.status_code == 201, added.text
+    evidence = client.get(f"/api/assets/{asset['id']}/classification-mission/evidence").json()
+    assert evidence[0]['reference'] == 'BIA-77' and evidence[0]['evidence_type'] == 'BIA'
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, environment='Demo')
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission/evidence").status_code == 404

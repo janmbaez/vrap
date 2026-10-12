@@ -251,6 +251,12 @@ class ClassificationMissionDraft(Strict):
     responses: dict[str, Any] = Field(default_factory=dict, max_length=50)
 
 
+class ClassificationEvidenceInput(Strict):
+    evidence_type: Literal['BIA', 'CMDB', 'owner_attestation', 'data_inventory', 'GRC_scope', 'network_evidence', 'other']
+    reference: str = Field(min_length=1, max_length=10000)
+    notes: str = Field(default='', max_length=5000)
+
+
 class AssetEdit(AssetUpdate):
     # Supplied by the asset editor to reject stale protected-context writes.
     expected_context_version: int | None = Field(default=None, ge=1)
