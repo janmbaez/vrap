@@ -16,8 +16,13 @@ from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowIn
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
 from ..asset_rules import PROTECTED_CONTEXT_FIELDS
+from ..vulnerability_questionnaire import QUESTIONNAIRE
 
 router = APIRouter(tags=['Governance'])
+
+@router.get('/assessment-questionnaire')
+def assessment_questionnaire(user=Depends(require_user)):
+    return QUESTIONNAIRE
 
 def _workspace(request): return request.state.session.workspace
 
@@ -219,9 +224,26 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
             raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
         prepared.append((finding, method, result, effective_context))
     if data.dry_run:
+        latest_by_finding = {finding.id: db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1)) for finding, _, _, _ in prepared}
+        unchanged = changed = 0; distribution = {}; regulatory = {}
+        for finding, _, result, context in prepared:
+            latest = latest_by_finding[finding.id]
+            signature = _bulk_signature(finding, context, data)
+            if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision: unchanged += 1
+            else: changed += 1
+            level = result.get('residual_level', 'Unknown'); distribution[level] = distribution.get(level, 0) + 1
+            for scope in context.regulatory: regulatory[scope] = regulatory.get(scope, 0) + 1
+        all_findings = db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)).all()
+        excluded = len(all_findings) - len(prepared)
+        cohorts = {}
+        for finding, _, _, context in prepared:
+            key = '|'.join([context.environment or 'Unknown', context.exposure or 'Unknown', ','.join(sorted(context.regulatory)) or 'None'])
+            cohorts[key] = cohorts.get(key, 0) + 1
         return {'dry_run': True, 'findings': len(prepared), 'assets_affected': len({finding.asset_id for finding,_,_,_ in prepared}),
-                'conflicts': conflicts, 'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
-                                                         'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required'])}}
+                'changed': changed, 'unchanged': unchanged, 'excluded': excluded, 'conflicts': conflicts,
+                'regulatory_scope': regulatory, 'cohorts': [{'name': k, 'findings': v} for k, v in cohorts.items()],
+                'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
+                                 'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required']), 'distribution': distribution}}
     key = data.idempotency_key or str(uuid.uuid4())
     existing = db.scalar(select(BulkAssessmentJob).where(BulkAssessmentJob.workspace == workspace, BulkAssessmentJob.vulnerability_id == vulnerability_id, BulkAssessmentJob.idempotency_key == key))
     if existing:

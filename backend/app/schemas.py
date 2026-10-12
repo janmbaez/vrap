@@ -336,6 +336,10 @@ class PluginBulkAssessmentInput(Strict):
     active_only: bool = True
     dry_run: bool = False
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=120)
+    questionnaire_version: str = Field(default='1.0-provisional', max_length=50)
+    answers: dict[str, Any] = Field(default_factory=dict, max_length=40)
+    scenario_evidence: list[str] = Field(default_factory=list, max_length=20)
+    scenario_notes: str = Field(default='', max_length=10000)
 
     @model_validator(mode='after')
     def unique_controls(self):

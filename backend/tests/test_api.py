@@ -492,6 +492,21 @@ def test_plugin_bulk_job_is_idempotent_and_reports_progress(client):
     assert retry.json()['succeeded'] == original['succeeded']
     status=client.get(f"/api/bulk-assessment-jobs/{original['id']}")
     assert status.status_code == 200 and status.json()['correlation_id'] == original['correlation_id']
+
+def test_vulnerability_questionnaire_and_preview_explain_cohorts(client):
+    login(client); create(client)
+    questionnaire = client.get('/api/assessment-questionnaire')
+    assert questionnaire.status_code == 200 and questionnaire.json()['version'] == '1.0-provisional'
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    response=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json={
+        'context':CONTEXT,'controls':[],'justification':'Preview scenario evidence and cohorts',
+        'answers':{'attack_prerequisite':'Low','exploit_validation':'Observed'},
+        'scenario_evidence':['TENABLE-PLUGIN-100'],'scenario_notes':'Shared synthetic evidence',
+        'decision':'Remediation Required','status':'Assessed','dry_run':True})
+    body=response.json()
+    assert response.status_code == 200
+    assert {'changed','unchanged','excluded','conflicts','regulatory_scope','cohorts'} <= body.keys()
+    assert 'distribution' in body['risk_preview']
 def test_saved_filters_are_personal_and_workspace_scoped(client):
     login(client)
     created=client.post('/api/saved-filters',json={'name':'Critical unassessed','filters':{'severity':'Critical','status':'Not Assessed','q':''}})
