@@ -410,6 +410,15 @@ def test_bulk_plugin_assessment_preserves_asset_authoritative_context(client):
     assert second_assessment['score']['inputs']['context']['asset_criticality']=='Low'
     assert second_assessment['score']['inputs']['context']['environment']=='Test'
 
+def test_mission_center_returns_prioritized_operational_queues(client):
+    login(client)
+    create(client)
+    response = client.get('/api/mission-center')
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body['queues']) == {'urgent_review','missing_context_evidence','automated_provisional','monitor_reassess'}
+    assert body['summary']['urgent_review'] == 1
+
 def test_plugin_bulk_dry_run_reports_conflicts_without_mutation(client):
     login(client)
     finding = create(client)

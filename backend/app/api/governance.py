@@ -313,6 +313,40 @@ def operations(request:Request,user=Depends(require_user),db=Depends(get_db)):
     exceptions_open=db.scalar(select(func.count(RiskException.id)).where(RiskException.workspace==workspace,RiskException.status.in_(['Requested','Approved']))) or 0
     return {'total':total,'stale':stale,'open_exceptions':exceptions_open,'statuses':[{'name':s or 'New','value':c} for s,c in status_rows],'owners':[{'name':n or 'Unassigned','value':c} for n,c in owner_rows]}
 
+@router.get('/mission-center')
+def mission_center(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request)
+    rows = db.execute(select(Finding.id, Vulnerability.name,
+                             FindingWorkflow.status, FindingWorkflow.owner_id,
+                             Asset.hostname, Vulnerability.plugin_id)
+        .join(Asset, Asset.id == Finding.asset_id)
+        .join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
+        .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+        .where(Finding.workspace == workspace)
+        .order_by(Finding.id.desc())).all()
+    queues = {key: [] for key in ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')}
+    for row in rows:
+        status = row.status or 'New'
+        item = {'finding_id': row.id, 'name': row.name, 'asset': row.hostname,
+                'plugin_id': row.plugin_id, 'status': status, 'owner_id': row.owner_id,
+                'recommended_action': 'Open finding and complete the assessment'}
+        if False:
+            item['recommended_action'] = 'Reassess changed source evidence or asset context'
+            queues['monitor_reassess'].append(item)
+        elif status in ('New', 'Assessment In Progress', 'Above Risk Appetite'):
+            queues['urgent_review'].append(item)
+        elif status in ('Context Required', 'Pending Validation'):
+            item['recommended_action'] = 'Collect required authoritative context or evidence'
+            queues['missing_context_evidence'].append(item)
+        elif status in ('Investigating', 'Remediation Planned'):
+            item['recommended_action'] = 'Update remediation progress and evidence'
+            queues['automated_provisional'].append(item)
+        else:
+            queues['monitor_reassess'].append(item)
+    return {'workspace': workspace, 'queues': queues,
+            'summary': {key: len(value) for key, value in queues.items()},
+            'generated_at': datetime.now(timezone.utc).isoformat()}
+
 def _executive_filters(request):
     allowed = ('period_start', 'period_end', 'severity', 'asset_group', 'business_owner', 'it_owner', 'application_owner', 'regulatory', 'campaign_id')
     filters = {key: request.query_params[key] for key in allowed if request.query_params.get(key)}
