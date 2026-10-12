@@ -4,6 +4,9 @@ from .models import AssetRule
 
 ASSET_CONTEXT_KEYS = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure',
                       'business_owner', 'it_owner', 'application_owner', 'asset_group', 'asset_type'}
+# These fields are asset-level classification facts. A scanner, tag, or shared
+# plugin scenario may propose them but cannot replace an existing value.
+PROTECTED_CONTEXT_FIELDS = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure'}
 
 def matches(rule: AssetRule, hostname: str, ip: str | None, tags: list) -> bool:
     if rule.match_type == 'All assets':

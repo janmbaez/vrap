@@ -1,18 +1,30 @@
 from datetime import datetime, timezone, timedelta
+import hashlib
+import json
+import uuid
 from io import BytesIO, StringIO
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select, func, case, update, delete
 from ..db import get_db
 from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
-                      ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent)
-from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput
+                      ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent,
+                      BulkAssessmentJob, BulkAssessmentItem, PluginAssessmentTemplateRevision, RemediationPackage,
+                      RemediationPackageFinding, RemediationPackageEvidence, RemediationPackageEvent, RemediationSLAPolicy)
+from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context, RemediationPackageInput, RemediationPackageUpdate, RemediationEvidenceInput, RemediationSLAPolicyInput
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
+from ..asset_rules import PROTECTED_CONTEXT_FIELDS
+from ..vulnerability_questionnaire import QUESTIONNAIRE
+from ..kpis import calculate_kpis
 
 router = APIRouter(tags=['Governance'])
+
+@router.get('/assessment-questionnaire')
+def assessment_questionnaire(user=Depends(require_user)):
+    return QUESTIONNAIRE
 
 def _workspace(request): return request.state.session.workspace
 
@@ -28,6 +40,119 @@ def _owner(db, owner_id):
     if not user or not user.active: raise HTTPException(422, 'Owner is not an active user')
     return user
 
+def _template_applies(template, asset):
+    rules = template.applicability or {}
+    context = asset.context or {}
+    for key, expected in rules.items():
+        if key == 'tags':
+            if not set(expected or []).intersection(set(asset.tags or [])): return False
+        elif expected not in (None, '') and context.get(key) != expected:
+            return False
+    return True
+
+# These fields belong to the asset record. A shared plugin scenario can never
+# replace its criticality, regulatory memberships, or exposure context.
+ASSET_AUTHORITY_FIELDS = PROTECTED_CONTEXT_FIELDS | {'production', 'publicly_accessible'}
+
+def _bulk_context(asset, submitted):
+    effective = submitted.model_dump()
+    for key in ASSET_AUTHORITY_FIELDS:
+        value = (asset.context or {}).get(key)
+        if value not in (None, '', []):
+            effective[key] = value
+    # These are derived by Context from the protected environment/exposure values.
+    if (asset.context or {}).get('environment') not in (None, ''):
+        effective['production'] = None
+    if (asset.context or {}).get('exposure') not in (None, ''):
+        effective['publicly_accessible'] = None
+    return Context(**effective)
+
+def _bulk_signature(finding, context, data):
+    payload = {'context': context.model_dump(mode='json'),
+               'controls': [c.model_dump(mode='json') for c in data.controls],
+               'notes': data.notes, 'justification': data.justification,
+               'decision': data.decision, 'status': data.status, 'workflow_status': data.workflow_status,
+               'owner_id': data.owner_id}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+def _bulk_job_output(db, job):
+    errors = [{'finding_id': row.finding_id, 'error': row.error} for row in db.scalars(
+        select(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed'))]
+    return {'id': job.id, 'status': job.status, 'vulnerability_id': job.vulnerability_id,
+            'correlation_id': job.correlation_id, 'total': job.total, 'processed': job.processed,
+            'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed,
+            'progress_percent': round((job.processed / job.total) * 100) if job.total else 100,
+            'error': job.error, 'errors': errors,
+            'created_at': job.created_at.isoformat(), 'started_at': job.started_at.isoformat() if job.started_at else None,
+            'finished_at': job.finished_at.isoformat() if job.finished_at else None}
+
+def run_bulk_assessment_job(job_id: int, request_db=None):
+    """Process one finding per transaction so a crash can resume without duplicate revisions."""
+    from .core import preview_score
+    from ..db import SessionLocal
+    session_context = request_db or SessionLocal()
+    with session_context as db:
+        job = db.get(BulkAssessmentJob, job_id)
+        if not job or job.status in ('Completed', 'Cancelled'): return
+        job.status, job.started_at, job.error = 'Running', job.started_at or datetime.now(timezone.utc), None
+        db.commit()
+        payload = dict(job.payload)
+        snapshot_revisions = payload.pop('finding_revisions', {})
+        data = PluginBulkAssessmentInput(**payload)
+        for item in db.scalars(select(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Pending').order_by(BulkAssessmentItem.id)).all():
+            db.refresh(job)
+            if job.status == 'Cancel requested':
+                job.status, job.finished_at = 'Cancelled', datetime.now(timezone.utc)
+                db.commit(); return
+            finding = db.get(Finding, item.finding_id)
+            try:
+                if not finding or finding.workspace != job.workspace:
+                    raise ValueError('Finding is no longer available in this workspace')
+                snapshot_revision = snapshot_revisions.get(str(finding.id))
+                if snapshot_revision is not None and finding.revision != snapshot_revision:
+                    raise ValueError('Finding changed after preflight; review conflict before retrying')
+                asset = db.get(Asset, finding.asset_id)
+                effective_context = _bulk_context(asset, data.context)
+                method, result = preview_score(db, finding, AssessmentInput(context=effective_context, controls=data.controls, methodology_id=active_methodology(db).id, expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status))
+                signature = _bulk_signature(finding, effective_context, data)
+                latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+                if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision:
+                    item.status, job.skipped = 'Skipped', job.skipped + 1
+                else:
+                    finding.revision += 1
+                    context_json = effective_context.model_dump(mode='json'); context_json['_bulk_signature'] = signature
+                    assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=job.requested_by, context=context_json, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+                    db.add(assessment); db.flush()
+                    rules = {rule['name']: rule for rule in method.configuration['controls']}
+                    for control in data.controls:
+                        db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
+                    asset_snapshot = {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}
+                    result.update({'methodology_id': method.id, 'methodology_version': method.version, 'asset_snapshot': asset_snapshot})
+                    db.add(RiskScore(assessment_id=assessment.id, result=result))
+                    workflow = db.get(FindingWorkflow, finding.id)
+                    if not workflow:
+                        workflow = FindingWorkflow(finding_id=finding.id, updated_by=job.requested_by); db.add(workflow)
+                    # Deliberately preserve ownership and decisions unless explicitly supplied on a new workflow.
+                    if workflow.owner_id is None and data.owner_id is not None: workflow.owner_id = data.owner_id
+                    if workflow.status in (None, 'New'): workflow.status = data.workflow_status
+                    workflow.updated_by = job.requested_by
+                    item.status, item.assessment_id, job.succeeded = 'Succeeded', assessment.id, job.succeeded + 1
+                item.processed_at = datetime.now(timezone.utc)
+                job.processed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status.in_(['Succeeded','Skipped','Failed']))) or 0
+                db.commit()
+            except Exception as exc:
+                db.rollback(); job = db.get(BulkAssessmentJob, job_id); item = db.get(BulkAssessmentItem, item.id)
+                item.status, item.error, item.processed_at = 'Failed', str(exc), datetime.now(timezone.utc)
+                job.failed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed')) or 0
+                job.processed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status.in_(['Succeeded','Skipped','Failed']))) or 0
+                db.commit()
+        job = db.get(BulkAssessmentJob, job_id)
+        job.processed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status.in_(['Succeeded','Skipped','Failed']))) or 0
+        job.failed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed')) or 0
+        job.status, job.finished_at = ('Failed' if job.failed else 'Completed'), datetime.now(timezone.utc)
+        db.add(Audit(actor_id=job.requested_by, action='plugin_assessment.bulk_finished', entity='bulk_assessment_job', entity_id=job.id, details={'correlation_id': job.correlation_id, 'processed': job.processed, 'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed}))
+        db.commit()
+
 @router.get('/owners')
 def owners(user=Depends(require_user), db=Depends(get_db)):
     return [{'id': u.id, 'username': u.username, 'role': u.role} for u in db.scalars(select(User).where(User.active == True).order_by(User.username))]
@@ -39,7 +164,10 @@ def get_template(vulnerability_id: int, request: Request, user=Depends(require_u
     if not item: return None
     return {'id': item.id, 'owner_id': item.owner_id, 'owner': db.get(User, item.owner_id).username if item.owner_id else None,
             'status': item.status, 'notes': item.notes, 'justification': item.justification, 'decision': item.decision,
-            'controls': item.controls, 'updated_at': item.updated_at.isoformat()}
+            'controls': item.controls, 'template_version': item.template_version, 'applicability': item.applicability,
+            'technical_rationale': item.technical_rationale, 'updated_at': item.updated_at.isoformat(),
+            'revisions': [{'version': r.version, 'created_at': r.created_at.isoformat(), 'changed_by': r.changed_by}
+                          for r in db.scalars(select(PluginAssessmentTemplateRevision).where(PluginAssessmentTemplateRevision.template_id == item.id).order_by(PluginAssessmentTemplateRevision.version.desc()))]}
 
 @router.put('/assessment-groups/{vulnerability_id}/template')
 def save_template(vulnerability_id: int, data: PluginTemplateInput, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -49,27 +177,47 @@ def save_template(vulnerability_id: int, data: PluginTemplateInput, request: Req
     item = db.scalar(select(PluginAssessmentTemplate).where(PluginAssessmentTemplate.workspace == workspace, PluginAssessmentTemplate.vulnerability_id == vulnerability_id))
     if not item:
         item = PluginAssessmentTemplate(workspace=workspace, vulnerability_id=vulnerability_id, updated_by=user.id); db.add(item)
-    for key, value in data.model_dump(mode='json').items(): setattr(item, key, value)
+    previous = {'owner_id': item.owner_id, 'status': item.status, 'notes': item.notes, 'justification': item.justification,
+                'decision': item.decision, 'controls': item.controls, 'applicability': item.applicability,
+                'technical_rationale': item.technical_rationale, 'template_version': item.template_version}
+    item.template_version = (item.template_version or 0) + 1
+    for key in ('owner_id', 'status', 'notes', 'justification', 'decision', 'controls', 'applicability', 'technical_rationale'):
+        setattr(item, key, getattr(data, key))
     item.updated_by = user.id; item.updated_at = datetime.now(timezone.utc)
-    db.add(Audit(actor_id=user.id, action='plugin_template.saved', entity='vulnerability', entity_id=vulnerability_id, details={'status': data.status, 'owner_id': data.owner_id}))
+    db.flush()
+    db.add(PluginAssessmentTemplateRevision(template_id=item.id, workspace=workspace, vulnerability_id=vulnerability_id,
+        version=item.template_version, snapshot={**previous, 'new': {key: getattr(item, key) for key in ('owner_id','status','notes','justification','decision','controls','applicability','technical_rationale','template_version')}}, changed_by=user.id))
+    db.add(Audit(actor_id=user.id, action='plugin_template.saved', entity='vulnerability', entity_id=vulnerability_id, details={'status': data.status, 'owner_id': data.owner_id, 'template_version': item.template_version}))
     db.commit(); return {'id': item.id, 'message': 'Plugin assessment template saved'}
 
 @router.post('/assessment-groups/{vulnerability_id}/template/apply')
-def apply_template(vulnerability_id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+def apply_template(vulnerability_id: int, request: Request, preview: bool = False, user=Depends(writer), db=Depends(get_db)):
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace)
     template = db.scalar(select(PluginAssessmentTemplate).where(PluginAssessmentTemplate.workspace == workspace, PluginAssessmentTemplate.vulnerability_id == vulnerability_id))
     if not template: raise HTTPException(409, 'Save a plugin template before applying it')
     if not template.justification.strip(): raise HTTPException(422, 'Template justification is required before applying')
-    method = active_methodology(db); rules = {c['name']: c for c in method.configuration['controls']}; applied = 0
+    method = active_methodology(db); rules = {c['name']: c for c in method.configuration['controls']}; applied = skipped = excluded = 0; changes = []
     for finding in db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)):
-        asset = db.get(Asset, finding.asset_id); controls = template.controls or []
+        asset = db.get(Asset, finding.asset_id)
+        if not _template_applies(template, asset): excluded += 1; continue
+        controls = template.controls or []
         technical = {**vulnerability.technical, **finding.observed}
         result = calculate(technical, asset.context or {}, controls, method.configuration, datetime.now(timezone.utc).date())
         result.update({'methodology_id': method.id, 'methodology_version': method.version, 'asset_snapshot': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}})
+        signature = hashlib.sha256(json.dumps({'template_id': template.id, 'template_version': template.template_version, 'context': asset.context or {}, 'controls': controls, 'rationale': template.technical_rationale}, sort_keys=True, default=str).encode()).hexdigest()
+        latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+        if latest and latest.context.get('_template_signature') == signature and latest.revision == finding.revision:
+            skipped += 1; continue
+        changes.append({'finding_id': finding.id, 'asset_id': asset.id, 'current_revision': finding.revision})
+        if preview: continue
         finding.revision += 1
+        prior_workflow = db.get(FindingWorkflow, finding.id)
+        decision = latest.decision if latest else template.decision
+        status = latest.status if latest else ('Assessed' if template.status not in ('New','Investigating') else 'Assessment In Progress')
+        context_snapshot = dict(asset.context or {}); context_snapshot['_template_signature'] = signature
         assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=user.id,
-                                context=asset.context or {}, notes=template.notes, justification=template.justification,
-                                decision=template.decision, status='Assessed' if template.status not in ('New','Investigating') else 'Assessment In Progress')
+                                context=context_snapshot, notes=template.notes, justification=template.justification,
+                                decision=decision, status=status)
         db.add(assessment); db.flush()
         for control in controls:
             rule = rules.get(control['name']);
@@ -78,54 +226,121 @@ def apply_template(vulnerability_id: int, request: Request, user=Depends(writer)
         workflow = db.get(FindingWorkflow, finding.id)
         if not workflow:
             workflow = FindingWorkflow(finding_id=finding.id, updated_by=user.id); db.add(workflow)
-        workflow.owner_id, workflow.status, workflow.updated_by = template.owner_id, template.status, user.id
+        # Existing ownership/workflow/decisions remain authoritative. A template
+        # can provide defaults only for an unassigned/new finding.
+        if workflow.owner_id is None: workflow.owner_id = template.owner_id
+        if workflow.status in (None, 'New'): workflow.status = template.status
+        workflow.updated_by = user.id
         applied += 1
-    db.add(Audit(actor_id=user.id, action='plugin_template.applied', entity='vulnerability', entity_id=vulnerability_id, details={'findings': applied}))
-    db.commit(); return {'findings_assessed': applied}
+    if preview:
+        return {'preview': True, 'template_version': template.template_version, 'changed': len(changes), 'unchanged': skipped, 'excluded': excluded, 'changes': changes}
+    db.add(Audit(actor_id=user.id, action='plugin_template.applied', entity='vulnerability', entity_id=vulnerability_id, details={'findings': applied, 'skipped': skipped, 'excluded': excluded, 'template_version': template.template_version}))
+    db.commit(); return {'findings_assessed': applied, 'skipped': skipped, 'excluded': excluded, 'template_version': template.template_version}
 
 @router.post('/assessment-groups/{vulnerability_id}/bulk-assess')
-def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):
     """Apply the complete workbench assessment once across a plugin's current finding population."""
     from .core import preview_score
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace); _owner(db, data.owner_id)
-    findings = list(db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)))
+    query = select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)
+    findings = list(db.scalars(query))
+    if data.active_only:
+        findings = [finding for finding in findings if (db.get(FindingWorkflow, finding.id) or FindingWorkflow(status='New')).status != 'Closed']
     if not findings: raise HTTPException(404, 'No findings are available for this plugin')
     if data.decision == 'Risk Accepted' or data.status == 'Risk Accepted':
-        if user.role != 'Administrator': raise HTTPException(403, 'Only an Administrator can approve risk acceptance')
-        if data.decision != 'Risk Accepted' or data.status != 'Risk Accepted': raise HTTPException(422, 'Risk acceptance decision and status must agree')
+        raise HTTPException(422, 'Bulk assessment cannot approve risk acceptance; use the governed exception workflow')
     methodology = active_methodology(db)
-    prepared=[]
+    prepared=[]; conflicts=[]
     for finding in findings:
-        assessment_data = AssessmentInput(context=data.context, controls=data.controls, methodology_id=methodology.id,
+        asset = db.get(Asset, finding.asset_id)
+        effective_context = _bulk_context(asset, data.context)
+        submitted = data.context.model_dump()
+        protected_conflicts = {key: {'asset': (asset.context or {}).get(key), 'requested': submitted.get(key)}
+                               for key in ASSET_AUTHORITY_FIELDS
+                               if submitted.get(key) not in (None, '', []) and (asset.context or {}).get(key) not in (None, '', [])
+                               and submitted.get(key) != (asset.context or {}).get(key)}
+        if protected_conflicts:
+            conflicts.append({'finding_id': finding.id, 'asset_id': asset.id, 'fields': protected_conflicts})
+        assessment_data = AssessmentInput(context=effective_context, controls=data.controls, methodology_id=methodology.id,
             expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
         method, result = preview_score(db, finding, assessment_data)
         if data.decision == 'Within Risk Appetite' and result['above_appetite']:
             raise HTTPException(422, 'Residual risk is above appetite for one or more affected assets')
         if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
             raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
-        prepared.append((finding, method, result))
-    rules = {rule['name']: rule for rule in prepared[0][1].configuration['controls']}
-    try:
-        for finding, method, result in prepared:
-            finding.revision += 1
-            assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=user.id,
-                context=data.context.model_dump(), notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
-            db.add(assessment); db.flush()
-            for control in data.controls:
-                db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
-            asset=db.get(Asset, finding.asset_id)
-            result.update({'methodology_id':method.id, 'methodology_version':method.version, 'asset_snapshot':{'id':asset.id,'hostname':asset.hostname,'ip':asset.ip,'os':asset.os,'tags':asset.tags}})
-            db.add(RiskScore(assessment_id=assessment.id, result=result))
-            workflow=db.get(FindingWorkflow,finding.id)
-            if not workflow:
-                workflow=FindingWorkflow(finding_id=finding.id,updated_by=user.id); db.add(workflow)
-            workflow.owner_id, workflow.status, workflow.updated_by = data.owner_id, data.workflow_status, user.id
-        db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_applied', entity='vulnerability', entity_id=vulnerability_id,
-            details={'findings':len(prepared),'decision':data.decision,'status':data.status,'workflow_status':data.workflow_status,'context':data.context.model_dump()}))
-        db.commit()
-    except Exception:
-        db.rollback(); raise
-    return {'findings_assessed':len(prepared), 'assets_affected':len({finding.asset_id for finding,_,_ in prepared})}
+        prepared.append((finding, method, result, effective_context))
+    if data.dry_run:
+        latest_by_finding = {finding.id: db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1)) for finding, _, _, _ in prepared}
+        unchanged = changed = 0; distribution = {}; regulatory = {}
+        for finding, _, result, context in prepared:
+            latest = latest_by_finding[finding.id]
+            signature = _bulk_signature(finding, context, data)
+            if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision: unchanged += 1
+            else: changed += 1
+            level = result.get('residual_level', 'Unknown'); distribution[level] = distribution.get(level, 0) + 1
+            for scope in context.regulatory: regulatory[scope] = regulatory.get(scope, 0) + 1
+        all_findings = db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)).all()
+        excluded = len(all_findings) - len(prepared)
+        cohorts = {}
+        for finding, _, _, context in prepared:
+            key = '|'.join([context.environment or 'Unknown', context.exposure or 'Unknown', ','.join(sorted(context.regulatory)) or 'None'])
+            cohorts[key] = cohorts.get(key, 0) + 1
+        return {'dry_run': True, 'findings': len(prepared), 'assets_affected': len({finding.asset_id for finding,_,_,_ in prepared}),
+                'changed': changed, 'unchanged': unchanged, 'excluded': excluded, 'conflicts': conflicts,
+                'regulatory_scope': regulatory, 'cohorts': [{'name': k, 'findings': v} for k, v in cohorts.items()],
+                'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
+                                 'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required']), 'distribution': distribution}}
+    key = data.idempotency_key or str(uuid.uuid4())
+    existing = db.scalar(select(BulkAssessmentJob).where(BulkAssessmentJob.workspace == workspace, BulkAssessmentJob.vulnerability_id == vulnerability_id, BulkAssessmentJob.idempotency_key == key))
+    if existing:
+        return _bulk_job_output(db, existing)
+    finding_ids = [finding.id for finding, _, _, _ in prepared]
+    payload = data.model_dump(mode='json', exclude={'dry_run', 'idempotency_key'})
+    payload['finding_revisions'] = {str(f.id): f.revision for f in findings}
+    job = BulkAssessmentJob(workspace=workspace, vulnerability_id=vulnerability_id, requested_by=user.id,
+        idempotency_key=key, status='Queued', active_only=data.active_only, payload=payload,
+        finding_ids=finding_ids, total=len(finding_ids), correlation_id=uuid.uuid4().hex)
+    db.add(job); db.flush()
+    db.add_all([BulkAssessmentItem(job_id=job.id, finding_id=finding_id) for finding_id in finding_ids])
+    db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_started', entity='bulk_assessment_job', entity_id=job.id,
+                 details={'correlation_id': job.correlation_id, 'vulnerability_id': vulnerability_id, 'active_only': data.active_only, 'total': len(finding_ids)}))
+    db.commit(); db.refresh(job)
+    # Tests use an isolated in-memory database that is not the application's
+    # SessionLocal engine; pass that session so legacy synchronous tests remain
+    # deterministic while deployed jobs use an independent worker session.
+    # SQLite test/demo sessions may be isolated in-memory engines; reuse that
+    # session so the request and worker see the same schema. PostgreSQL uses a
+    # fresh SessionLocal worker for restart-safe execution.
+    background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
+    return _bulk_job_output(db, job) | {'status': 'Queued'}
+
+@router.get('/bulk-assessment-jobs/{job_id}')
+def bulk_job(job_id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    job = db.get(BulkAssessmentJob, job_id)
+    if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
+    return _bulk_job_output(db, job)
+
+@router.post('/bulk-assessment-jobs/{job_id}/cancel')
+def cancel_bulk_job(job_id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+    job = db.get(BulkAssessmentJob, job_id)
+    if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
+    if job.status not in ('Queued', 'Running'): raise HTTPException(409, 'Only queued or running jobs can be cancelled')
+    job.status = 'Cancel requested'; db.add(Audit(actor_id=user.id, action='plugin_assessment.bulk_cancel_requested', entity='bulk_assessment_job', entity_id=job.id, details={'correlation_id': job.correlation_id})); db.commit()
+    return _bulk_job_output(db, job)
+
+@router.post('/bulk-assessment-jobs/{job_id}/resume')
+def resume_bulk_job(job_id: int, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):
+    job = db.get(BulkAssessmentJob, job_id)
+    if not job or job.workspace != _workspace(request): raise HTTPException(404, 'Bulk assessment job not found')
+    if job.status not in ('Failed', 'Cancelled', 'Interrupted'): raise HTTPException(409, 'Only failed, cancelled, or interrupted jobs can resume')
+    db.execute(update(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed').values(status='Pending', error=None, processed_at=None))
+    job.status = 'Queued'; job.error = None
+    job.failed = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed')) or 0
+    job.succeeded = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Succeeded')) or 0
+    job.skipped = db.scalar(select(func.count(BulkAssessmentItem.id)).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Skipped')) or 0
+    job.processed = job.succeeded + job.skipped
+    db.commit(); background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
+    return _bulk_job_output(db, job)
 
 @router.put('/findings/{finding_id}/workflow')
 def update_workflow(finding_id: int, data: WorkflowInput, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -174,11 +389,13 @@ def request_exception(finding_id:int, data:ExceptionInput, request:Request, user
     db.add(item);db.flush();db.add(Audit(actor_id=user.id,action='exception.requested',entity='exception',entity_id=item.id,details={'finding_id':finding_id,'expires_at':expiry.isoformat()}));db.commit();return {'id':item.id,'status':item.status}
 
 @router.put('/exceptions/{id}')
-def decide_exception(id:int,data:ExceptionDecision,user=Depends(admin),db=Depends(get_db)):
+def decide_exception(id:int,data:ExceptionDecision,request:Request,user=Depends(admin),db=Depends(get_db)):
     item=db.get(RiskException,id)
-    if not item: raise HTTPException(404,'Exception not found')
+    if not item or item.workspace != _workspace(request): raise HTTPException(404,'Exception not found')
+    if item.requested_by == user.id:
+        raise HTTPException(403, 'A requester cannot approve or reject their own exception')
     item.status=data.status;item.approved_by=user.id;item.reviewed_at=datetime.now(timezone.utc)
-    db.add(Audit(actor_id=user.id,action='exception.'+data.status.lower(),entity='exception',entity_id=id));db.commit();return {'id':id,'status':item.status}
+    db.add(Audit(actor_id=user.id,action='exception.'+data.status.lower(),entity='exception',entity_id=id,details={'workspace':_workspace(request)}));db.commit();return {'id':id,'status':item.status}
 
 @router.get('/controls')
 def controls(request:Request,user=Depends(require_user),db=Depends(get_db)):
@@ -277,6 +494,133 @@ def operations(request:Request,user=Depends(require_user),db=Depends(get_db)):
     stale=db.scalar(select(func.count(Finding.id)).where(Finding.workspace==workspace,Finding.observed['last_seen'].as_string()<thirty)) or 0
     exceptions_open=db.scalar(select(func.count(RiskException.id)).where(RiskException.workspace==workspace,RiskException.status.in_(['Requested','Approved']))) or 0
     return {'total':total,'stale':stale,'open_exceptions':exceptions_open,'statuses':[{'name':s or 'New','value':c} for s,c in status_rows],'owners':[{'name':n or 'Unassigned','value':c} for n,c in owner_rows]}
+
+@router.get('/kpis')
+def kpis(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    """Single denominator/as-of KPI contract for dashboards, exports and reports."""
+    return calculate_kpis(db, _workspace(request))
+
+@router.get('/mission-center')
+def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str = '', owner_id: int | None = None, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request)
+    rows = db.execute(select(Finding, Vulnerability, Asset, FindingWorkflow)
+        .join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
+        .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+        .where(Finding.workspace == workspace)
+        .order_by(Finding.id.desc())).all()
+    queues = {key: [] for key in ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')}
+    today = datetime.now(timezone.utc).date()
+    for finding, vuln, asset, workflow in rows:
+        assessment = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+        if q and q.lower() not in f'{asset.hostname} {asset.ip or ""} {vuln.name} {vuln.plugin_id or ""}'.lower(): continue
+        if owner_id is not None and (not workflow or workflow.owner_id != owner_id): continue
+        status = workflow.status if workflow else 'New'
+        tech = {**(vuln.technical or {}), **(finding.observed or {}).get('technical', finding.observed or {})}
+        context = asset.context or {}
+        factors = []
+        if tech.get('kev') is True: factors.append('CISA KEV')
+        if tech.get('exploit_available') is True: factors.append('Exploit available')
+        if context.get('asset_criticality') in ('Critical', 'High'): factors.append('High asset criticality')
+        if context.get('exposure') == 'Internet Facing' or context.get('publicly_accessible') is True: factors.append('Internet exposed')
+        overdue = bool(workflow and workflow.remediation_due_at and workflow.remediation_due_at.date() < today and status not in ('Closed', 'Accepted'))
+        if overdue: factors.append('Overdue')
+        missing = not assessment or not context.get('asset_criticality') or not context.get('business_criticality')
+        stale = bool(assessment and assessment.revision != finding.revision)
+        severity = str(tech.get('severity') or '').lower()
+        priority = (40 if tech.get('kev') else 0) + (25 if tech.get('exploit_available') else 0) + (20 if context.get('asset_criticality') in ('Critical','High') else 0) + (15 if context.get('exposure') == 'Internet Facing' else 0) + (15 if overdue else 0) + (10 if missing else 0) + (10 if stale else 0) + ({'critical':20,'high':10,'medium':4}.get(severity, 0))
+        if severity in ('critical', 'high') or priority >= 45 or overdue or status in ('Assessment In Progress', 'Above Risk Appetite'): bucket = 'urgent_review'
+        elif stale or (not assessment and status not in ('Closed', 'Accepted')): bucket = 'monitor_reassess' if stale else 'automated_provisional'
+        elif missing: bucket = 'missing_context_evidence'
+        else: bucket = 'monitor_reassess'
+        item = {'finding_id': finding.id, 'name': vuln.name, 'asset': asset.hostname, 'plugin_id': vuln.plugin_id,
+                'status': status, 'owner_id': workflow.owner_id if workflow else None, 'priority_score': priority,
+                'priority_factors': factors, 'overdue': overdue, 'recommended_action':
+                'Reassess changed evidence' if stale else ('Collect authoritative context/evidence' if missing else ('Address overdue remediation' if overdue else 'Open finding and complete the assessment'))}
+        queues[bucket].append(item)
+    for items in queues.values(): items.sort(key=lambda x: (-x['priority_score'], x['finding_id']))
+    selected = {queue: queues[queue]} if queue in queues else queues
+    return {'workspace': workspace, 'queues': {k: v[(page-1)*page_size:page*page_size] for k,v in selected.items()},
+            'summary': {key: len(value) for key, value in selected.items()}, 'page': page, 'page_size': page_size,
+            'generated_at': datetime.now(timezone.utc).isoformat()}
+
+def _package_output(db, package):
+    findings = db.scalars(select(RemediationPackageFinding.finding_id).where(RemediationPackageFinding.package_id == package.id)).all()
+    evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id).order_by(RemediationPackageEvidence.id.desc())).all()
+    return {'id': package.id, 'name': package.name, 'workspace': package.workspace, 'remediation_action': package.remediation_action,
+            'owner_id': package.owner_id, 'jira_reference': package.jira_reference, 'due_date': package.due_date.isoformat() if package.due_date else None,
+            'status': package.status, 'blockers': package.blockers or [], 'finding_ids': findings,
+            'evidence': [{'id': e.id, 'type': e.evidence_type, 'reference': e.reference, 'verified': e.verified, 'created_at': e.created_at.isoformat()} for e in evidence]}
+
+@router.get('/remediation-packages')
+def list_remediation_packages(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request)
+    return [_package_output(db, p) for p in db.scalars(select(RemediationPackage).where(RemediationPackage.workspace == workspace).order_by(RemediationPackage.updated_at.desc())).all()]
+
+@router.post('/remediation-packages', status_code=201)
+def create_remediation_package(data: RemediationPackageInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    workspace = _workspace(request)
+    ids = set(data.finding_ids)
+    if ids and len(db.scalars(select(Finding.id).where(Finding.workspace == workspace, Finding.id.in_(ids))).all()) != len(ids):
+        raise HTTPException(422, 'All findings must belong to the current workspace')
+    package = RemediationPackage(workspace=workspace, name=data.name, remediation_action=data.remediation_action, owner_id=data.owner_id,
+        jira_reference=data.jira_reference, due_date=data.due_date, blockers=data.blockers, created_by=user.id)
+    db.add(package); db.flush()
+    for finding_id in ids: db.add(RemediationPackageFinding(package_id=package.id, finding_id=finding_id, added_by=user.id))
+    db.add(RemediationPackageEvent(package_id=package.id, action='created', details={'finding_count': len(ids)}, actor_id=user.id))
+    db.commit(); db.refresh(package); return _package_output(db, package)
+
+@router.put('/remediation-packages/{package_id}')
+def update_remediation_package(package_id: int, data: RemediationPackageUpdate, request: Request, user=Depends(writer), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    changes = data.model_dump(exclude_none=True)
+    if data.status == 'Verified Closed':
+        evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id, RemediationPackageEvidence.verified.is_(True))).all()
+        if not any(e.evidence_type == 'rescan' for e in evidence): raise HTTPException(409, 'A verified rescan is required before closure')
+    for key, value in changes.items(): setattr(package, key, value)
+    db.add(RemediationPackageEvent(package_id=package.id, action='updated', details=changes, actor_id=user.id)); db.commit(); db.refresh(package)
+    return _package_output(db, package)
+
+@router.post('/remediation-packages/{package_id}/evidence', status_code=201)
+def add_remediation_evidence(package_id: int, data: RemediationEvidenceInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    row = RemediationPackageEvidence(package_id=package.id, evidence_type=data.evidence_type, reference=data.reference.strip(), verified=False, created_by=user.id)
+    db.add(row); db.add(RemediationPackageEvent(package_id=package.id, action='evidence_added', details={'evidence_type': data.evidence_type}, actor_id=user.id)); db.commit(); db.refresh(row)
+    return {'id': row.id, 'verified': row.verified, 'type': row.evidence_type, 'reference': row.reference}
+
+@router.post('/remediation-packages/{package_id}/evidence/{evidence_id}/verify')
+def verify_remediation_evidence(package_id: int, evidence_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id); row = db.get(RemediationPackageEvidence, evidence_id)
+    if not package or package.workspace != _workspace(request) or not row or row.package_id != package.id: raise HTTPException(404, 'Evidence not found')
+    row.verified = True; db.add(RemediationPackageEvent(package_id=package.id, action='evidence_verified', details={'evidence_id': row.id}, actor_id=user.id)); db.commit()
+    return {'id': row.id, 'verified': True}
+
+@router.get('/remediation-sla/policies')
+def list_sla_policies(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    return [p.__dict__ | {'effective_from': p.effective_from.isoformat(), 'effective_to': p.effective_to.isoformat() if p.effective_to else None} for p in db.scalars(select(RemediationSLAPolicy).where(RemediationSLAPolicy.workspace == _workspace(request)).order_by(RemediationSLAPolicy.version.desc())).all()]
+
+@router.post('/remediation-sla/policies', status_code=201)
+def create_sla_policy(data: RemediationSLAPolicyInput, request: Request, user=Depends(admin), db=Depends(get_db)):
+    workspace = _workspace(request)
+    version = (db.scalar(select(func.max(RemediationSLAPolicy.version)).where(RemediationSLAPolicy.workspace == workspace)) or 0) + 1
+    row = RemediationSLAPolicy(workspace=workspace, version=version, created_by=user.id, **data.model_dump())
+    db.add(row); db.commit(); db.refresh(row)
+    return {'id': row.id, 'version': row.version}
+
+@router.get('/remediation-sla/evaluate')
+def evaluate_remediation_sla(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request); today = datetime.now(timezone.utc).date()
+    defaults = {('PCI DSS','Critical'):30,('PCI DSS','High'):30,('PCI DSS','Medium'):90,('PCI DSS','Low'):180,('Non-PCI','Critical'):30,('Non-PCI','High'):60,('Non-PCI','Medium'):90,('Non-PCI','Low'):None}
+    policies = db.scalars(select(RemediationSLAPolicy).where(RemediationSLAPolicy.workspace == workspace, RemediationSLAPolicy.approved.is_(True), RemediationSLAPolicy.effective_from <= today, (RemediationSLAPolicy.effective_to.is_(None) | (RemediationSLAPolicy.effective_to >= today)))).all()
+    rows=[]
+    for finding, vuln, asset, workflow in db.execute(select(Finding,Vulnerability,Asset,FindingWorkflow).join(Vulnerability,Vulnerability.id==Finding.vulnerability_id).join(Asset,Asset.id==Finding.asset_id).outerjoin(FindingWorkflow,FindingWorkflow.finding_id==Finding.id).where(Finding.workspace==workspace)).all():
+        tech={**(vuln.technical or {}), **(finding.observed or {})}; severity=tech.get('severity','Low'); scopes=(asset.context or {}).get('regulatory') or []
+        obligations=[(s, next((p.days for p in policies if p.regulatory_scope==s and p.severity==severity), defaults.get((s,severity), defaults.get(('Non-PCI',severity)))) ) for s in (scopes or ['Non-PCI'])]
+        obligations=[x for x in obligations if x[1] is not None]; days=min((x[1] for x in obligations), default=None)
+        first=(finding.source_last_seen or today); age=(today-first).days; due=first+timedelta(days=days) if days else None
+        rows.append({'finding_id':finding.id,'severity':severity,'scopes':scopes,'first_seen':first.isoformat(),'age_days':age,'sla_days':days,'due_date':due.isoformat() if due else None,'overdue':bool(due and today>due),'due_soon':bool(due and not (today>due) and (due-today).days<=7),'exception':False})
+    return {'workspace':workspace,'policies':'provisional defaults plus approved overrides','total':len(rows),'overdue':sum(x['overdue'] for x in rows),'due_soon':sum(x['due_soon'] for x in rows),'items':rows}
 
 def _executive_filters(request):
     allowed = ('period_start', 'period_end', 'severity', 'asset_group', 'business_owner', 'it_owner', 'application_owner', 'regulatory', 'campaign_id')

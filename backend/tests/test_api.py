@@ -2,7 +2,8 @@ from copy import deepcopy
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,Audit,ImportRow,IntegrationSettings,User
+from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,SyncJob,User,now
+from app.api.tenable import recover_stale_syncs
 from app.risk.policy import DEFAULT
 from conftest import login
 DATA={'hostname':'TEST-01','name':'Synthetic RCE','plugin_id':'test-100','severity':'Critical','cvss':9.8,'vpr':9.4}
@@ -11,6 +12,15 @@ def create(client):
     r=client.post('/api/findings',json=DATA); assert r.status_code==201,r.text
     return r.json()
 def body(f): return {'expected_revision':f['revision'],'methodology_id':f['methodology_id'],'context':CONTEXT,'controls':[],'justification':'Reviewed business context','decision':'Remediation Required','status':'Assessed'}
+def test_api_security_headers_are_restrictive(client):
+    response = client.get('/api/health')
+    assert response.headers['content-security-policy'] == "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    assert response.headers['cross-origin-opener-policy'] == 'same-origin'
+    assert response.headers['cross-origin-resource-policy'] == 'same-site'
+    assert response.headers['permissions-policy'] == 'camera=(), geolocation=(), microphone=()'
+    assert response.headers['x-permitted-cross-domain-policies'] == 'none'
+
+
 def test_auth_rbac_csrf(client):
     assert client.get('/api/findings').status_code==401
     login(client,'viewer'); assert client.get('/api/findings').status_code==200
@@ -19,6 +29,17 @@ def test_auth_rbac_csrf(client):
     login(client); client.headers.pop('X-CSRF-Token')
     assert client.post('/api/findings',json=DATA).status_code==403
     assert client.post('/api/auth/login',headers={'Origin':'https://evil.example'},json={'username':'admin','password':'Test-password-123!'}).status_code==403
+
+def test_stale_tenable_job_is_recovered_without_touching_active_job(db):
+    from datetime import timedelta
+    stale = SyncJob(kind='vulnerabilities', workspace='Production', started_at=now()-timedelta(hours=2))
+    active = SyncJob(kind='assets', workspace='Production', started_at=now())
+    db.add_all([stale, active]); db.commit()
+    recovered = recover_stale_syncs(db, 'Production')
+    assert [job.id for job in recovered] == [stale.id]
+    db.refresh(stale); db.refresh(active)
+    assert stale.status == 'Failed' and stale.counts['recovered_stale_job'] is True
+    assert active.status == 'Running'
 
 def test_administrator_can_change_role_and_audit_it(client, db):
     login(client)
@@ -80,6 +101,20 @@ def test_atomic_revision_and_replay(client,db):
     assert h[0]['score']['inputs']['technical']['cvss']==9.8
     assert db.scalar(select(Audit).where(Audit.action=='assessment.saved'))
 
+def test_dashboard_and_executive_report_share_current_assessment_definition(client):
+    login(client)
+    finding=create(client)
+    assert client.post(f"/api/findings/{finding['id']}/assessments",json=body(finding)).status_code==201
+    dashboard=client.get('/api/dashboard').json()
+    report=client.get('/api/executive-report').json()
+    assert dashboard['completed']==1 and report['summary']['assessed']==1
+    config=deepcopy(DEFAULT); config['appetite']='Critical'
+    assert client.post('/api/methodologies',json={'version':'currentness-test','configuration':config}).status_code==201
+    dashboard=client.get('/api/dashboard').json()
+    report=client.get('/api/executive-report').json()
+    assert dashboard['completed']==0 and report['summary']['assessed']==0
+    assert report['assessment_posture']['stale_assessments']==1
+
 def test_methodology_immutable(client):
     login(client);f=create(client);payload=body(f)
     assert client.post(f"/api/findings/{f['id']}/assessments",json=payload).status_code==201
@@ -126,6 +161,15 @@ def test_bad_upload_logout(client):
     assert client.post('/api/imports/preview',files={'file':('evil.exe',b'x','application/octet-stream')}).status_code==422
     assert client.post('/api/auth/logout').status_code==200
     assert client.get('/api/findings').status_code==401
+
+def test_assessment_group_detail_does_not_leak_between_workspaces(client):
+    login(client, environment='Production')
+    finding=create(client)
+    group_id=next(item for item in client.get('/api/assessment-groups').json()['items'] if item['plugin_id']=='test-100')['id']
+    assert group_id == finding['id'] or group_id > 0
+    assert client.post('/api/auth/logout').status_code==200
+    login(client, environment='Demo')
+    assert client.get(f'/api/assessment-groups/{group_id}').status_code==404
 
 def test_environment_isolation(client):
     login(client, environment='Demo'); demo=create(client)
@@ -190,6 +234,22 @@ def test_disabling_or_deleting_rule_removes_its_inherited_effects(client):
     assert deleted.status_code==200 and deleted.json()['assets_reconciled']==1
     assert client.get(f"/api/findings/{finding['id']}").json()['applied_rules']==[]
 
+def test_disabling_rule_preserves_a_manual_context_value(client):
+    login(client)
+    rule={'name':'Production AWS','priority':10,'active':True,'match_type':'Hostname prefix','match_value':'aws',
+          'context':{'environment':'Production','regulatory':['PCI DSS']},'controls':[]}
+    rule_id=client.post('/api/asset-rules',json=rule).json()['id']
+    finding=client.post('/api/findings',json={**DATA,'hostname':'aws-finance-01','ip':'10.44.2.20','plugin_id':'aws-finance'}).json()
+    asset_id=finding['asset']['id']
+    changed=client.put(f'/api/assets/{asset_id}',json={'environment':'Production','regulatory':['PCI DSS','SOC 2']})
+    assert changed.status_code==200
+    assert changed.json()['context_provenance']['regulatory']['source_system']=='asset_management'
+    disabled=client.put(f'/api/asset-rules/{rule_id}',json={**rule,'active':False})
+    assert disabled.status_code==200
+    refreshed=client.get(f"/api/findings/{finding['id']}").json()
+    assert refreshed['context']['environment']=='Production'
+    assert refreshed['context']['regulatory']==['PCI DSS','SOC 2']
+
 def test_asset_context_is_authoritative_and_flags_reassessment(client):
     login(client); finding=create(client); payload=body(finding)
     saved=client.post(f"/api/findings/{finding['id']}/assessments",json=payload).json()
@@ -199,6 +259,35 @@ def test_asset_context_is_authoritative_and_flags_reassessment(client):
     assert refreshed['context']['asset_criticality']=='Low'
     assert refreshed['context']['regulatory']==['SOX']
     assert refreshed['reassessment_required'] is True
+
+def test_regulatory_scope_memberships_are_additive_and_governed(client, db):
+    login(client)
+    created = client.post('/api/assets', json={
+        'hostname': 'scope-asset', 'regulatory': ['PCI DSS'],
+    })
+    assert created.status_code == 201, created.text
+    asset_id = created.json()['id']
+    membership = db.scalar(select(AssetRegulatoryScope).where(
+        AssetRegulatoryScope.asset_id == asset_id,
+        AssetRegulatoryScope.scope == 'PCI DSS',
+    ))
+    assert membership and membership.active and membership.source_system == 'asset_management'
+
+    expanded = client.put(f'/api/assets/{asset_id}', json={
+        'regulatory': ['PCI DSS', 'SOC 2'],
+    })
+    assert expanded.status_code == 200, expanded.text
+    assert expanded.json()['context']['regulatory'] == ['PCI DSS', 'SOC 2']
+    assert db.scalar(select(AssetRegulatoryScope).where(
+        AssetRegulatoryScope.asset_id == asset_id,
+        AssetRegulatoryScope.scope == 'SOC 2',
+        AssetRegulatoryScope.active.is_(True),
+    )) is not None
+
+    removed = client.put(f'/api/assets/{asset_id}', json={'regulatory': ['PCI DSS']})
+    assert removed.status_code == 409
+    assert 'governed classification change request' in removed.json()['detail']
+
 
 def test_assets_are_paginated_searchable_and_support_crud(client):
     login(client)
@@ -226,9 +315,38 @@ def test_assessment_groups_plugin_assets_and_bulk_context(client):
     assert group['assets']==2 and group['findings']==2 and group['assessed']==0
     detail=client.get(f"/api/assessment-groups/{group['id']}").json()
     assert {item['finding_id'] for item in detail['items']}=={first['id'],second['id']}
-    updated=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_criticality':'Critical'})
+    protected=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_criticality':'Critical'})
+    assert protected.status_code==422
+    updated=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_group':'Windows fleet'})
     assert updated.status_code==200 and updated.json()=={'assets_updated':2,'findings_flagged':3}
-    assert client.get(f"/api/findings/{other['id']}").json()['context']['asset_criticality']=='Critical'
+    assert client.get(f"/api/findings/{other['id']}").json()['context']['asset_group']=='Windows fleet'
+
+def test_protected_asset_context_rejects_a_stale_editor_version(client):
+    login(client)
+    finding=create(client)
+    asset_id=finding['asset']['id']
+    first=client.put(f'/api/assets/{asset_id}',json={'asset_criticality':'High','expected_context_version':1})
+    assert first.status_code==200 and first.json()['context_version']==2
+    stale=client.put(f'/api/assets/{asset_id}',json={'asset_criticality':'Critical','expected_context_version':1})
+    assert stale.status_code==409
+    current=client.get('/api/assets').json()['items'][0]
+    assert current['context']['asset_criticality']=='High' and current['context_version']==2
+
+def test_rules_and_ingest_cannot_overwrite_existing_asset_classification(client):
+    login(client)
+    first=create(client)
+    asset_id=first['asset']['id']
+    protected=client.put(f'/api/assets/{asset_id}',json={'asset_criticality':'Critical','regulatory':['PCI DSS','SOC 2'],'environment':'Production'})
+    assert protected.status_code==200
+    assert protected.json()['context_version']==2
+    assert protected.json()['context_provenance']['regulatory']['source_system']=='asset_management'
+    rule={'name':'Unsafe source proposal','priority':1,'active':True,'match_type':'Hostname prefix','match_value':'test-',
+          'context':{'asset_criticality':'Low','regulatory':['None'],'environment':'Development'},'controls':[]}
+    assert client.post('/api/asset-rules',json=rule).status_code==201
+    second=client.post('/api/findings',json={**DATA,'plugin_id':'test-rule-proposal','name':'Rule proposal'}).json()
+    assert second['context']['asset_criticality']=='Critical'
+    assert second['context']['regulatory']==['PCI DSS','SOC 2']
+    assert second['context']['environment']=='Production'
 
 def test_tenable_configuration_is_encrypted_and_redacted(client,db):
     login(client)
@@ -255,8 +373,10 @@ def test_governance_workflow_template_exception_control_and_reporting(client):
     assert client.get(f"/api/findings/{first['id']}").json()['status']=='Assessment In Progress'
     workflow=client.put(f"/api/findings/{second['id']}/workflow",json={'owner_id':2,'status':'Remediation Planned'})
     assert workflow.status_code==200 and workflow.json()['owner_id']==2
+    login(client,'analyst')
     exception=client.post(f"/api/findings/{first['id']}/exceptions",json={'justification':'Temporary operational dependency requires documented acceptance','evidence':'Change record CAB-42','expires_at':'2030-01-01T00:00:00Z','review_frequency_days':30})
     assert exception.status_code==201
+    login(client)
     assert client.put(f"/api/exceptions/{exception.json()['id']}",json={'status':'Approved'}).status_code==200
     control=client.post('/api/controls',json={'name':'Privileged access review','description':'Quarterly review','evidence_requirements':'Approved review record','mappings':{'NIST':['PR.AA-05']},'design_maturity':3,'operating_effectiveness':4,'active':True})
     assert control.status_code==201
@@ -269,6 +389,113 @@ def test_governance_workflow_template_exception_control_and_reporting(client):
     assert pdf.status_code==200 and pdf.headers['content-type']=='application/pdf'
     assert pdf.content.startswith(b'%PDF-') and len(pdf.content)>3000
 
+def test_plugin_template_versions_preview_and_preserve_workflow(client):
+    login(client); finding = create(client)
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    saved=client.put(f"/api/assessment-groups/{group['id']}/template",json={
+        'owner_id':2,'status':'Closed','notes':'Shared rationale','justification':'Template review completed',
+        'decision':'Remediation Required','technical_rationale':'Same vendor remediation applies',
+        'applicability':{},'controls':[]})
+    assert saved.status_code == 200
+    template=client.get(f"/api/assessment-groups/{group['id']}/template").json()
+    assert template['template_version']==1 and len(template['revisions'])==1
+    assert client.put(f"/api/findings/{finding['id']}/workflow",json={'owner_id':3,'status':'Investigating'}).status_code==200
+    preview=client.post(f"/api/assessment-groups/{group['id']}/template/apply?preview=true")
+    assert preview.status_code==200 and preview.json()['changed'] + preview.json()['unchanged'] >= 1
+    applied=client.post(f"/api/assessment-groups/{group['id']}/template/apply")
+    assert applied.status_code==200
+    detail=client.get(f"/api/findings/{finding['id']}").json()
+    assert detail['workflow_status']=='Investigating' and detail['asset']['hostname']
+    replay=client.post(f"/api/assessment-groups/{group['id']}/template/apply")
+    assert replay.status_code==200 and replay.json()['skipped'] >= 1
+def test_bulk_plugin_assessment_preserves_asset_authoritative_context(client):
+    login(client)
+    first=create(client)
+    second=client.post('/api/findings',json={**DATA,'hostname':'TEST-02'}).json()
+    first_asset=client.get(f"/api/findings/{first['id']}").json()['asset']['id']
+    second_asset=client.get(f"/api/findings/{second['id']}").json()['asset']['id']
+    assert client.put(f'/api/assets/{first_asset}',json={'asset_criticality':'Critical','regulatory':['PCI DSS','SOC 2'],'environment':'Production'}).status_code==200
+    assert client.put(f'/api/assets/{second_asset}',json={'asset_criticality':'Low','regulatory':['SOC 2'],'environment':'Test'}).status_code==200
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    submitted={**CONTEXT,'asset_criticality':'Low','regulatory':['None'],'environment':'Development'}
+    response=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json={
+        'context':submitted,'controls':[],'owner_id':1,'workflow_status':'Risk Review','notes':'Shared technical scenario',
+        'justification':'Preserve approved asset context','decision':'Remediation Required','status':'Assessed'})
+    assert response.status_code==200,response.text
+    first_assessment=client.get(f"/api/findings/{first['id']}/history").json()[0]
+    second_assessment=client.get(f"/api/findings/{second['id']}/history").json()[0]
+    assert first_assessment['score']['inputs']['context']['asset_criticality']=='Critical'
+    assert first_assessment['score']['inputs']['context']['regulatory']==['PCI DSS','SOC 2']
+    assert second_assessment['score']['inputs']['context']['asset_criticality']=='Low'
+    assert second_assessment['score']['inputs']['context']['environment']=='Test'
+
+def test_mission_center_returns_prioritized_operational_queues(client):
+    login(client)
+    create(client)
+    response = client.get('/api/mission-center')
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body['queues']) == {'urgent_review','missing_context_evidence','automated_provisional','monitor_reassess'}
+    assert body['summary']['urgent_review'] == 1
+
+def test_remediation_package_requires_verified_rescan_before_closure(client):
+    login(client); finding = create(client)
+    package = client.post('/api/remediation-packages', json={'name':'Patch wave','remediation_action':'Patch and rescan','finding_ids':[finding['id']]})
+    assert package.status_code == 201, package.text
+    pid = package.json()['id']
+    assert client.put(f'/api/remediation-packages/{pid}', json={'status':'Verified Closed'}).status_code == 409
+    evidence = client.post(f'/api/remediation-packages/{pid}/evidence', json={'evidence_type':'rescan','reference':'scan-1'})
+    assert evidence.status_code == 201
+    assert client.post(f"/api/remediation-packages/{pid}/evidence/{evidence.json()['id']}/verify").status_code == 200
+    assert client.put(f'/api/remediation-packages/{pid}', json={'status':'Verified Closed'}).status_code == 200
+
+def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
+    login(client); create(client)
+    response = client.get('/api/kpis')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['total_findings'] >= 1 and body['assessment_coverage'] >= 0
+    assert body['workspace'] == 'Production' and body['as_of']
+
+def test_dashboard_exposes_governance_and_remediation_metrics(client):
+    login(client)
+    create(client)
+    dashboard = client.get('/api/dashboard')
+    assert dashboard.status_code == 200
+    remediation = dashboard.json()['remediation']
+    assert {'verified_closure','ticket_coverage','backlog_aging'} <= set(remediation)
+
+def test_plugin_bulk_dry_run_reports_conflicts_without_mutation(client):
+    login(client)
+    finding = create(client)
+    asset_id = client.get(f"/api/findings/{finding['id']}").json()['asset']['id']
+    assert client.put(f'/api/assets/{asset_id}', json={'asset_criticality':'Critical','regulatory':['PCI DSS']}).status_code == 200
+    group = next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    response = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json={
+        'context': {**CONTEXT, 'asset_criticality':'Low', 'regulatory':['None']},
+        'justification':'Preview only', 'dry_run':True, 'active_only':True,
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()['dry_run'] is True and response.json()['findings'] == 1
+    assert response.json()['conflicts']
+    assert client.get(f"/api/findings/{finding['id']}/history").json() == []
+
+def test_workspace_idor_is_blocked_for_exceptions_and_imports(client):
+    login(client)
+    finding=create(client)
+    exception=client.post(f"/api/findings/{finding['id']}/exceptions",json={'justification':'Production exception for isolation test','evidence':'CAB-77','expires_at':'2030-01-01T00:00:00Z','review_frequency_days':30}).json()
+    csv=b'hostname,name,plugin_id\nimport-host,Import test,import-plugin\n'
+    batch=client.post('/api/imports/preview',files={'file':('production.csv',csv,'text/csv')}).json()['id']
+    login(client,environment='Demo')
+    assert client.put(f"/api/exceptions/{exception['id']}",json={'status':'Approved'}).status_code==404
+    assert client.post(f'/api/imports/{batch}/validate',json={'mapping':{}}).status_code==404
+
+def test_exception_requester_cannot_self_approve(client):
+    login(client)
+    finding=create(client)
+    exception=client.post(f"/api/findings/{finding['id']}/exceptions",json={'justification':'Self approval must be blocked','evidence':'CAB-88','expires_at':'2030-01-01T00:00:00Z','review_frequency_days':30}).json()
+    assert client.put(f"/api/exceptions/{exception['id']}",json={'status':'Approved'}).status_code==403
+
 def test_plugin_bulk_assessment_applies_full_workbench_context(client):
     login(client); first=create(client)
     second=client.post('/api/findings',json={**DATA,'hostname':'TEST-02'}).json()
@@ -278,11 +505,47 @@ def test_plugin_bulk_assessment_applies_full_workbench_context(client):
         'notes':'Shared validation completed','justification':'The plugin has the same exposure across this asset group',
         'decision':'Remediation Required','status':'Assessed'})
     assert response.status_code==200,response.text
-    assert response.json()=={'findings_assessed':2,'assets_affected':2}
+    body = response.json()
+    assert body['total'] == 2 and body['status'] in ('Queued', 'Running') and body['correlation_id']
+    body = client.get(f"/api/bulk-assessment-jobs/{body['id']}").json()
+    assert body['succeeded'] == 2 and body['processed'] == 2 and body['failed'] == 0
     for finding in (first,second):
         detail=client.get(f"/api/findings/{finding['id']}").json()
         assert detail['status']=='Assessed' and detail['context']['asset_criticality']=='Critical'
 
+def test_plugin_bulk_job_is_idempotent_and_reports_progress(client):
+    login(client); create(client)
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    payload={'context':CONTEXT,'controls':[],'owner_id':1,'workflow_status':'Risk Review',
+             'notes':'Idempotent job','justification':'Retry-safe bulk assessment',
+             'decision':'Remediation Required','status':'Assessed','idempotency_key':'bulk-test-key-001'}
+    first=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json=payload)
+    assert first.status_code == 200
+    original=first.json()
+    original=client.get(f"/api/bulk-assessment-jobs/{original['id']}").json()
+    assert original['status']=='Completed' and original['progress_percent']==100
+    retry=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json=payload)
+    assert retry.status_code == 200
+    assert retry.json()['id'] == original['id']
+    assert retry.json()['succeeded'] == original['succeeded']
+    status=client.get(f"/api/bulk-assessment-jobs/{original['id']}")
+    assert status.status_code == 200 and status.json()['correlation_id'] == original['correlation_id']
+    assert status.json()['processed'] <= status.json()['total']
+
+def test_vulnerability_questionnaire_and_preview_explain_cohorts(client):
+    login(client); create(client)
+    questionnaire = client.get('/api/assessment-questionnaire')
+    assert questionnaire.status_code == 200 and questionnaire.json()['version'] == '1.0-provisional'
+    group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
+    response=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json={
+        'context':CONTEXT,'controls':[],'justification':'Preview scenario evidence and cohorts',
+        'answers':{'attack_prerequisite':'Low','exploit_validation':'Observed'},
+        'scenario_evidence':['TENABLE-PLUGIN-100'],'scenario_notes':'Shared synthetic evidence',
+        'decision':'Remediation Required','status':'Assessed','dry_run':True})
+    body=response.json()
+    assert response.status_code == 200
+    assert {'changed','unchanged','excluded','conflicts','regulatory_scope','cohorts'} <= body.keys()
+    assert 'distribution' in body['risk_preview']
 def test_saved_filters_are_personal_and_workspace_scoped(client):
     login(client)
     created=client.post('/api/saved-filters',json={'name':'Critical unassessed','filters':{'severity':'Critical','status':'Not Assessed','q':''}})
@@ -292,3 +555,193 @@ def test_saved_filters_are_personal_and_workspace_scoped(client):
     assert updated.status_code==201 and client.get('/api/saved-filters').json()[0]['filters']=={'severity':'High'}
     assert client.delete(f"/api/saved-filters/{saved[0]['id']}").status_code==200
     assert client.get('/api/saved-filters').json()==[]
+
+def test_classification_change_request_requires_independent_approval(client, db):
+    login(client)
+    asset = client.post('/api/assets', json={
+        'hostname': 'governed-scope-asset', 'regulatory': ['PCI DSS', 'SOC 2'],
+    }).json()
+    asset_id = asset['id']
+
+    login(client, 'analyst')
+    request = client.post(f'/api/assets/{asset_id}/classification-change-requests', json={
+        'expected_context_version': asset['context_version'],
+        'changes': {'regulatory': ['SOC 2']},
+        'justification': 'The PCI system was decommissioned and scope was validated.',
+        'evidence': 'Approved decommission record DC-001.',
+    })
+    assert request.status_code == 201, request.text
+    change = request.json()
+    assert change['before_context']['regulatory'] == ['PCI DSS', 'SOC 2']
+    assert change['proposed_context']['regulatory'] == ['SOC 2']
+    assert client.put(f"/api/classification-change-requests/{change['id']}", json={
+        'status': 'Approved', 'justification': 'Self approval must be blocked.',
+    }).status_code == 403
+
+    login(client)
+    approved = client.put(f"/api/classification-change-requests/{change['id']}", json={
+        'status': 'Approved', 'justification': 'GRC evidence reviewed and approved.',
+    })
+    assert approved.status_code == 200, approved.text
+    assert approved.json()['status'] == 'Approved' and approved.json()['applied_at']
+    saved = client.get('/api/assets').json()['items'][0]
+    assert saved['context']['regulatory'] == ['SOC 2']
+    memberships = db.scalars(select(AssetRegulatoryScope).where(
+        AssetRegulatoryScope.asset_id == asset_id,
+    )).all()
+    by_scope = {row.scope: row for row in memberships}
+    assert by_scope['PCI DSS'].active is False
+    assert by_scope['SOC 2'].active is True
+    assert by_scope['SOC 2'].approval_state == 'Approved'
+
+    # Re-add the approved scope and remove it again: membership identity must
+    # remain stable while the audit lifecycle records both transitions.
+    current = db.get(Asset, asset_id)
+    login(client, 'analyst')
+    readd = client.post(f'/api/assets/{asset_id}/classification-change-requests', json={
+        'expected_context_version': current.context_version, 'changes': {'regulatory': ['PCI DSS', 'SOC 2']},
+        'justification': 'PCI scope restored after approved system change.', 'evidence': 'GRC-RESTORE-1',
+    }).json()
+    login(client)
+    assert client.put(f"/api/classification-change-requests/{readd['id']}", json={'status':'Approved','justification':'GRC approved restoration.'}).status_code == 200
+    restored = {row.scope: row for row in db.scalars(select(AssetRegulatoryScope).where(AssetRegulatoryScope.asset_id == asset_id)).all()}
+    pci_id = restored['PCI DSS'].id
+    assert restored['PCI DSS'].active is True and restored['PCI DSS'].approval_state == 'Approved'
+    current = db.get(Asset, asset_id)
+    login(client, 'analyst')
+    remove_again = client.post(f'/api/assets/{asset_id}/classification-change-requests', json={
+        'expected_context_version': current.context_version, 'changes': {'regulatory': ['SOC 2']},
+        'justification': 'PCI scope removed again with approved evidence.', 'evidence': 'GRC-REMOVE-2',
+    }).json()
+    login(client)
+    assert client.put(f"/api/classification-change-requests/{remove_again['id']}", json={'status':'Approved','justification':'GRC approved removal.'}).status_code == 200
+    db.expire_all(); final = db.scalar(select(AssetRegulatoryScope).where(AssetRegulatoryScope.id == pci_id))
+    assert final.active is False and final.id == pci_id and final.removed_at is not None
+
+
+def test_classification_change_request_is_workspace_scoped(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'production-governed-asset'}).json()
+    change = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'],
+        'changes': {'asset_criticality': 'High'},
+        'justification': 'Business impact review.',
+    }).json()
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, environment='Demo')
+    assert client.put(f"/api/classification-change-requests/{change['id']}", json={
+        'status': 'Approved', 'justification': 'Guessed ID.'
+    }).status_code == 404
+
+
+def test_classification_mission_draft_is_resumable_and_workspace_scoped(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'mission-asset'}).json()
+    saved = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '1.0-provisional', 'current_step': 3,
+        'responses': {'identity_owner': 'Infrastructure', 'data_scope': 'PCI DSS'},
+    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()['status'] == 'Draft' and saved.json()['current_step'] == 3
+    resumed = client.get(f"/api/assets/{asset['id']}/classification-mission")
+    assert resumed.status_code == 200 and resumed.json()['responses']['data_scope'] == 'PCI DSS'
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, environment='Demo')
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission").status_code == 404
+
+def test_classification_change_request_can_govern_owner_assignment(client):
+    login(client)
+    asset = client.post('/api/assets', json={'hostname': 'owner-governed-asset'}).json()
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, 'analyst')
+    assert client.put(f"/api/assets/{asset['id']}/classification-mission", json={'current_step': 1, 'responses': {}}).status_code == 200
+    request = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'],
+        'changes': {'business_owner': 'Payments leadership', 'it_owner': 'Endpoint engineering'},
+        'justification': 'Owner attestation completed.', 'evidence': 'BIA-123',
+    })
+    assert request.status_code == 201, request.text
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission").json()['status'] == 'Pending Owner Validation'
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client)
+    approved = client.put(f"/api/classification-change-requests/{request.json()['id']}", json={
+        'status': 'Approved', 'justification': 'Attestation verified.',
+    })
+    assert approved.status_code == 200
+    current = next(item for item in client.get('/api/assets').json()['items'] if item['id'] == asset['id'])
+    assert current['context']['business_owner'] == 'Payments leadership'
+    assert current['context']['it_owner'] == 'Endpoint engineering'
+
+def test_classification_mission_tracks_review_decision(client):
+    login(client)
+    asset = client.post('/api/assets', json={'hostname': 'mission-decision-asset'}).json()
+    assert client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'current_step': 4, 'responses': {'classification': {'context': {'asset_criticality': 'High'}}},
+    }).status_code == 200
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, 'analyst')
+    request = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'], 'changes': {'asset_criticality': 'High'},
+        'justification': 'BIA completed.',
+    })
+    assert request.status_code == 201
+    pending = client.get(f"/api/assets/{asset['id']}/classification-mission").json()
+    assert pending['status'] == 'Pending GRC Approval' and pending['current_step'] == 5
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client)
+    assert client.put(f"/api/classification-change-requests/{request.json()['id']}", json={
+        'status': 'Rejected', 'justification': 'Evidence is incomplete.',
+    }).status_code == 200
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission").json()['status'] == 'Rejected'
+
+def test_classification_mission_validates_version_and_answer_contract(client):
+    login(client)
+    asset = client.post('/api/assets', json={'hostname': 'mission-validation-asset'}).json()
+    bad_version = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '0.1-old', 'current_step': 1, 'responses': {},
+    })
+    assert bad_version.status_code == 409
+    bad_answer = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '1.0-provisional', 'current_step': 2,
+        'responses': {'business.criticality': 'Extreme'},
+    })
+    assert bad_answer.status_code == 422
+    good = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '1.0-provisional', 'current_step': 2,
+        'responses': {'business.criticality': 'High', 'scope.regulatory': ['PCI DSS']},
+    })
+    assert good.status_code == 200
+
+def test_classification_questionnaire_uses_stable_versioned_ids(client):
+    login(client)
+    questionnaire = client.get('/api/classification-questionnaire').json()
+    assert questionnaire['version'] == '1.0-provisional'
+    question_ids = [question['id'] for step in questionnaire['steps'] for question in step['questions']]
+    assert len(question_ids) == len(set(question_ids))
+    assert {'identity.business_owner', 'scope.regulatory', 'exposure.network'} <= set(question_ids)
+
+def test_classification_mission_history_is_workspace_scoped_and_resumable(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'mission-history-asset'}).json()
+    saved = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'current_step': 2, 'responses': {'business.criticality': 'High'},
+    })
+    assert saved.status_code == 200
+    history = client.get(f"/api/assets/{asset['id']}/classification-mission/history")
+    assert history.status_code == 200 and history.json()[0]['action'] == 'draft_saved'
+    login(client, environment='Demo')
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission/history").status_code == 404
+
+def test_classification_evidence_requires_mission_and_is_workspace_scoped(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'evidence-asset'}).json()
+    payload = {'evidence_type': 'BIA', 'reference': 'BIA-77', 'notes': 'Business impact assessment.'}
+    assert client.post(f"/api/assets/{asset['id']}/classification-mission/evidence", json=payload).status_code == 409
+    assert client.put(f"/api/assets/{asset['id']}/classification-mission", json={'current_step': 2, 'responses': {}}).status_code == 200
+    added = client.post(f"/api/assets/{asset['id']}/classification-mission/evidence", json=payload)
+    assert added.status_code == 201, added.text
+    evidence = client.get(f"/api/assets/{asset['id']}/classification-mission/evidence").json()
+    assert evidence[0]['reference'] == 'BIA-77' and evidence[0]['evidence_type'] == 'BIA'
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, environment='Demo')
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission/evidence").status_code == 404

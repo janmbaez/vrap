@@ -105,11 +105,28 @@ def test_tenable_lifecycle_updates_one_finding_and_preserves_review(db):
     closed=normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':0,'protocol':'tcp'},'severity':'High','state':'FIXED','finding_id':'stable-1'})
     same,created=ingest(db,closed,'Tenable',{'finding_id':'stable-1'},update_existing=True,actor_id=1)
     assert same.id == finding.id and not created
+    assert same.revision == 0 and same.lifecycle_revision == 1
     assert db.get(FindingWorkflow,finding.id).status == 'Closed'
     assert db.get(FindingWorkflow,finding.id).review_state == 'Reviewed'
     reopened=normalize({'asset':{'uuid':'asset-1','hostname':['server']},'plugin':{'id':1,'name':'Finding'},'port':{'port':0,'protocol':'tcp'},'severity':'High','state':'ACTIVE','finding_id':'stable-1'})
     same,created=ingest(db,reopened,'Tenable',{'finding_id':'stable-1'},update_existing=True,actor_id=1)
     assert same.id == finding.id and not created and db.get(FindingWorkflow,finding.id).status == 'New'
+    assert same.revision == 0 and same.lifecycle_revision == 2
+
+def test_identical_tenable_rescan_preserves_assessment_revision_and_updates_freshness(db):
+    active=normalize({'asset':{'uuid':'asset-fresh','hostname':['fresh-server']},'plugin':{'id':9,'name':'Freshness'},
+                      'port':{'port':443,'protocol':'tcp'},'severity':'High','state':'ACTIVE',
+                      'last_found':'2026-10-01','finding_id':'fresh-1'})
+    finding,created=ingest(db,active,'Tenable',{'finding_id':'fresh-1','state':'ACTIVE'},update_existing=True,actor_id=1)
+    assert created and finding.revision == 0
+    fingerprint=finding.evidence_fingerprint
+    rescan=active.model_copy(update={'last_seen': active.last_seen})
+    same,created_again=ingest(db,rescan,'Tenable',{'finding_id':'fresh-1','state':'ACTIVE','last_found':'2026-10-02'},update_existing=True,actor_id=1)
+    assert not created_again and same.id == finding.id
+    assert same.revision == 0 and same.evidence_fingerprint == fingerprint
+    changed=active.model_copy(update={'cvss': 9.9})
+    changed_finding,_=ingest(db,changed,'Tenable',{'finding_id':'fresh-1','state':'ACTIVE'},update_existing=True,actor_id=1)
+    assert changed_finding.revision == 1 and changed_finding.evidence_fingerprint != fingerprint
 
 def test_ingest_cache_prevents_duplicate_findings(db):
     cache = {}
@@ -137,3 +154,37 @@ def test_cleanup_tenable_duplicates_merges_same_stable_finding_id(db):
     remaining = db.query(Finding).filter(Finding.source == 'Tenable').all()
     assert len(remaining) == 1
     assert remaining[0].source_record['finding_id'] == 'stable-1'
+
+def test_failed_tenable_sync_does_not_publish_partial_findings(tmp_path, monkeypatch):
+    """The worker may update progress, but live findings publish only on success."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.db import Base
+    from app.models import SyncJob, User
+    from app.api import tenable as tenable_api
+
+    engine = create_engine(f'sqlite:///{tmp_path}/sync-atomic.db')
+    Base.metadata.create_all(engine)
+    Local = sessionmaker(engine, expire_on_commit=False)
+    with Local() as db:
+        db.add(User(id=1, username='sync-user', password_hash='test', role='Administrator', active=True))
+        job = SyncJob(kind='vulnerabilities', workspace='Production')
+        db.add(job); db.commit(); job_id = job.id
+
+    class FailingClient:
+        def __init__(self, *_args, **_kwargs): pass
+        async def export(self, _kind, progress=None):
+            if progress:
+                assert await progress({'status':'PROCESSING','total_chunks':1,'chunks_available_count':1}, {1})
+            yield [{'asset':{'uuid':'sync-asset','hostname':['sync-host']}, 'plugin':{'id':55,'name':'Sync test'},
+                    'port':{'port':443,'protocol':'tcp'}, 'severity':'High', 'finding_id':'sync-1'}]
+            raise TenableError('simulated export failure')
+        async def close(self): pass
+
+    monkeypatch.setattr(tenable_api, 'SessionLocal', Local)
+    monkeypatch.setattr(tenable_api, 'TenableClient', FailingClient)
+    asyncio.run(tenable_api.run_sync(job_id, 1))
+    with Local() as db:
+        assert db.query(Finding).count() == 0
+        assert db.get(SyncJob, job_id).status == 'Failed'
+    engine.dispose()

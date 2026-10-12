@@ -227,7 +227,44 @@ class AssetUpdate(Strict):
     asset_group: str | None = Field(default=None, max_length=200)
     asset_type: str | None = Field(default=None, max_length=100)
 
+class ClassificationChangeRequestInput(Strict):
+    changes: AssetUpdate
+    expected_context_version: int = Field(ge=1)
+    justification: str = Field(min_length=1, max_length=5000)
+    evidence: str = Field(default='', max_length=10000)
+
+    @model_validator(mode='after')
+    def has_protected_change(self):
+        governed = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure', 'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+        if not (set(self.changes.model_dump(exclude_none=True)) & governed):
+            raise ValueError('At least one governed asset field is required')
+        return self
+
+class ClassificationChangeDecision(Strict):
+    status: Literal['Approved', 'Rejected']
+    justification: str = Field(min_length=1, max_length=5000)
+
+
+class ClassificationMissionDraft(Strict):
+    questionnaire_version: str = Field(default='1.0-provisional', min_length=1, max_length=50)
+    current_step: int = Field(default=1, ge=1, le=5)
+    responses: dict[str, Any] = Field(default_factory=dict, max_length=50)
+
+
+class ClassificationEvidenceInput(Strict):
+    evidence_type: Literal['BIA', 'CMDB', 'owner_attestation', 'data_inventory', 'GRC_scope', 'network_evidence', 'other']
+    reference: str = Field(min_length=1, max_length=10000)
+    notes: str = Field(default='', max_length=5000)
+    expires_at: datetime | None = None
+
+class ClassificationReviewerAssignment(Strict):
+    role: Literal['owner', 'grc']
+    user_id: int | None = None
+
+
 class AssetEdit(AssetUpdate):
+    # Supplied by the asset editor to reject stale protected-context writes.
+    expected_context_version: int | None = Field(default=None, ge=1)
     hostname: str | None = Field(default=None, min_length=1, max_length=255)
     ip: str | None = Field(default=None, max_length=60)
     os: str | None = Field(default=None, max_length=200)
@@ -291,6 +328,10 @@ class PluginTemplateInput(Strict):
     justification: str = Field(default='', max_length=5000)
     decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required'] = 'Needs Further Assessment'
     controls: list[Control] = Field(default_factory=list, max_length=50)
+    applicability: dict[str, Any] = Field(default_factory=dict, max_length=20)
+    technical_rationale: str = Field(default='', max_length=10000)
+    overwrite_workflow: bool = False
+    overwrite_decision: bool = False
 
 class PluginBulkAssessmentInput(Strict):
     context: Context
@@ -301,6 +342,13 @@ class PluginBulkAssessmentInput(Strict):
     justification: str = Field(min_length=1, max_length=5000)
     decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Risk Accepted'] = 'Needs Further Assessment'
     status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
+    active_only: bool = True
+    dry_run: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=120)
+    questionnaire_version: str = Field(default='1.0-provisional', max_length=50)
+    answers: dict[str, Any] = Field(default_factory=dict, max_length=40)
+    scenario_evidence: list[str] = Field(default_factory=list, max_length=20)
+    scenario_notes: str = Field(default='', max_length=10000)
 
     @model_validator(mode='after')
     def unique_controls(self):
@@ -313,6 +361,35 @@ class WorkflowInput(Strict):
     status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed']
     remediation_due_at: datetime | None = None
     remediation_evidence: str | None = Field(default=None, max_length=10000)
+
+class RemediationPackageInput(Strict):
+    name: str = Field(min_length=1, max_length=200)
+    remediation_action: str = Field(min_length=1, max_length=10000)
+    owner_id: int | None = None
+    jira_reference: str | None = Field(default=None, max_length=300)
+    due_date: date | None = None
+    blockers: list[str] = Field(default_factory=list, max_length=50)
+    finding_ids: list[int] = Field(default_factory=list, max_length=5000)
+
+class RemediationPackageUpdate(Strict):
+    status: Literal['Open', 'In Progress', 'Blocked', 'Pending Verification', 'Verified Closed', 'Reopened'] | None = None
+    owner_id: int | None = None
+    jira_reference: str | None = Field(default=None, max_length=300)
+    due_date: date | None = None
+    blockers: list[str] | None = Field(default=None, max_length=50)
+
+class RemediationEvidenceInput(Strict):
+    evidence_type: Literal['rescan', 'test_result', 'change_record', 'other']
+    reference: str = Field(min_length=1, max_length=10000)
+
+class RemediationSLAPolicyInput(Strict):
+    name: str = Field(min_length=1, max_length=160)
+    regulatory_scope: Literal['PCI DSS', 'SOC 2', 'Non-PCI']
+    severity: Literal['Critical', 'High', 'Medium', 'Low']
+    days: int | None = Field(default=None, ge=1, le=3650)
+    effective_from: date
+    effective_to: date | None = None
+    approved: bool = False
 
 class ExceptionInput(Strict):
     justification: str = Field(min_length=10, max_length=5000)
@@ -333,6 +410,9 @@ class ControlLibraryInput(Strict):
     operating_effectiveness: int | None = Field(default=None, ge=1, le=5)
     last_tested_at: datetime | None = None
     active: bool = True
+    validator_id: int | None = None
+    expires_at: datetime | None = None
+    recertification_days: int = Field(default=365, ge=1, le=3650)
 
 class RuleControl(Control):
     validated: bool = False

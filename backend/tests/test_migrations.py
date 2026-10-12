@@ -24,7 +24,7 @@ def preservation_check(engine):
         assert 'reviewed_at' not in {column['name'] for column in inspect(connection).get_columns('finding_workflows')}
         existing_tables = set(inspect(connection).get_table_names())
         connection.execute(text("INSERT INTO users (id,username,password_hash,role,active) VALUES (910001,'migration-check','test-only','Administrator',true)"))
-        connection.execute(text("INSERT INTO assets (id,hostname,workspace,tags,context) VALUES (910001,'preserved-host','Production','[]','{\"business_owner\":\"Preserved owner\"}')"))
+        connection.execute(text("INSERT INTO assets (id,hostname,workspace,tags,context) VALUES (910001,'preserved-host','Production','[]','{\"business_owner\":\"Preserved owner\",\"regulatory\":[\"PCI DSS\"]}')"))
         connection.execute(text("INSERT INTO vulnerabilities (id,identity,name,cves,technical) VALUES (910001,'migration-check','Preserved vulnerability','[]','{}')"))
         connection.execute(text("INSERT INTO vulnerability_instances (id,asset_id,vulnerability_id,port,protocol,source,source_record,observed,revision,workspace) VALUES (910001,910001,910001,443,'tcp','Manual','{}','{}',5,'Production')"))
         connection.execute(text("INSERT INTO finding_workflows (finding_id,owner_id,status,updated_by,updated_at) VALUES (910001,910001,'Remediation Planned',910001,CURRENT_TIMESTAMP)"))
@@ -38,8 +38,10 @@ def preservation_check(engine):
         for table, rows in before.items():
             after = [dict(row) for row in connection.execute(text(f'SELECT * FROM {table}')).mappings()]
             assert [{k: row[k] for k in rows[0]} for row in after] == rows
-        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0006'
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0019'
         assert 'review_campaigns' in inspect(connection).get_table_names()
+        assert connection.scalar(text("SELECT scope FROM asset_regulatory_scopes WHERE asset_id = 910001 AND active IS TRUE")) == 'PCI DSS'
+        assert connection.scalar(text("SELECT source_system FROM asset_regulatory_scopes WHERE asset_id = 910001 AND scope = 'PCI DSS'")) == 'legacy'
         assert 'reviewed_at' in {column['name'] for column in inspect(connection).get_columns('finding_workflows')}
 
 def test_additive_migration_preserves_pre_feature_data(tmp_path):
@@ -74,6 +76,6 @@ def test_concurrent_startup_and_restart_do_not_duplicate_seed(tmp_path):
         with engine.connect() as connection:
             assert connection.scalar(text('SELECT COUNT(*) FROM users')) == 1
             assert connection.scalar(text('SELECT COUNT(*) FROM vulnerability_instances')) == 20
-            assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0006'
+            assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0019'
     finally:
         engine.dispose()

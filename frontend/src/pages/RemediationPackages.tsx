@@ -1,0 +1,10 @@
+import { useEffect, useState } from 'react'
+import { Plus, RefreshCw } from 'lucide-react'
+import { api } from '../api'
+import { Badge, ErrorBox, PageTitle } from '../components/UI'
+export default function RemediationPackages() {
+  const [rows,setRows]=useState<any[]>([]),[error,setError]=useState(''),[name,setName]=useState(''),[action,setAction]=useState(''),[busy,setBusy]=useState(false)
+  const load=()=>api<any[]>('/remediation-packages').then(setRows).catch(e=>setError(e.message)); useEffect(()=>{load()},[])
+  async function create(){if(!name.trim()||!action.trim())return;setBusy(true);try{await api('/remediation-packages',{method:'POST',body:JSON.stringify({name,remediation_action:action,finding_ids:[]})});setName('');setAction('');await load()}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
+  return <><PageTitle title="Remediation work packages" description="Group related findings while preserving individual assessment history." actions={<button onClick={load}><RefreshCw size={16}/> Refresh</button>}/><ErrorBox error={error}/><section className="panel form-grid"><label>Package name<input value={name} onChange={e=>setName(e.target.value)} placeholder="Windows security updates"/></label><label>Shared remediation action<input value={action} onChange={e=>setAction(e.target.value)} placeholder="Apply vendor-supported patch and rescan"/></label><button className="primary" disabled={busy} onClick={create}><Plus size={16}/> Create package</button></section><section className="panel table-panel"><div className="section-head"><h2>Packages</h2><Badge>{rows.length}</Badge></div><div className="table-scroll"><table><thead><tr><th>Package</th><th>Findings</th><th>Owner</th><th>Due</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{rows.map(row=><tr key={row.id}><td><strong>{row.name}</strong><small>{row.remediation_action}</small></td><td>{row.finding_ids.length}</td><td>{row.owner_id||'Unassigned'}</td><td>{row.due_date||'—'}</td><td><Badge>{row.status}</Badge></td><td>{row.evidence.filter((e:any)=>e.verified).length} verified</td></tr>)}</tbody></table></div></section></>
+}

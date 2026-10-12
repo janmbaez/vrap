@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -45,6 +45,16 @@ async def security_headers(request: Request, call_next):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Referrer-Policy'] = 'no-referrer'
     response.headers['Cache-Control'] = 'no-store'
+    # The API only returns data, never executable page content. Keep its
+    # browser policy deliberately restrictive even when the SPA is hosted by a
+    # separate reverse proxy.
+    response.headers['Content-Security-Policy'] = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    response.headers['Cross-Origin-Resource-Policy'] = 'same-site'
+    response.headers['Permissions-Policy'] = 'camera=(), geolocation=(), microphone=()'
+    response.headers['X-Permitted-Cross-Domain-Policies'] = 'none'
+    if request.url.scheme == 'https':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
 
 @app.exception_handler(IntegrityError)
@@ -57,4 +67,15 @@ async def safe_error(request, exc):
 
 @app.get('/api/health')
 def health():
+    """Liveness only: the process can answer HTTP."""
     return {'status': 'ok'}
+
+@app.get('/api/health/ready')
+def readiness():
+    """Readiness: database access is available before a proxy sends traffic."""
+    try:
+        with SessionLocal() as db:
+            db.execute(select(1))
+    except OperationalError:
+        raise HTTPException(503, 'Database is not ready')
+    return {'status': 'ready'}

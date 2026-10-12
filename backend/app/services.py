@@ -1,10 +1,12 @@
 import hashlib
+import json
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy import delete, select, update
 from .models import (Asset, Vulnerability, Finding, Methodology, Assessment,
                      AssessmentControl, RiskScore, FindingWorkflow, RiskException,
                      ImportRow, CampaignFinding, CampaignEvidence)
+from .regulatory import add_scope_memberships, normalize_scopes
 from .risk.engine import calculate
 from .asset_rules import resolve_rules, ASSET_CONTEXT_KEYS
 
@@ -17,6 +19,22 @@ def active_methodology(db):
 
 def identity(data):
     return ('plugin:' + data.plugin_id) if data.plugin_id else 'manual:' + hashlib.sha256((data.name.casefold() + '|' + ','.join(sorted(data.cves))).encode()).hexdigest()
+
+
+def evidence_fingerprint(technical):
+    """Hash only risk-relevant scanner evidence, excluding scan freshness/lifecycle."""
+    evidence = {key: value for key, value in technical.items() if key not in {'last_seen', 'state'}}
+    payload = json.dumps(evidence, sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _lifecycle_state(value):
+    state = str(value or '').strip().casefold()
+    if state in {'closed', 'fixed', 'resolved'}:
+        return 'closed'
+    if state in {'active', 'open', 'new', 'reopened'}:
+        return 'active'
+    return None
 
 def ingest(db, data, source='Manual', original=None, update_existing=False, workspace='Production', actor_id=None, cache=None):
     """Persist one finding, optionally reusing identities already seen in this batch."""
@@ -31,14 +49,31 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
     if not asset:
         rule_context, default_controls, applied_rules = resolve_rules(db, data.hostname, data.ip, data.asset_tags)
         supplied = {k: v for k, v in data.context.model_dump().items() if v not in (None, '', [])}
+        context = {**rule_context, **supplied, 'applied_rules': applied_rules}
+        provenance = {key: {'source_system': 'import' if key in supplied else 'asset_rule', 'approval_state': 'Provisional'}
+                      for key in context if key != 'applied_rules'}
         asset = Asset(hostname=data.hostname.lower(), external_id=data.external_id, ip=data.ip, os=data.os, tags=data.asset_tags,
-                      context={**rule_context, **supplied, 'applied_rules': applied_rules}, workspace=workspace)
+                      context=context, context_provenance=provenance, workspace=workspace)
         db.add(asset)
         db.flush()
+        scopes = normalize_scopes(context.get('regulatory', []))
+        if scopes:
+            scope_source = 'import' if 'regulatory' in supplied else 'asset_rule'
+            add_scope_memberships(db, asset, scopes, source_system=scope_source, approval_state='Provisional')
+            asset.context = {**asset.context, 'regulatory': scopes}
     else:
         rule_context, default_controls, applied_rules = resolve_rules(db, asset.hostname, data.ip or asset.ip, data.asset_tags or asset.tags)
         if applied_rules:
-            asset.context = {**asset.context, **rule_context, 'applied_rules': applied_rules}
+            # Existing asset context wins. Rules only classify previously unknown fields.
+            additions = {key: value for key, value in rule_context.items() if (asset.context or {}).get(key) in (None, '', [])}
+            if additions:
+                asset.context = {**asset.context, **additions, 'applied_rules': applied_rules}
+                provenance = dict(asset.context_provenance or {})
+                provenance.update({key: {'source_system': 'asset_rule', 'approval_state': 'Provisional'} for key in additions})
+                asset.context_provenance = provenance
+                asset.context_version += 1
+            else:
+                asset.context = {**asset.context, 'applied_rules': applied_rules}
     assets[asset_key] = asset
     tech = data.model_dump(mode='json', exclude={'hostname', 'ip', 'os', 'external_id', 'context', 'name', 'cves', 'plugin_id', 'asset_tags', 'port', 'protocol'})
     vulnerability_identity = identity(data)
@@ -61,29 +96,38 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
                 break
     if not finding:
         finding = db.scalar(select(Finding).where(Finding.asset_id == asset.id, Finding.vulnerability_id == vuln.id, Finding.port == data.port, Finding.protocol == data.protocol))
+    observed = {**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
+                'default_controls': default_controls, 'applied_rules': applied_rules}
+    fingerprint = evidence_fingerprint(tech)
     if finding:
         if update_existing:
-            finding.observed = {**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
-                                'default_controls': default_controls, 'applied_rules': applied_rules}
+            previous_fingerprint = finding.evidence_fingerprint or evidence_fingerprint(dict(finding.observed or {}))
+            # Source freshness is always updated, while only material risk evidence
+            # invalidates an assessment by advancing the finding revision.
+            finding.observed = observed
             finding.source_record = original or data.model_dump(mode='json')
-            finding.revision += 1
+            finding.source_last_seen = data.last_seen or finding.source_last_seen
+            if previous_fingerprint != fingerprint:
+                finding.evidence_fingerprint = fingerprint
+                finding.revision += 1
             if source == 'Tenable' and actor_id is not None:
-                lifecycle = str(data.state or '').strip().casefold()
-                closed = lifecycle in {'closed', 'fixed', 'resolved'}
+                lifecycle = _lifecycle_state(data.state)
                 workflow = db.get(FindingWorkflow, finding.id)
-                if closed:
+                if lifecycle == 'closed' and (not workflow or workflow.status != 'Closed'):
                     if not workflow:
                         workflow = FindingWorkflow(finding_id=finding.id, status='Closed', updated_by=actor_id)
                         db.add(workflow)
                     else:
                         workflow.status, workflow.updated_by = 'Closed', actor_id
-                elif workflow and workflow.status == 'Closed':
+                    finding.lifecycle_revision += 1
+                elif lifecycle == 'active' and workflow and workflow.status == 'Closed':
                     workflow.status, workflow.updated_by = 'New', actor_id
+                    finding.lifecycle_revision += 1
         findings[finding_key] = finding
         return finding, False
     finding = Finding(asset_id=asset.id, vulnerability_id=vuln.id, source=source, port=data.port, protocol=data.protocol, workspace=workspace,
-                      source_record=original or data.model_dump(mode='json'), observed={**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
-                      'default_controls': default_controls, 'applied_rules': applied_rules})
+                      source_record=original or data.model_dump(mode='json'), observed=observed, source_last_seen=data.last_seen,
+                      evidence_fingerprint=fingerprint)
     db.add(finding)
     db.flush()
     findings[finding_key] = finding

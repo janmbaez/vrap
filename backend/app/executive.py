@@ -7,9 +7,9 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import and_, case, func, select, Text
 from fastapi import HTTPException
 from .models import Asset, Assessment, Finding, FindingWorkflow, Methodology, RiskException, RiskScore, Vulnerability
+from .assessment_state import current_assessment_columns, latest_assessment_revision, stale_assessment_columns
 
 SEVERITIES = ('Critical', 'High', 'Medium', 'Low', 'Informational', 'Unknown')
-COMPLETED_ASSESSMENTS = ('Assessed', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed')
 ATTENTION_THRESHOLDS = {'review_coverage': 80, 'owner_min_population': 5, 'group_min_population': 5,
                         'skipped_share': 10, 'coverage_drop_points': 10}
 
@@ -33,7 +33,7 @@ def reporting_period(filters, today=None):
 
 
 def _live_query(db, workspace, filters):
-    latest = select(Assessment.instance_id, func.max(Assessment.revision).label('revision')).group_by(Assessment.instance_id).subquery()
+    latest = latest_assessment_revision()
     query = (select(Finding.id.label('finding_id'), Finding.asset_id, Finding.revision,
                     Vulnerability.name, Vulnerability.plugin_id,
                     func.coalesce(Finding.observed['severity'].as_string(), Vulnerability.technical['severity'].as_string(), 'Unknown').label('severity'),
@@ -41,7 +41,7 @@ def _live_query(db, workspace, filters):
                     Assessment.status.label('assessment_status'), RiskScore.result,
                     func.coalesce(FindingWorkflow.review_state, case((FindingWorkflow.status == 'Reviewed', 'Reviewed'), else_='Pending')).label('review_state'))
              .select_from(Finding).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
-             .outerjoin(latest, latest.c.instance_id == Finding.id)
+             .outerjoin(latest, latest.c.finding_id == Finding.id)
              .outerjoin(Assessment, and_(Assessment.instance_id == Finding.id, Assessment.revision == latest.c.revision))
              .outerjoin(RiskScore, RiskScore.assessment_id == Assessment.id)
              .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
@@ -64,10 +64,10 @@ def live_exposure(db, workspace, filters, generated):
     method = db.scalar(select(Methodology).order_by(Methodology.id.desc()))
     base = _live_query(db, workspace, filters).subquery()
     # JSON risk values are projected once; aggregates remain portable on SQLite/Postgres.
-    valid = and_(base.c.assessment_status.in_(COMPLETED_ASSESSMENTS), base.c.assessment_revision == base.c.revision,
-                 base.c.methodology_id == (method.id if method else -1), base.c.result.is_not(None))
-    stale = and_(base.c.assessment_id.is_not(None),
-                 (base.c.assessment_revision != base.c.revision) | (base.c.methodology_id != (method.id if method else -1)))
+    valid = current_assessment_columns(base.c.assessment_status, base.c.assessment_revision, base.c.revision,
+                                       base.c.methodology_id, method.id if method else -1, base.c.result)
+    stale = stale_assessment_columns(base.c.assessment_id, base.c.assessment_revision, base.c.revision,
+                                     base.c.methodology_id, method.id if method else -1)
     reviewed = base.c.review_state == 'Reviewed'
     count = lambda condition: func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
     result = db.execute(select(func.count().label('total'), func.count(func.distinct(base.c.asset_id)).label('assets'),

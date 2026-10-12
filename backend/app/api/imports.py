@@ -11,9 +11,9 @@ from ..imports.parser import parse_file, normalize, MAX_BYTES, FIELDS
 
 router = APIRouter(prefix='/imports', tags=['Imports'])
 
-def batch_for(db, id, user):
+def batch_for(db, id, user, workspace):
     batch = db.get(ImportBatch, id)
-    if not batch:
+    if not batch or batch.workspace != workspace:
         raise HTTPException(404, 'Import not found')
     if batch.owner_id != user.id and user.role != 'Administrator':
         raise HTTPException(403, 'This import belongs to another analyst')
@@ -74,7 +74,7 @@ def validate_rows(db, batch, mapping):
         try:
             data = normalize(row.original, mapping)
             key = (data.hostname.lower(), identity(data), data.port, data.protocol)
-            exists = db.scalar(select(Finding.id).join(Asset).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Asset.hostname == key[0], Vulnerability.identity == key[1], Finding.port == key[2], Finding.protocol == key[3]))
+            exists = db.scalar(select(Finding.id).join(Asset).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Asset.workspace == batch.workspace, Finding.workspace == batch.workspace, Asset.hostname == key[0], Vulnerability.identity == key[1], Finding.port == key[2], Finding.protocol == key[3]))
             if key in seen or exists:
                 duplicates += 1
                 row.errors = ['Duplicate finding; skipped']
@@ -90,8 +90,8 @@ def validate_rows(db, batch, mapping):
     return valid, errors, counts
 
 @router.post('/{id}/validate')
-def validate(id: int, data: MappingInput, user=Depends(writer), db=Depends(get_db)):
-    batch = batch_for(db, id, user)
+def validate(id: int, data: MappingInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    batch = batch_for(db, id, user, request.state.session.workspace)
     _, errors, counts = validate_rows(db, batch, data.mapping)
     batch.mapping, batch.counts, batch.status = data.mapping, counts, 'Validated'
     db.commit()
@@ -99,7 +99,7 @@ def validate(id: int, data: MappingInput, user=Depends(writer), db=Depends(get_d
 
 @router.post('/{id}/commit')
 def commit(id: int, data: MappingInput, request: Request, user=Depends(writer), db=Depends(get_db)):
-    batch = batch_for(db, id, user)
+    batch = batch_for(db, id, user, request.state.session.workspace)
     if batch.status != 'Validated' or batch.mapping != data.mapping:
         raise HTTPException(409, 'Validate this mapping before importing')
     claimed = db.execute(update(ImportBatch).where(ImportBatch.id == id, ImportBatch.status == 'Validated').values(status='Importing'))
@@ -146,7 +146,7 @@ def run_import_job(id: int, actor_id: int, workspace: str):
 
 @router.post('/{id}/queue', status_code=202)
 def queue_import(id: int, data: MappingInput, request: Request, tasks: BackgroundTasks, user=Depends(writer), db=Depends(get_db)):
-    batch = batch_for(db, id, user)
+    batch = batch_for(db, id, user, request.state.session.workspace)
     if batch.status not in ('Validated', 'Failed', 'Cancelled') or batch.mapping != data.mapping:
         raise HTTPException(409, 'Validate this mapping before queueing the import')
     batch.status = 'Queued'; batch.counts = {**batch.counts, 'processed': 0}; db.commit()
@@ -154,18 +154,18 @@ def queue_import(id: int, data: MappingInput, request: Request, tasks: Backgroun
     return {'id': id, 'status': 'Queued', 'message': 'Import queued. You can leave this page and monitor its progress.'}
 
 @router.post('/{id}/cancel')
-def cancel_import(id: int, user=Depends(writer), db=Depends(get_db)):
+def cancel_import(id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
     batch = db.get(ImportBatch, id)
-    if not batch or (batch.owner_id != user.id and user.role != 'Administrator'): raise HTTPException(404, 'Import not found')
+    if not batch or batch.workspace != request.state.session.workspace or (batch.owner_id != user.id and user.role != 'Administrator'): raise HTTPException(404, 'Import not found')
     if batch.status not in ('Queued', 'Importing'): raise HTTPException(409, 'Only queued or running imports can be cancelled')
     batch.status = 'Cancelling' if batch.status == 'Importing' else 'Cancelled'; db.commit()
     return {'id': id, 'status': batch.status}
 
 
 @router.patch('/{id}')
-def edit_import(id: int, payload: dict, user=Depends(writer), db=Depends(get_db)):
+def edit_import(id: int, payload: dict, request: Request, user=Depends(writer), db=Depends(get_db)):
     batch = db.get(ImportBatch, id)
-    if not batch or (batch.owner_id != user.id and user.role != 'Administrator'):
+    if not batch or batch.workspace != request.state.session.workspace or (batch.owner_id != user.id and user.role != 'Administrator'):
         raise HTTPException(404, 'Import not found')
     if batch.status in ('Queued', 'Importing'):
         raise HTTPException(409, 'Stop the import before editing it')
@@ -184,9 +184,9 @@ def edit_import(id: int, payload: dict, user=Depends(writer), db=Depends(get_db)
     return {'id': batch.id, 'filename': batch.filename, 'mapping': batch.mapping, 'status': batch.status}
 
 @router.delete('/{id}', status_code=204)
-def delete_import(id: int, user=Depends(writer), db=Depends(get_db)):
+def delete_import(id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
     batch = db.get(ImportBatch, id)
-    if not batch or (batch.owner_id != user.id and user.role != 'Administrator'):
+    if not batch or batch.workspace != request.state.session.workspace or (batch.owner_id != user.id and user.role != 'Administrator'):
         raise HTTPException(404, 'Import not found')
     if batch.status in ('Queued', 'Importing', 'Cancelling'):
         raise HTTPException(409, 'Cancel the running import before deleting it')
@@ -199,7 +199,7 @@ def delete_import(id: int, user=Depends(writer), db=Depends(get_db)):
 @router.post('/{id}/retry', status_code=202)
 def retry_import(id: int, request: Request, tasks: BackgroundTasks, user=Depends(writer), db=Depends(get_db)):
     batch = db.get(ImportBatch, id)
-    if not batch or (batch.owner_id != user.id and user.role != 'Administrator'): raise HTTPException(404, 'Import not found')
+    if not batch or batch.workspace != request.state.session.workspace or (batch.owner_id != user.id and user.role != 'Administrator'): raise HTTPException(404, 'Import not found')
     if batch.status not in ('Failed', 'Cancelled', 'Importing'):
         raise HTTPException(409, 'Only failed, cancelled, or interrupted imports can be retried')
     if not batch.mapping: raise HTTPException(409, 'Validate the mapping before retrying')

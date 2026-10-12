@@ -58,6 +58,8 @@ def calculate(technical: dict, context: dict, controls: list, policy: dict, as_o
             reason = 'Not validated'
         elif not control.get('evidence', '').strip():
             reason = 'Evidence required'
+        elif control.get('expires_at') and str(control.get('expires_at'))[:10] < as_of.isoformat():
+            reason = 'Control evidence expired'
         elif not control.get('applicable'):
             reason = 'Applicability not confirmed'
         elif rule.get('requires') and context.get(rule['requires']) is not True:

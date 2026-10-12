@@ -9,6 +9,7 @@ from .models import (ReviewCampaign, CampaignReviewer, CampaignFinding, Campaign
                      CampaignEvidence, CampaignAuditEvent, User, Finding, FindingWorkflow,
                      Asset, Vulnerability, Assessment, RiskScore, Methodology, Audit, now)
 from .query import finding_query, normalize_tags, json_list_has
+from .assessment_state import current_assessment_condition, latest_assessment_revision
 
 MAX_SNAPSHOT = 100000
 MAX_BULK = 10000
@@ -144,10 +145,9 @@ def activate(db,campaign,user):
     total=db.scalar(select(func.count()).select_from(population.subquery())) or 0
     if not total: raise HTTPException(422,'The scope must match at least one finding')
     if total>MAX_SNAPSHOT: raise HTTPException(422,f'Campaign populations cannot exceed {MAX_SNAPSHOT} findings')
-    latest=select(Assessment.instance_id,func.max(Assessment.id).label('id')).group_by(Assessment.instance_id).subquery()
+    latest=latest_assessment_revision()
     method_id=db.scalar(select(Methodology.id).order_by(Methodology.id.desc()).limit(1))
-    valid_score=(Assessment.status.in_(['Assessed','Above Risk Appetite','Exception Requested','Risk Accepted','Remediation Required','Closed']) & (Assessment.revision==Finding.revision)
-                 & (Assessment.methodology_id==method_id))
+    valid_score=current_assessment_condition(Assessment, Finding, method_id, RiskScore)
     query=(population.with_only_columns(Finding.id.label('finding_id'),Asset.id.label('asset_id'),Asset.hostname,
            Asset.context,Asset.tags,Vulnerability.name,Vulnerability.plugin_id,
            func.coalesce(Finding.observed['severity'].as_string(),Vulnerability.technical['severity'].as_string(),'Unknown').label('severity'))
@@ -155,8 +155,8 @@ def activate(db,campaign,user):
     # Populate from compact joined records; existing scope risk filters may already join Assessment.
     records=(select(query,case((valid_score,RiskScore.result['residual'].as_float()),else_=None).label('risk'),
            case((valid_score,RiskScore.result['residual_level'].as_string()),else_=None).label('risk_level'))
-           .join(Finding,Finding.id==query.c.finding_id).outerjoin(latest,latest.c.instance_id==Finding.id)
-           .outerjoin(Assessment,Assessment.id==latest.c.id).outerjoin(RiskScore,RiskScore.assessment_id==Assessment.id))
+           .join(Finding,Finding.id==query.c.finding_id).outerjoin(latest,latest.c.finding_id==Finding.id)
+           .outerjoin(Assessment,(Assessment.instance_id==latest.c.finding_id) & (Assessment.revision==latest.c.revision)).outerjoin(RiskScore,RiskScore.assessment_id==Assessment.id))
     pending=[]
     def save_batch(batch):
         returned=db.execute(insert(CampaignFinding).returning(CampaignFinding.id,CampaignFinding.finding_id),batch).all()

@@ -6,14 +6,61 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput
-from ..asset_rules import ASSET_CONTEXT_KEYS, resolve_rules, resolve_rule_list
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
+from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
+from ..assessment_state import assessment_currency, latest_assessment_revision
+from ..regulatory import active_scopes, add_scope_memberships, normalize_scopes
+from ..classification_questionnaire import QUESTIONNAIRE
 
 router = APIRouter(tags=['Workbench'])
 
+def _question_contract():
+    return {question['id']: question for step in QUESTIONNAIRE['steps'] for question in step['questions']}
+
+def _validate_mission_responses(data: ClassificationMissionDraft):
+    if data.questionnaire_version not in {QUESTIONNAIRE['version'], '1.0-provisional'}:
+        raise HTTPException(409, 'Questionnaire version is no longer supported; start a new mission with the current version.')
+    contract = _question_contract()
+    # Drafts created before the versioned question contract used a small set of
+    # opaque keys. Keep accepting those historical drafts so they remain
+    # resumable, while validating every new stable question ID strictly.
+    legacy_keys = {'identity_owner', 'data_scope', 'classification'}
+    unknown = set(data.responses) - set(contract) - legacy_keys
+    if unknown:
+        raise HTTPException(422, f'Unknown questionnaire response: {sorted(unknown)[0]}')
+    for question_id, value in data.responses.items():
+        if question_id in legacy_keys:
+            continue
+        question = contract[question_id]
+        if value in (None, ''):
+            continue
+        if question['type'] == 'choice' and value not in question.get('values', []):
+            raise HTTPException(422, f'Invalid value for {question_id}')
+        if question['type'] == 'multi':
+            if not isinstance(value, list) or any(item not in question.get('values', []) for item in value):
+                raise HTTPException(422, f'Invalid values for {question_id}')
+        if question['type'] == 'text' and (not isinstance(value, str) or len(value) > 200):
+            raise HTTPException(422, f'Invalid value for {question_id}')
+    for question_id, question in contract.items():
+        condition = question.get('when')
+        if not condition:
+            continue
+        actual = data.responses.get(condition['question'])
+        active = actual in condition.get('in', [])
+        if active and question.get('required') and data.current_step >= 5 and not data.responses.get(question_id):
+            raise HTTPException(422, f'Response required for {question_id}')
+        if not active and data.responses.get(question_id):
+            raise HTTPException(422, f'{question_id} is not applicable for the selected context')
+
+def _mission_history(db, mission, actor_id, action):
+    db.add(AssetClassificationMissionHistory(
+        mission_id=mission.id, asset_id=mission.asset_id, workspace=mission.workspace,
+        action=action, status=mission.status, current_step=mission.current_step,
+        responses=mission.responses or {}, actor_id=actor_id,
+    ))
 @router.get('/saved-filters')
 def saved_filters(request: Request, user=Depends(require_user), db=Depends(get_db)):
     rows = db.scalars(select(SavedFilter).where(SavedFilter.workspace == request.state.session.workspace,
@@ -90,7 +137,9 @@ def assessment_groups(request: Request, q: str = '', severity: str = '', limit: 
 @router.get('/assessment-groups/{vulnerability_id}')
 def assessment_group(vulnerability_id: int, request: Request, limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     vulnerability = db.get(Vulnerability, vulnerability_id)
-    if not vulnerability: raise HTTPException(404, 'Plugin group not found')
+    exists = db.scalar(select(Finding.id).where(Finding.workspace == request.state.session.workspace,
+                                                  Finding.vulnerability_id == vulnerability_id).limit(1))
+    if not vulnerability or not exists: raise HTTPException(404, 'Plugin group not found')
     base = (select(Finding).join(Asset).where(Finding.workspace == request.state.session.workspace,
                                                 Finding.vulnerability_id == vulnerability_id).order_by(Asset.hostname, Finding.id))
     total = db.scalar(select(func.count()).select_from(base.order_by(None).subquery())) or 0
@@ -105,6 +154,9 @@ def update_group_assets(vulnerability_id: int, data: AssetUpdate, request: Reque
     workspace = request.state.session.workspace
     changes = data.model_dump(exclude_none=True)
     if not changes: raise HTTPException(422, 'Select at least one asset context value')
+    protected = sorted(set(changes) & PROTECTED_CONTEXT_FIELDS)
+    if protected:
+        raise HTTPException(422, 'Shared plugin assessment cannot change asset classification fields: ' + ', '.join(protected))
     asset_ids = db.scalars(select(Finding.asset_id).where(Finding.workspace == workspace,
                                                           Finding.vulnerability_id == vulnerability_id).distinct()).all()
     if not asset_ids: raise HTTPException(404, 'Plugin group not found')
@@ -198,7 +250,7 @@ def history(id: int, request: Request, user=Depends(require_user), db=Depends(ge
 
 def _asset_output(asset):
     return {'id': asset.id, 'hostname': asset.hostname, 'external_id': asset.external_id, 'ip': asset.ip,
-            'os': asset.os, 'tags': asset.tags, 'context': asset.context}
+            'os': asset.os, 'tags': asset.tags, 'context': asset.context, 'context_version': asset.context_version, 'context_provenance': asset.context_provenance}
 
 @router.get('/assets')
 def assets(request: Request, q: str = '', asset_criticality: str = '', business_criticality: str = '', environment: str = '', asset_type: str = '', owner: str = '', tag: str = '', regulatory: str = '', data_classification: str = '', limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
@@ -234,9 +286,15 @@ def create_asset(data: AssetCreate, request: Request, user=Depends(writer), db=D
     if data.external_id and db.scalar(select(Asset.id).where(Asset.workspace == workspace, Asset.external_id == data.external_id)):
         raise HTTPException(409, 'An asset with this external ID already exists in this environment')
     fields = data.model_dump(exclude_none=True)
+    fields.pop('expected_context_version', None)
     context = {key: fields.pop(key) for key in list(fields) if key in {'asset_criticality','business_criticality','data_classification','regulatory','environment','exposure','business_owner','it_owner','application_owner','asset_group','asset_type'}}
-    asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context, **fields)
+    asset = Asset(hostname=fields.pop('hostname').lower(), workspace=workspace, tags=list(dict.fromkeys(fields.pop('tags', [])))[:100], context=context,
+                  context_provenance={key: {'source_system': 'manual', 'approval_state': 'Pending verification'} for key in context}, **fields)
     db.add(asset); db.flush()
+    scopes = normalize_scopes(context.get('regulatory', []))
+    if scopes:
+        add_scope_memberships(db, asset, scopes, source_system='asset_management')
+        asset.context = {**asset.context, 'regulatory': scopes}
     db.add(Audit(actor_id=user.id, action='asset.created', entity='asset', entity_id=asset.id, details={'hostname':asset.hostname, 'workspace':workspace}))
     db.commit(); db.refresh(asset)
     return _asset_output(asset)
@@ -247,6 +305,24 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
     if not asset or asset.workspace != request.state.session.workspace: raise HTTPException(404, 'Asset not found')
     before = _asset_output(asset)
     changes = data.model_dump(exclude_none=True)
+    expected_context_version = changes.pop('expected_context_version', None)
+    requested_regulatory = changes.get('regulatory')
+    existing_regulatory = active_scopes(db, asset)
+    if requested_regulatory is not None:
+        requested_set = set(normalize_scopes(requested_regulatory))
+        removed_scopes = existing_regulatory - requested_set
+        if removed_scopes:
+            raise HTTPException(409, 'Regulatory scope removal requires a governed classification change request.')
+        additions = requested_set - existing_regulatory
+        if additions:
+            add_scope_memberships(db, asset, additions, source_system='asset_management')
+        # Preserve legacy memberships in the compatibility JSON projection.
+        changes['regulatory'] = sorted(existing_regulatory | requested_set) or ['None']
+    protected = {key for key in changes if key in PROTECTED_CONTEXT_FIELDS and changes[key] != (asset.context or {}).get(key)}
+    if protected and user.role != 'Administrator':
+        raise HTTPException(403, 'Only an Administrator can change protected asset classification fields')
+    if protected and expected_context_version is not None and expected_context_version != asset.context_version:
+        raise HTTPException(409, 'Asset context changed. Reload the asset before saving classification fields.')
     if 'hostname' in changes:
         hostname = changes.pop('hostname').lower()
         duplicate = db.scalar(select(Asset.id).where(Asset.workspace == asset.workspace, Asset.hostname == hostname, Asset.id != asset.id))
@@ -261,13 +337,290 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
             setattr(asset, field, value)
     if 'tags' in changes:
         asset.tags = list(dict.fromkeys(changes.pop('tags')))[:100]
-    asset.context = {**asset.context, **changes}
+    if changes:
+        provenance = dict(asset.context_provenance or {})
+        for key in changes:
+            provenance[key] = {'source_system': 'asset_management', 'approval_state': 'Pending verification', 'updated_by': user.id}
+        asset.context = {**asset.context, **changes}
+        asset.context_provenance = provenance
+        asset.context_version += 1
     findings = db.scalars(select(Finding).where(Finding.asset_id == id, Finding.workspace == request.state.session.workspace)).all()
     for record in findings: record.revision += 1
     db.add(Audit(actor_id=user.id, action='asset.context_updated', entity='asset', entity_id=id,
                  details={'before': before, 'after': _asset_output(asset), 'findings_flagged': len(findings)}))
     db.commit()
     return {**_asset_output(asset), 'findings_flagged': len(findings)}
+
+def _classification_request_output(db, item):
+    asset = db.get(Asset, item.asset_id)
+    return {
+        'id': item.id, 'asset_id': item.asset_id, 'asset_hostname': asset.hostname if asset else None,
+        'workspace': item.workspace, 'status': item.status,
+        'expected_context_version': item.expected_context_version,
+        'before_context': item.before_context, 'proposed_context': item.proposed_context,
+        'justification': item.justification, 'evidence': item.evidence,
+        'decision_justification': item.decision_justification,
+        'requested_by': item.requested_by, 'approved_by': item.approved_by,
+        'created_at': item.created_at.isoformat(),
+        'reviewed_at': item.reviewed_at.isoformat() if item.reviewed_at else None,
+        'applied_at': item.applied_at.isoformat() if item.applied_at else None,
+    }
+
+
+@router.get('/classification-questionnaire')
+def classification_questionnaire(user=Depends(require_user)):
+    return QUESTIONNAIRE
+
+
+@router.get('/classification-change-requests')
+def classification_change_requests(request: Request, status: str = '', user=Depends(require_user), db=Depends(get_db)):
+    query = select(AssetClassificationChangeRequest).where(
+        AssetClassificationChangeRequest.workspace == request.state.session.workspace,
+    )
+    if status:
+        query = query.where(AssetClassificationChangeRequest.status == status)
+    rows = db.scalars(query.order_by(AssetClassificationChangeRequest.id.desc())).all()
+    return [_classification_request_output(db, item) for item in rows]
+
+
+def _mission_output(item):
+    return {'id': item.id, 'asset_id': item.asset_id, 'workspace': item.workspace,
+            'questionnaire_version': item.questionnaire_version, 'status': item.status,
+            'current_step': item.current_step, 'responses': item.responses,
+            'created_by': item.created_by, 'updated_by': item.updated_by,
+            'updated_at': item.updated_at.isoformat(), 'owner_reviewer_id': item.owner_reviewer_id,
+            'grc_reviewer_id': item.grc_reviewer_id}
+
+
+@router.get('/assets/{id}/classification-mission')
+def classification_mission(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    item = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    return _mission_output(item) if item else None
+
+
+@router.put('/assets/{id}/classification-mission')
+def save_classification_mission(id: int, data: ClassificationMissionDraft, request: Request, user=Depends(writer), db=Depends(get_db)):
+    _validate_mission_responses(data)
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    item = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    if item:
+        if item.status in {'Approved', 'Cancelled'}:
+            raise HTTPException(409, 'This mission is closed and cannot be edited.')
+        item.questionnaire_version = data.questionnaire_version
+        item.current_step = data.current_step
+        item.responses = data.responses
+        item.updated_by = user.id
+        item.status = 'In Progress'
+    else:
+        item = AssetClassificationMission(asset_id=id, workspace=asset.workspace,
+            questionnaire_version=data.questionnaire_version, current_step=data.current_step,
+            responses=data.responses, created_by=user.id, updated_by=user.id, status='Draft')
+        db.add(item)
+    db.flush()
+    _mission_history(db, item, user.id, 'draft_saved')
+    db.add(Audit(actor_id=user.id, action='asset.classification_mission_saved', entity='asset', entity_id=id,
+                 details={'mission_id': item.id, 'step': data.current_step, 'questionnaire_version': data.questionnaire_version}))
+    db.commit(); db.refresh(item)
+    return _mission_output(item)
+
+@router.get('/assets/{id}/classification-mission/history')
+def classification_mission_history(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    if not mission:
+        return []
+    return [{'id': row.id, 'action': row.action, 'status': row.status,
+             'current_step': row.current_step, 'responses': row.responses,
+             'actor_id': row.actor_id, 'created_at': row.created_at.isoformat()}
+            for row in db.scalars(select(AssetClassificationMissionHistory).where(
+                AssetClassificationMissionHistory.mission_id == mission.id,
+                AssetClassificationMissionHistory.workspace == asset.workspace,
+            ).order_by(AssetClassificationMissionHistory.id.desc()))]
+
+@router.put('/assets/{id}/classification-mission/reviewers')
+def assign_classification_reviewer(id: int, data: ClassificationReviewerAssignment, request: Request, user=Depends(admin), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(AssetClassificationMission.asset_id == id, AssetClassificationMission.workspace == asset.workspace))
+    if not mission:
+        raise HTTPException(404, 'Classification mission not found')
+    if data.user_id is not None:
+        reviewer = db.get(User, data.user_id)
+        if not reviewer or not reviewer.active:
+            raise HTTPException(422, 'Reviewer is not active')
+    if data.role == 'owner': mission.owner_reviewer_id = data.user_id
+    else: mission.grc_reviewer_id = data.user_id
+    _mission_history(db, mission, user.id, f'{data.role}_reviewer_assigned')
+    db.commit(); db.refresh(mission)
+    return _mission_output(mission)
+
+
+@router.get('/assets/{id}/classification-mission/evidence')
+def classification_evidence(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace))
+    if not mission:
+        return []
+    return [{'id': row.id, 'evidence_type': row.evidence_type, 'reference': row.reference,
+             'notes': row.notes, 'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+             'expired': bool(row.expires_at and row.expires_at <= datetime.now(timezone.utc)),
+             'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
+            for row in db.scalars(select(AssetClassificationEvidence).where(
+                AssetClassificationEvidence.mission_id == mission.id).order_by(AssetClassificationEvidence.id.desc()))]
+
+
+@router.post('/assets/{id}/classification-mission/evidence', status_code=201)
+def add_classification_evidence(id: int, data: ClassificationEvidenceInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace))
+    if not mission:
+        raise HTTPException(409, 'Save a classification mission draft before attaching evidence')
+    row = AssetClassificationEvidence(mission_id=mission.id, asset_id=id, workspace=asset.workspace,
+        evidence_type=data.evidence_type, reference=data.reference.strip(), notes=data.notes.strip(),
+        expires_at=data.expires_at, created_by=user.id)
+    db.add(row); db.flush()
+    db.add(Audit(actor_id=user.id, action='asset.classification_evidence_added', entity='asset', entity_id=id,
+                 details={'mission_id': mission.id, 'evidence_id': row.id, 'evidence_type': row.evidence_type}))
+    db.commit(); db.refresh(row)
+    return {'id': row.id, 'evidence_type': row.evidence_type, 'reference': row.reference, 'notes': row.notes,
+            'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+            'expired': bool(row.expires_at and row.expires_at <= datetime.now(timezone.utc)),
+            'created_by': row.created_by, 'created_at': row.created_at.isoformat()}
+
+
+@router.post('/assets/{id}/classification-change-requests', status_code=201)
+def request_classification_change(id: int, data: ClassificationChangeRequestInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    if data.expected_context_version != asset.context_version:
+        raise HTTPException(409, 'Asset context changed. Reload before requesting a classification change.')
+    proposed = data.changes.model_dump(exclude_none=True)
+    governed = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory', 'environment', 'exposure', 'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+    proposed = {key: value for key, value in proposed.items() if key in governed}
+    before = {key: (asset.context or {}).get(key) for key in proposed}
+    item = AssetClassificationChangeRequest(
+        asset_id=asset.id, workspace=asset.workspace, requested_by=user.id,
+        expected_context_version=asset.context_version, before_context=before,
+        proposed_context=proposed, justification=data.justification.strip(), evidence=data.evidence.strip(),
+    )
+    db.add(item); db.flush()
+    mission = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == asset.id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    if mission:
+        mission.status = ('Pending Owner Validation'
+                          if set(proposed) & {'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+                          else 'Pending GRC Approval')
+        mission.current_step = 5
+        mission.updated_by = user.id
+        _mission_history(db, mission, user.id, 'submitted_for_approval')
+    db.add(Audit(actor_id=user.id, action='asset.classification_change_requested', entity='asset', entity_id=asset.id,
+                 details={'request_id': item.id, 'before': before, 'proposed': proposed}))
+    db.commit(); db.refresh(item)
+    return _classification_request_output(db, item)
+
+
+@router.put('/classification-change-requests/{id}')
+def decide_classification_change(id: int, data: ClassificationChangeDecision, request: Request, user=Depends(admin), db=Depends(get_db)):
+    item = db.get(AssetClassificationChangeRequest, id)
+    if not item or item.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Classification change request not found')
+    if item.status != 'Requested':
+        raise HTTPException(409, 'Classification change request has already been decided')
+    if item.requested_by == user.id:
+        raise HTTPException(403, 'A requester cannot approve or reject their own classification change')
+    item.status = data.status
+    item.approved_by = user.id
+    item.reviewed_at = datetime.now(timezone.utc)
+    item.decision_justification = data.justification.strip()
+    asset = db.get(Asset, item.asset_id)
+    if data.status == 'Approved':
+        if not asset or asset.workspace != request.state.session.workspace:
+            raise HTTPException(404, 'Asset not found')
+        if asset.context_version != item.expected_context_version:
+            raise HTTPException(409, 'Asset context changed since this request was submitted; submit a new request.')
+        proposed = dict(item.proposed_context or {})
+        context = dict(asset.context or {})
+        if 'regulatory' in proposed:
+            current = active_scopes(db, asset)
+            # Ensure legacy projection values receive their own membership record
+            # before an approved removal is recorded.
+            add_scope_memberships(db, asset, current, source_system='legacy')
+            target = set(normalize_scopes(proposed['regulatory']))
+            for membership in db.scalars(select(AssetRegulatoryScope).where(
+                AssetRegulatoryScope.asset_id == asset.id,
+                AssetRegulatoryScope.active.is_(True),
+                AssetRegulatoryScope.scope.in_(current - target),
+            )):
+                membership.active = False
+                membership.removed_at = datetime.now(timezone.utc)
+                membership.approval_state = 'Removed by approved change'
+                membership.verified_by = user.id
+                membership.verified_at = datetime.now(timezone.utc)
+            reviewed_at = datetime.now(timezone.utc)
+            add_scope_memberships(db, asset, target - current,
+                                  source_system='classification_change_request',
+                                  source_record_id=str(item.id), approval_state='Approved',
+                                  verified_by=user.id, verified_at=reviewed_at)
+            for membership in db.scalars(select(AssetRegulatoryScope).where(
+                AssetRegulatoryScope.asset_id == asset.id,
+                AssetRegulatoryScope.active.is_(True),
+                AssetRegulatoryScope.scope.in_(target),
+            )):
+                membership.approval_state = 'Approved'
+                membership.verified_by = user.id
+                membership.verified_at = reviewed_at
+            proposed['regulatory'] = sorted(target) or ['None']
+        context.update(proposed)
+        provenance = dict(asset.context_provenance or {})
+        for key in proposed:
+            provenance[key] = {'source_system': 'classification_change_request', 'source_record_id': str(item.id),
+                               'approval_state': 'Approved', 'verified_by': user.id,
+                               'verified_at': datetime.now(timezone.utc).isoformat()}
+        asset.context = context
+        asset.context_provenance = provenance
+        asset.context_version += 1
+        for finding in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.workspace == asset.workspace)):
+            finding.revision += 1
+        item.applied_at = datetime.now(timezone.utc)
+    mission = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == item.asset_id,
+        AssetClassificationMission.workspace == item.workspace,
+    ))
+    if mission:
+        mission.status = data.status
+        mission.updated_by = user.id
+        _mission_history(db, mission, user.id, f'review_{data.status.lower()}')
+    db.add(Audit(actor_id=user.id, action='asset.classification_change_' + data.status.casefold(), entity='asset', entity_id=item.asset_id,
+                 details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification}))
+    db.commit(); db.refresh(item)
+    return _classification_request_output(db, item)
+
 
 @router.delete('/assets/{id}')
 def delete_asset(id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -304,15 +657,25 @@ def _reconcile_asset_rule_effects(db, workspace, prior_rules):
         old_context, _, _ = resolve_rule_list(prior_rules, asset.hostname, asset.ip, asset.tags)
         new_context, new_controls, new_applied = resolve_rule_list(current_rules, asset.hostname, asset.ip, asset.tags)
         context = dict(asset.context or {})
-        previous_managed = context.pop('_rule_context', old_context)
+        provenance = dict(asset.context_provenance or {})
+        stored_managed = context.pop('_rule_context', None)
+        # Older assets did not have explicit rule ownership.  Treat only values
+        # with rule provenance as disposable; keeping an ambiguous legacy value is
+        # safer than clearing a business-approved classification.
+        previous_managed = stored_managed if stored_managed is not None else {
+            key: value for key, value in old_context.items()
+            if provenance.get(key, {}).get('source_system') == 'asset_rule'
+        }
         for key, value in previous_managed.items():
             if context.get(key) == value:
                 context.pop(key, None)
+                provenance.pop(key, None)
         managed = {}
         for key, value in new_context.items():
             if key not in context:
                 context[key] = value
                 managed[key] = value
+                provenance[key] = {'source_system': 'asset_rule', 'approval_state': 'Provisional'}
         if managed:
             context['_rule_context'] = managed
         context['applied_rules'] = new_applied
@@ -332,6 +695,8 @@ def _reconcile_asset_rule_effects(db, workspace, prior_rules):
                 finding_changed = True
         if context_changed:
             asset.context = context
+            asset.context_provenance = provenance
+            asset.context_version += 1
         if context_changed or finding_changed:
             changed += 1
     return changed
@@ -368,7 +733,7 @@ def update_asset_rule(id: int, data: AssetRuleInput, user=Depends(admin), db=Dep
     values['context'] = data.context.model_dump(exclude_none=True)
     for key, value in values.items():
         setattr(rule, key, value if key != 'match_value' else value.strip())
-    affected = _reconcile_asset_rule_effects(db, None, prior_rules) if not rule.active else 0
+    affected = _reconcile_asset_rule_effects(db, None, prior_rules)
     db.add(Audit(actor_id=user.id, action='asset_rule.updated', entity='asset_rule', entity_id=id, details={'name':rule.name,'active':rule.active,'match_type':rule.match_type,'match_value':rule.match_value,'assets_reconciled':affected}))
     db.commit(); return {'id': rule.id, 'name': rule.name, 'active': rule.active, 'assets_reconciled': affected}
 
@@ -390,7 +755,20 @@ def apply_asset_rule(id: int, request: Request, user=Depends(admin), db=Depends(
     for asset in db.scalars(select(Asset).where(Asset.workspace == request.state.session.workspace)):
         rule_context, controls, applied = resolve_rules(db, asset.hostname, asset.ip, asset.tags)
         if not any(item['id'] == id for item in applied): continue
-        asset.context = {**asset.context, **rule_context, 'applied_rules': applied}
+        context = dict(asset.context or {})
+        provenance = dict(asset.context_provenance or {})
+        managed = {}
+        for key, value in rule_context.items():
+            if context.get(key) in (None, '', []):
+                context[key] = value
+                managed[key] = value
+                provenance[key] = {'source_system': 'asset_rule', 'approval_state': 'Provisional'}
+        if managed:
+            context['_rule_context'] = managed
+            asset.context_version += 1
+        context['applied_rules'] = applied
+        asset.context = context
+        asset.context_provenance = provenance
         for record in db.scalars(select(Finding).where(Finding.asset_id == asset.id)):
             observed = dict(record.observed); observed['default_controls'] = controls; observed['applied_rules'] = applied
             record.observed = observed; record.revision += 1
@@ -412,11 +790,9 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     severity_counts = dict(db.execute(select(severity_value, func.count()).select_from(Finding).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(Finding.workspace == workspace, active).group_by(severity_value)).all())
     # Dashboard summaries must remain fast for six-figure finding volumes.  Join the
     # most recent assessment in one query instead of calling detail() for every row.
-    latest = (select(Assessment.instance_id.label('finding_id'), func.max(Assessment.revision).label('revision'))
-              .join(Finding, Assessment.instance_id == Finding.id)
-              .where(Finding.workspace == workspace).group_by(Assessment.instance_id).subquery())
+    latest = latest_assessment_revision()
     assessment_rows = db.execute(
-        select(Finding.id, Finding.revision.label('finding_revision'), Assessment.revision.label('assessment_revision'),
+        select(Finding.id, Assessment.id.label('assessment_id'), Finding.revision.label('finding_revision'), Assessment.revision.label('assessment_revision'),
                Assessment.methodology_id, Assessment.status, RiskScore.result)
         .join(latest, latest.c.finding_id == Finding.id)
         .join(Assessment, (Assessment.instance_id == latest.c.finding_id) & (Assessment.revision == latest.c.revision))
@@ -424,9 +800,12 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
         .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
         .where(Finding.workspace == workspace, active)
     ).all()
-    draft_statuses = {'Assessment In Progress', 'Context Required', 'Pending Validation'}
-    current_scores = [row for row in assessment_rows if row.result is not None and row.status not in draft_statuses
-                      and row.assessment_revision == row.finding_revision and row.methodology_id == methodology.id]
+    currencies = {row.id: assessment_currency(
+        assessment_id=row.assessment_id, assessment_revision=row.assessment_revision,
+        finding_revision=row.finding_revision, methodology_id=row.methodology_id,
+        active_methodology_id=methodology.id, status=row.status, score_present=row.result is not None)
+        for row in assessment_rows}
+    current_scores = [row for row in assessment_rows if currencies[row.id] == 'Current']
     rank = case((severity_value == 'Critical', 4), (severity_value == 'High', 3), (severity_value == 'Medium', 2), (severity_value == 'Low', 1), else_=0)
     vpr = cast(Finding.observed['vpr'].as_string(), Float)
     cvss = cast(Finding.observed['cvss'].as_string(), Float)
@@ -443,9 +822,19 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     due_dates = [value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value for value in due_rows]
     overdue = sum(value < now for value in due_dates)
     due_soon = sum(now <= value <= now + timedelta(days=7) for value in due_dates)
+    workflow_rows = db.execute(select(FindingWorkflow.status, FindingWorkflow.remediation_due_at,
+                                      FindingWorkflow.remediation_evidence)
+        .join(Finding, Finding.id == FindingWorkflow.finding_id)
+        .where(Finding.workspace == workspace)).all()
+    verified = sum(status == 'Closed' and bool(evidence) for status, _, evidence in workflow_rows)
+    ticket_covered = sum(bool(evidence) for _, _, evidence in workflow_rows)
+    backlog_aging = db.scalar(select(func.count(Finding.id)).outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+        .where(Finding.workspace == workspace, active, FindingWorkflow.status.in_(['New','Investigating','Remediation Planned','Risk Review']))) or 0
     return {'total': total, 'severity': {s: severity_counts.get(s, 0) for s in levels},
             'pending': total - len(current_scores), 'completed': len(current_scores), 'exceptions': sum(row.status == 'Exception Requested' for row in assessment_rows),
-            'remediation': {'overdue': overdue, 'due_soon': due_soon, 'scheduled': len(due_dates)},
+            'remediation': {'overdue': overdue, 'due_soon': due_soon, 'scheduled': len(due_dates),
+                            'verified_closure': verified, 'ticket_coverage': ticket_covered,
+                            'backlog_aging': backlog_aging},
             'above': sum(bool(row.result.get('above_appetite')) for row in current_scores), 'within': sum(not row.result.get('above_appetite') for row in current_scores),
             'distribution': [{'name': s, 'value': sum(row.result.get('residual_level') == s for row in current_scores)} for s in levels],
             'priority': priority,
@@ -453,7 +842,7 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
 
 @router.get('/methodologies')
 def methodologies(user=Depends(require_user), db=Depends(get_db)):
-    return [{'id': m.id, 'version': m.version, 'configuration': m.configuration, 'created_at': m.created_at.isoformat()} for m in db.scalars(select(Methodology).order_by(Methodology.id.desc()))]
+    return [{'id': m.id, 'version': m.version, 'configuration': m.configuration, 'lifecycle_status': m.lifecycle_status, 'approved_by': m.approved_by, 'created_at': m.created_at.isoformat()} for m in db.scalars(select(Methodology).order_by(Methodology.id.desc()))]
 
 @router.post('/methodologies', status_code=201)
 def add_methodology(data: MethodologyCreate, user=Depends(admin), db=Depends(get_db)):
@@ -465,6 +854,15 @@ def add_methodology(data: MethodologyCreate, user=Depends(admin), db=Depends(get
     db.add(Audit(actor_id=user.id, action='methodology.published', entity='methodology', entity_id=method.id, details={'version': method.version}))
     db.commit()
     return {'id': method.id, 'version': method.version}
+
+@router.post('/methodologies/{id}/approve')
+def approve_methodology(id: int, user=Depends(admin), db=Depends(get_db)):
+    method = db.get(Methodology, id)
+    if not method: raise HTTPException(404, 'Methodology not found')
+    if method.created_by == user.id: raise HTTPException(409, 'Methodology approval requires separation of duties')
+    method.lifecycle_status = 'Approved'; method.approved_by = user.id; method.approved_at = datetime.now(timezone.utc)
+    db.add(Audit(actor_id=user.id, action='methodology.approved', entity='methodology', entity_id=id, details={'version': method.version})); db.commit()
+    return {'id': id, 'version': method.version, 'lifecycle_status': method.lifecycle_status}
 
 @router.get('/audit')
 def audit(request: Request, user=Depends(require_user), db=Depends(get_db)):

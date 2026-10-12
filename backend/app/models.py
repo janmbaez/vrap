@@ -1,5 +1,5 @@
 from datetime import date, datetime, timezone
-from sqlalchemy import String, Integer, JSON, ForeignKey, Text, Boolean, DateTime, Date, UniqueConstraint, Float, Index
+from sqlalchemy import String, Integer, JSON, ForeignKey, Text, Boolean, DateTime, Date, UniqueConstraint, Float, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -32,7 +32,87 @@ class Asset(Base):
     os: Mapped[str | None] = mapped_column(String(200))
     tags: Mapped[list] = mapped_column(JSON, default=list)
     context: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Context is versioned so a later classification workflow can reject stale writes.
+    context_version: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
+    context_provenance: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
     workspace: Mapped[str] = mapped_column(String(20), default='Production')
+
+class AssetRegulatoryScope(Base):
+    __tablename__ = 'asset_regulatory_scopes'
+    __table_args__ = (UniqueConstraint('asset_id', 'scope'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    scope: Mapped[str] = mapped_column(String(40))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default='1')
+    source_system: Mapped[str] = mapped_column(String(80), default='legacy')
+    source_record_id: Mapped[str | None] = mapped_column(String(200))
+    approval_state: Mapped[str] = mapped_column(String(40), default='Pending verification')
+    verified_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+class AssetClassificationChangeRequest(Base):
+    __tablename__ = 'asset_classification_change_requests'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    approved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    status: Mapped[str] = mapped_column(String(30), default='Requested')
+    expected_context_version: Mapped[int] = mapped_column(Integer)
+    before_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    proposed_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    justification: Mapped[str] = mapped_column(Text)
+    evidence: Mapped[str] = mapped_column(Text, default='')
+    decision_justification: Mapped[str] = mapped_column(Text, default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+class AssetClassificationMission(Base):
+    __tablename__ = 'asset_classification_missions'
+    __table_args__ = (UniqueConstraint('workspace', 'asset_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    questionnaire_version: Mapped[str] = mapped_column(String(50), default='1.0-provisional')
+    status: Mapped[str] = mapped_column(String(40), default='Draft')
+    current_step: Mapped[int] = mapped_column(Integer, default=1)
+    responses: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    owner_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    grc_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+
+class AssetClassificationMissionHistory(Base):
+    __tablename__ = 'asset_classification_mission_history'
+    __table_args__ = (Index('ix_asset_classification_mission_history_mission', 'mission_id', 'created_at'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    mission_id: Mapped[int] = mapped_column(ForeignKey('asset_classification_missions.id'), index=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'), index=True)
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    action: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(50))
+    current_step: Mapped[int] = mapped_column(Integer)
+    responses: Mapped[dict] = mapped_column(JSON, default=dict)
+    actor_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class AssetClassificationEvidence(Base):
+    __tablename__ = 'asset_classification_evidence'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    mission_id: Mapped[int] = mapped_column(ForeignKey('asset_classification_missions.id'))
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    evidence_type: Mapped[str] = mapped_column(String(60))
+    reference: Mapped[str] = mapped_column(Text)
+    notes: Mapped[str] = mapped_column(Text, default='')
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class Vulnerability(Base):
     __tablename__ = 'vulnerabilities'
@@ -54,6 +134,10 @@ class Finding(Base):
     source: Mapped[str] = mapped_column(String(20))
     source_record: Mapped[dict] = mapped_column(JSON, default=dict)
     observed: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Scanner freshness and lifecycle are distinct from the assessment revision.
+    source_last_seen: Mapped[date | None] = mapped_column(Date)
+    evidence_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    lifecycle_revision: Mapped[int] = mapped_column(Integer, default=0, server_default='0')
     revision: Mapped[int] = mapped_column(Integer, default=0)
     workspace: Mapped[str] = mapped_column(String(20), default='Production')
 
@@ -64,6 +148,9 @@ class Methodology(Base):
     configuration: Mapped[dict] = mapped_column(JSON)
     created_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    lifecycle_status: Mapped[str] = mapped_column(String(30), default='Provisional')
+    approved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class Assessment(Base):
     __tablename__ = 'assessments'
@@ -177,8 +264,56 @@ class PluginAssessmentTemplate(Base):
     justification: Mapped[str] = mapped_column(Text, default='')
     decision: Mapped[str] = mapped_column(String(60), default='Needs Further Assessment')
     controls: Mapped[list] = mapped_column(JSON, default=list)
+    template_version: Mapped[int] = mapped_column(Integer, default=1)
+    applicability: Mapped[dict] = mapped_column(JSON, default=dict)
+    technical_rationale: Mapped[str] = mapped_column(Text, default='')
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+class PluginAssessmentTemplateRevision(Base):
+    __tablename__ = 'plugin_assessment_template_revisions'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    template_id: Mapped[int] = mapped_column(ForeignKey('plugin_assessment_templates.id'), index=True)
+    workspace: Mapped[str] = mapped_column(String(20))
+    vulnerability_id: Mapped[int] = mapped_column(ForeignKey('vulnerabilities.id'))
+    version: Mapped[int] = mapped_column(Integer)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    changed_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class BulkAssessmentJob(Base):
+    __tablename__ = 'bulk_assessment_jobs'
+    __table_args__ = (UniqueConstraint('workspace', 'vulnerability_id', 'idempotency_key'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), index=True)
+    vulnerability_id: Mapped[int] = mapped_column(ForeignKey('vulnerabilities.id'), index=True)
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(30), default='Queued', index=True)
+    active_only: Mapped[bool] = mapped_column(Boolean, default=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    finding_ids: Mapped[list] = mapped_column(JSON, default=list)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    correlation_id: Mapped[str] = mapped_column(String(64), unique=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+class BulkAssessmentItem(Base):
+    __tablename__ = 'bulk_assessment_items'
+    __table_args__ = (UniqueConstraint('job_id', 'finding_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey('bulk_assessment_jobs.id'), index=True)
+    finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), index=True)
+    status: Mapped[str] = mapped_column(String(30), default='Pending', index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    assessment_id: Mapped[int | None] = mapped_column(ForeignKey('assessments.id'))
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class FindingWorkflow(Base):
     __tablename__ = 'finding_workflows'
@@ -195,6 +330,65 @@ class FindingWorkflow(Base):
     review_notes: Mapped[str | None] = mapped_column(Text)
     remediation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     remediation_evidence: Mapped[str | None] = mapped_column(Text)
+
+class RemediationPackage(Base):
+    __tablename__ = 'remediation_packages'
+    __table_args__ = (UniqueConstraint('workspace', 'name'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    name: Mapped[str] = mapped_column(String(200))
+    remediation_action: Mapped[str] = mapped_column(Text)
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    jira_reference: Mapped[str | None] = mapped_column(String(300))
+    due_date: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), default='Open')
+    blockers: Mapped[list] = mapped_column(JSON, default=list)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+class RemediationPackageFinding(Base):
+    __tablename__ = 'remediation_package_findings'
+    __table_args__ = (UniqueConstraint('package_id', 'finding_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey('remediation_packages.id'), index=True)
+    finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), index=True)
+    added_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class RemediationPackageEvidence(Base):
+    __tablename__ = 'remediation_package_evidence'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey('remediation_packages.id'), index=True)
+    evidence_type: Mapped[str] = mapped_column(String(50))
+    reference: Mapped[str] = mapped_column(Text)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class RemediationPackageEvent(Base):
+    __tablename__ = 'remediation_package_events'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey('remediation_packages.id'), index=True)
+    action: Mapped[str] = mapped_column(String(50))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    actor_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class RemediationSLAPolicy(Base):
+    __tablename__ = 'remediation_sla_policies'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    name: Mapped[str] = mapped_column(String(160))
+    regulatory_scope: Mapped[str] = mapped_column(String(40), default='Non-PCI')
+    severity: Mapped[str] = mapped_column(String(20))
+    days: Mapped[int | None] = mapped_column(Integer)
+    effective_from: Mapped[date] = mapped_column(Date)
+    effective_to: Mapped[date | None] = mapped_column(Date)
+    approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 class RiskException(Base):
     __tablename__ = 'risk_exceptions'
@@ -227,6 +421,10 @@ class ControlLibrary(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    validator_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recertification_days: Mapped[int] = mapped_column(Integer, default=365)
 
 class SavedFilter(Base):
     __tablename__ = 'saved_filters'
