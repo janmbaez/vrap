@@ -328,6 +328,50 @@ class FindingWorkflow(Base):
     remediation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     remediation_evidence: Mapped[str | None] = mapped_column(Text)
 
+class RemediationPackage(Base):
+    __tablename__ = 'remediation_packages'
+    __table_args__ = (UniqueConstraint('workspace', 'name'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    name: Mapped[str] = mapped_column(String(200))
+    remediation_action: Mapped[str] = mapped_column(Text)
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    jira_reference: Mapped[str | None] = mapped_column(String(300))
+    due_date: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), default='Open')
+    blockers: Mapped[list] = mapped_column(JSON, default=list)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+class RemediationPackageFinding(Base):
+    __tablename__ = 'remediation_package_findings'
+    __table_args__ = (UniqueConstraint('package_id', 'finding_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey('remediation_packages.id'), index=True)
+    finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), index=True)
+    added_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class RemediationPackageEvidence(Base):
+    __tablename__ = 'remediation_package_evidence'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey('remediation_packages.id'), index=True)
+    evidence_type: Mapped[str] = mapped_column(String(50))
+    reference: Mapped[str] = mapped_column(Text)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class RemediationPackageEvent(Base):
+    __tablename__ = 'remediation_package_events'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey('remediation_packages.id'), index=True)
+    action: Mapped[str] = mapped_column(String(50))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    actor_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 class RiskException(Base):
     __tablename__ = 'risk_exceptions'
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -11,8 +11,9 @@ from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent,
-                      BulkAssessmentJob, BulkAssessmentItem, PluginAssessmentTemplateRevision)
-from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context
+                      BulkAssessmentJob, BulkAssessmentItem, PluginAssessmentTemplateRevision, RemediationPackage,
+                      RemediationPackageFinding, RemediationPackageEvidence, RemediationPackageEvent)
+from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context, RemediationPackageInput, RemediationPackageUpdate, RemediationEvidenceInput
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
 from ..asset_rules import PROTECTED_CONTEXT_FIELDS
@@ -525,6 +526,59 @@ def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1)
     return {'workspace': workspace, 'queues': {k: v[(page-1)*page_size:page*page_size] for k,v in selected.items()},
             'summary': {key: len(value) for key, value in selected.items()}, 'page': page, 'page_size': page_size,
             'generated_at': datetime.now(timezone.utc).isoformat()}
+
+def _package_output(db, package):
+    findings = db.scalars(select(RemediationPackageFinding.finding_id).where(RemediationPackageFinding.package_id == package.id)).all()
+    evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id).order_by(RemediationPackageEvidence.id.desc())).all()
+    return {'id': package.id, 'name': package.name, 'workspace': package.workspace, 'remediation_action': package.remediation_action,
+            'owner_id': package.owner_id, 'jira_reference': package.jira_reference, 'due_date': package.due_date.isoformat() if package.due_date else None,
+            'status': package.status, 'blockers': package.blockers or [], 'finding_ids': findings,
+            'evidence': [{'id': e.id, 'type': e.evidence_type, 'reference': e.reference, 'verified': e.verified, 'created_at': e.created_at.isoformat()} for e in evidence]}
+
+@router.get('/remediation-packages')
+def list_remediation_packages(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request)
+    return [_package_output(db, p) for p in db.scalars(select(RemediationPackage).where(RemediationPackage.workspace == workspace).order_by(RemediationPackage.updated_at.desc())).all()]
+
+@router.post('/remediation-packages', status_code=201)
+def create_remediation_package(data: RemediationPackageInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    workspace = _workspace(request)
+    ids = set(data.finding_ids)
+    if ids and len(db.scalars(select(Finding.id).where(Finding.workspace == workspace, Finding.id.in_(ids))).all()) != len(ids):
+        raise HTTPException(422, 'All findings must belong to the current workspace')
+    package = RemediationPackage(workspace=workspace, name=data.name, remediation_action=data.remediation_action, owner_id=data.owner_id,
+        jira_reference=data.jira_reference, due_date=data.due_date, blockers=data.blockers, created_by=user.id)
+    db.add(package); db.flush()
+    for finding_id in ids: db.add(RemediationPackageFinding(package_id=package.id, finding_id=finding_id, added_by=user.id))
+    db.add(RemediationPackageEvent(package_id=package.id, action='created', details={'finding_count': len(ids)}, actor_id=user.id))
+    db.commit(); db.refresh(package); return _package_output(db, package)
+
+@router.put('/remediation-packages/{package_id}')
+def update_remediation_package(package_id: int, data: RemediationPackageUpdate, request: Request, user=Depends(writer), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    changes = data.model_dump(exclude_none=True)
+    if data.status == 'Verified Closed':
+        evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id, RemediationPackageEvidence.verified.is_(True))).all()
+        if not any(e.evidence_type == 'rescan' for e in evidence): raise HTTPException(409, 'A verified rescan is required before closure')
+    for key, value in changes.items(): setattr(package, key, value)
+    db.add(RemediationPackageEvent(package_id=package.id, action='updated', details=changes, actor_id=user.id)); db.commit(); db.refresh(package)
+    return _package_output(db, package)
+
+@router.post('/remediation-packages/{package_id}/evidence', status_code=201)
+def add_remediation_evidence(package_id: int, data: RemediationEvidenceInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    row = RemediationPackageEvidence(package_id=package.id, evidence_type=data.evidence_type, reference=data.reference.strip(), verified=False, created_by=user.id)
+    db.add(row); db.add(RemediationPackageEvent(package_id=package.id, action='evidence_added', details={'evidence_type': data.evidence_type}, actor_id=user.id)); db.commit(); db.refresh(row)
+    return {'id': row.id, 'verified': row.verified, 'type': row.evidence_type, 'reference': row.reference}
+
+@router.post('/remediation-packages/{package_id}/evidence/{evidence_id}/verify')
+def verify_remediation_evidence(package_id: int, evidence_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id); row = db.get(RemediationPackageEvidence, evidence_id)
+    if not package or package.workspace != _workspace(request) or not row or row.package_id != package.id: raise HTTPException(404, 'Evidence not found')
+    row.verified = True; db.add(RemediationPackageEvent(package_id=package.id, action='evidence_verified', details={'evidence_id': row.id}, actor_id=user.id)); db.commit()
+    return {'id': row.id, 'verified': True}
 
 def _executive_filters(request):
     allowed = ('period_start', 'period_end', 'severity', 'asset_group', 'business_owner', 'it_owner', 'application_owner', 'regulatory', 'campaign_id')

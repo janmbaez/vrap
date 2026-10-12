@@ -362,6 +362,26 @@ class WorkflowInput(Strict):
     remediation_due_at: datetime | None = None
     remediation_evidence: str | None = Field(default=None, max_length=10000)
 
+class RemediationPackageInput(Strict):
+    name: str = Field(min_length=1, max_length=200)
+    remediation_action: str = Field(min_length=1, max_length=10000)
+    owner_id: int | None = None
+    jira_reference: str | None = Field(default=None, max_length=300)
+    due_date: date | None = None
+    blockers: list[str] = Field(default_factory=list, max_length=50)
+    finding_ids: list[int] = Field(default_factory=list, max_length=5000)
+
+class RemediationPackageUpdate(Strict):
+    status: Literal['Open', 'In Progress', 'Blocked', 'Pending Verification', 'Verified Closed', 'Reopened'] | None = None
+    owner_id: int | None = None
+    jira_reference: str | None = Field(default=None, max_length=300)
+    due_date: date | None = None
+    blockers: list[str] | None = Field(default=None, max_length=50)
+
+class RemediationEvidenceInput(Strict):
+    evidence_type: Literal['rescan', 'test_result', 'change_record', 'other']
+    reference: str = Field(min_length=1, max_length=10000)
+
 class ExceptionInput(Strict):
     justification: str = Field(min_length=10, max_length=5000)
     evidence: str = Field(default='', max_length=10000)
