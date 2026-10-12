@@ -448,6 +448,9 @@ def test_remediation_package_requires_verified_rescan_before_closure(client):
     assert evidence.status_code == 201
     assert client.post(f"/api/remediation-packages/{pid}/evidence/{evidence.json()['id']}/verify").status_code == 200
     assert client.put(f'/api/remediation-packages/{pid}', json={'status':'Verified Closed'}).status_code == 200
+    reopened = client.put(f'/api/remediation-packages/{pid}', json={'status':'Reopened','finding_ids':[finding['id'],finding['id']]})
+    assert reopened.status_code == 200
+    assert reopened.json()['finding_ids'] == [finding['id']]
 
 def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
     login(client); create(client)
