@@ -3,7 +3,7 @@ import hashlib
 import json
 import uuid
 from io import BytesIO, StringIO
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select, func, case, update, delete
 from ..db import get_db
@@ -484,37 +484,46 @@ def operations(request:Request,user=Depends(require_user),db=Depends(get_db)):
     return {'total':total,'stale':stale,'open_exceptions':exceptions_open,'statuses':[{'name':s or 'New','value':c} for s,c in status_rows],'owners':[{'name':n or 'Unassigned','value':c} for n,c in owner_rows]}
 
 @router.get('/mission-center')
-def mission_center(request: Request, user=Depends(require_user), db=Depends(get_db)):
+def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str = '', owner_id: int | None = None, user=Depends(require_user), db=Depends(get_db)):
     workspace = _workspace(request)
-    rows = db.execute(select(Finding.id, Vulnerability.name,
-                             FindingWorkflow.status, FindingWorkflow.owner_id,
-                             Asset.hostname, Vulnerability.plugin_id)
-        .join(Asset, Asset.id == Finding.asset_id)
-        .join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
+    rows = db.execute(select(Finding, Vulnerability, Asset, FindingWorkflow)
+        .join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
         .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
         .where(Finding.workspace == workspace)
         .order_by(Finding.id.desc())).all()
     queues = {key: [] for key in ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')}
-    for row in rows:
-        status = row.status or 'New'
-        item = {'finding_id': row.id, 'name': row.name, 'asset': row.hostname,
-                'plugin_id': row.plugin_id, 'status': status, 'owner_id': row.owner_id,
-                'recommended_action': 'Open finding and complete the assessment'}
-        if False:
-            item['recommended_action'] = 'Reassess changed source evidence or asset context'
-            queues['monitor_reassess'].append(item)
-        elif status in ('New', 'Assessment In Progress', 'Above Risk Appetite'):
-            queues['urgent_review'].append(item)
-        elif status in ('Context Required', 'Pending Validation'):
-            item['recommended_action'] = 'Collect required authoritative context or evidence'
-            queues['missing_context_evidence'].append(item)
-        elif status in ('Investigating', 'Remediation Planned'):
-            item['recommended_action'] = 'Update remediation progress and evidence'
-            queues['automated_provisional'].append(item)
-        else:
-            queues['monitor_reassess'].append(item)
-    return {'workspace': workspace, 'queues': queues,
-            'summary': {key: len(value) for key, value in queues.items()},
+    today = datetime.now(timezone.utc).date()
+    for finding, vuln, asset, workflow in rows:
+        assessment = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+        if q and q.lower() not in f'{asset.hostname} {asset.ip or ""} {vuln.name} {vuln.plugin_id or ""}'.lower(): continue
+        if owner_id is not None and (not workflow or workflow.owner_id != owner_id): continue
+        status = workflow.status if workflow else 'New'
+        tech = {**(vuln.technical or {}), **(finding.observed or {}).get('technical', finding.observed or {})}
+        context = asset.context or {}
+        factors = []
+        if tech.get('kev') is True: factors.append('CISA KEV')
+        if tech.get('exploit_available') is True: factors.append('Exploit available')
+        if context.get('asset_criticality') in ('Critical', 'High'): factors.append('High asset criticality')
+        if context.get('exposure') == 'Internet Facing' or context.get('publicly_accessible') is True: factors.append('Internet exposed')
+        overdue = bool(workflow and workflow.remediation_due_at and workflow.remediation_due_at.date() < today and status not in ('Closed', 'Accepted'))
+        if overdue: factors.append('Overdue')
+        missing = not assessment or not context.get('asset_criticality') or not context.get('business_criticality')
+        stale = bool(assessment and assessment.revision != finding.revision)
+        severity = str(tech.get('severity') or '').lower()
+        priority = (40 if tech.get('kev') else 0) + (25 if tech.get('exploit_available') else 0) + (20 if context.get('asset_criticality') in ('Critical','High') else 0) + (15 if context.get('exposure') == 'Internet Facing' else 0) + (15 if overdue else 0) + (10 if missing else 0) + (10 if stale else 0) + ({'critical':20,'high':10,'medium':4}.get(severity, 0))
+        if severity in ('critical', 'high') or priority >= 45 or overdue or status in ('Assessment In Progress', 'Above Risk Appetite'): bucket = 'urgent_review'
+        elif stale or (not assessment and status not in ('Closed', 'Accepted')): bucket = 'monitor_reassess' if stale else 'automated_provisional'
+        elif missing: bucket = 'missing_context_evidence'
+        else: bucket = 'monitor_reassess'
+        item = {'finding_id': finding.id, 'name': vuln.name, 'asset': asset.hostname, 'plugin_id': vuln.plugin_id,
+                'status': status, 'owner_id': workflow.owner_id if workflow else None, 'priority_score': priority,
+                'priority_factors': factors, 'overdue': overdue, 'recommended_action':
+                'Reassess changed evidence' if stale else ('Collect authoritative context/evidence' if missing else ('Address overdue remediation' if overdue else 'Open finding and complete the assessment'))}
+        queues[bucket].append(item)
+    for items in queues.values(): items.sort(key=lambda x: (-x['priority_score'], x['finding_id']))
+    selected = {queue: queues[queue]} if queue in queues else queues
+    return {'workspace': workspace, 'queues': {k: v[(page-1)*page_size:page*page_size] for k,v in selected.items()},
+            'summary': {key: len(value) for key, value in selected.items()}, 'page': page, 'page_size': page_size,
             'generated_at': datetime.now(timezone.utc).isoformat()}
 
 def _executive_filters(request):
