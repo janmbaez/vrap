@@ -5,7 +5,8 @@ import uuid
 from io import BytesIO, StringIO
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, JSONResponse
-from sqlalchemy import select, func, case, update, delete
+from sqlalchemy import select, func, case, update, delete, or_
+from sqlalchemy.orm import aliased
 from ..db import get_db
 from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
@@ -503,17 +504,31 @@ def kpis(request: Request, user=Depends(require_user), db=Depends(get_db)):
 @router.get('/mission-center')
 def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str = '', owner_id: int | None = None, user=Depends(require_user), db=Depends(get_db)):
     workspace = _workspace(request)
-    rows = db.execute(select(Finding, Vulnerability, Asset, FindingWorkflow)
+    # Join the latest assessment once.  The previous implementation issued one
+    # query per finding and then paginated the complete inventory in Python.
+    latest_revision = (select(Assessment.instance_id.label('instance_id'),
+                              func.max(Assessment.revision).label('revision'))
+                       .group_by(Assessment.instance_id).subquery())
+    LatestAssessment = aliased(Assessment)
+    statement = (select(Finding, Vulnerability, Asset, FindingWorkflow, LatestAssessment)
         .join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
         .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
-        .where(Finding.workspace == workspace)
-        .order_by(Finding.id.desc())).all()
+        .outerjoin(latest_revision, latest_revision.c.instance_id == Finding.id)
+        .outerjoin(LatestAssessment, (LatestAssessment.instance_id == latest_revision.c.instance_id) &
+                   (LatestAssessment.revision == latest_revision.c.revision))
+        .where(Finding.workspace == workspace))
+    if q.strip():
+        term = f'%{q.strip().lower()}%'
+        statement = statement.where(or_(func.lower(Asset.hostname).like(term),
+                                       func.lower(func.coalesce(Asset.ip, '')).like(term),
+                                       func.lower(Vulnerability.name).like(term),
+                                       func.lower(func.coalesce(Vulnerability.plugin_id, '')).like(term)))
+    if owner_id is not None:
+        statement = statement.where(FindingWorkflow.owner_id == owner_id)
+    rows = db.execute(statement.order_by(Finding.id.desc())).all()
     queues = {key: [] for key in ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')}
     today = datetime.now(timezone.utc).date()
-    for finding, vuln, asset, workflow in rows:
-        assessment = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
-        if q and q.lower() not in f'{asset.hostname} {asset.ip or ""} {vuln.name} {vuln.plugin_id or ""}'.lower(): continue
-        if owner_id is not None and (not workflow or workflow.owner_id != owner_id): continue
+    for finding, vuln, asset, workflow, assessment in rows:
         status = workflow.status if workflow else 'New'
         tech = {**(vuln.technical or {}), **(finding.observed or {}).get('technical', finding.observed or {})}
         context = asset.context or {}
