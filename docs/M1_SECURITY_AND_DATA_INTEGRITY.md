@@ -14,14 +14,15 @@
 - Shared plugin asset updates cannot alter protected classification fields.
 - Rule disable/delete reconciles only explicitly rule-derived values, preserving manual and ambiguous legacy context.
 - Shared assessment-currency rules now drive live dashboard counts, campaign score snapshots, and executive reporting. A current assessment is latest, completed, methodology-matching, revision-valid, and scored.
+- Finding evidence fingerprints now keep an unchanged Tenable rescan from advancing assessment revision; scan freshness and lifecycle transitions are stored separately.
 
 ## Migration and rollback
 
-`0007_asset_context_provenance` is additive. It assigns safe defaults for existing assets. Its downgrade intentionally retains provenance data because audit evidence must not be silently deleted. Application rollback is possible, but it restores weaker enforcement and should be a security-reviewed change.
+`0007_asset_context_provenance` and `0008_finding_sync_state` are additive. It assigns safe defaults for existing assets. Its downgrade intentionally retains provenance data because audit evidence must not be silently deleted. Application rollback is possible, but it restores weaker enforcement and should be a security-reviewed change.
 
 ## Remaining M1 work
 
 - Replace transitional JSON provenance with independent classification/membership and approval/effective-date records.
-- Add material-evidence fingerprints and extend the shared current/stale/draft assessment denominator to every queue and export route.
+- Extend the shared current/stale/draft assessment denominator to every queue and export route, and define the operational policy for which non-scanner asset/control changes are material.
 - Complete the mutation-route workspace audit and add snapshot-based Tenable ingestion.
 - Add delegated risk-owner/GRC approval workflow for formal acceptance.

@@ -36,7 +36,7 @@
 | Risk acceptance governance | Partial | Individual/bulk admin path existed; no segregation-of-duties model | High | Bulk acceptance is now blocked; formal approval redesign remains M1/M2. |
 | Asset provenance and immutable regulatory memberships | Transitional enforcement | Migration `0007` stores context version/provenance; imports/rules preserve existing values and bulk plugin updates cannot change classifications | Critical | Independent memberships, approvals, and effective dates remain M1/M2 work. |
 | Current assessment denominator | Transitional enforcement | `assessment_state.py` supplies shared latest/current/stale predicates to dashboard, campaign snapshot and executive report | High | Extend to all queues/exports and add material evidence fingerprint. |
-| Material-change fingerprint | Missing | `services.ingest()` increments revision on any Tenable update | High | M1 follow-up. |
+| Material-change fingerprint | Transitional enforcement | `0008` stores evidence fingerprint, source freshness, and lifecycle revision; unchanged rescans retain assessment revision | High | Define materiality for non-scanner evidence and extend lifecycle monitoring. |
 | Atomic Tenable snapshot publication | Missing | Records are committed in batches during export | High | M1 follow-up. |
 | TLS/trusted proxy/cookie deployment safety | Partial | Headers/cookies exist; Docker used unrestricted forwarded headers and main push redeployed | High | Automatic deployment removed; proxy boundary narrowed. |
 | Control evidence lifecycle | Partial | Assessment controls have evidence and validation fields, no expiry/recertification | Medium | M5. |

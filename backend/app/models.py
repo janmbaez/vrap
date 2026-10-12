@@ -57,6 +57,10 @@ class Finding(Base):
     source: Mapped[str] = mapped_column(String(20))
     source_record: Mapped[dict] = mapped_column(JSON, default=dict)
     observed: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Scanner freshness and lifecycle are distinct from the assessment revision.
+    source_last_seen: Mapped[date | None] = mapped_column(Date)
+    evidence_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    lifecycle_revision: Mapped[int] = mapped_column(Integer, default=0, server_default='0')
     revision: Mapped[int] = mapped_column(Integer, default=0)
     workspace: Mapped[str] = mapped_column(String(20), default='Production')
 

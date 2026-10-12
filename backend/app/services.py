@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy import delete, select, update
@@ -17,6 +18,22 @@ def active_methodology(db):
 
 def identity(data):
     return ('plugin:' + data.plugin_id) if data.plugin_id else 'manual:' + hashlib.sha256((data.name.casefold() + '|' + ','.join(sorted(data.cves))).encode()).hexdigest()
+
+
+def evidence_fingerprint(technical):
+    """Hash only risk-relevant scanner evidence, excluding scan freshness/lifecycle."""
+    evidence = {key: value for key, value in technical.items() if key not in {'last_seen', 'state'}}
+    payload = json.dumps(evidence, sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _lifecycle_state(value):
+    state = str(value or '').strip().casefold()
+    if state in {'closed', 'fixed', 'resolved'}:
+        return 'closed'
+    if state in {'active', 'open', 'new', 'reopened'}:
+        return 'active'
+    return None
 
 def ingest(db, data, source='Manual', original=None, update_existing=False, workspace='Production', actor_id=None, cache=None):
     """Persist one finding, optionally reusing identities already seen in this batch."""
@@ -73,29 +90,38 @@ def ingest(db, data, source='Manual', original=None, update_existing=False, work
                 break
     if not finding:
         finding = db.scalar(select(Finding).where(Finding.asset_id == asset.id, Finding.vulnerability_id == vuln.id, Finding.port == data.port, Finding.protocol == data.protocol))
+    observed = {**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
+                'default_controls': default_controls, 'applied_rules': applied_rules}
+    fingerprint = evidence_fingerprint(tech)
     if finding:
         if update_existing:
-            finding.observed = {**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
-                                'default_controls': default_controls, 'applied_rules': applied_rules}
+            previous_fingerprint = finding.evidence_fingerprint or evidence_fingerprint(dict(finding.observed or {}))
+            # Source freshness is always updated, while only material risk evidence
+            # invalidates an assessment by advancing the finding revision.
+            finding.observed = observed
             finding.source_record = original or data.model_dump(mode='json')
-            finding.revision += 1
+            finding.source_last_seen = data.last_seen or finding.source_last_seen
+            if previous_fingerprint != fingerprint:
+                finding.evidence_fingerprint = fingerprint
+                finding.revision += 1
             if source == 'Tenable' and actor_id is not None:
-                lifecycle = str(data.state or '').strip().casefold()
-                closed = lifecycle in {'closed', 'fixed', 'resolved'}
+                lifecycle = _lifecycle_state(data.state)
                 workflow = db.get(FindingWorkflow, finding.id)
-                if closed:
+                if lifecycle == 'closed' and (not workflow or workflow.status != 'Closed'):
                     if not workflow:
                         workflow = FindingWorkflow(finding_id=finding.id, status='Closed', updated_by=actor_id)
                         db.add(workflow)
                     else:
                         workflow.status, workflow.updated_by = 'Closed', actor_id
-                elif workflow and workflow.status == 'Closed':
+                    finding.lifecycle_revision += 1
+                elif lifecycle == 'active' and workflow and workflow.status == 'Closed':
                     workflow.status, workflow.updated_by = 'New', actor_id
+                    finding.lifecycle_revision += 1
         findings[finding_key] = finding
         return finding, False
     finding = Finding(asset_id=asset.id, vulnerability_id=vuln.id, source=source, port=data.port, protocol=data.protocol, workspace=workspace,
-                      source_record=original or data.model_dump(mode='json'), observed={**tech, 'context': data.context.model_dump(), 'name': data.name, 'cves': data.cves, 'plugin_id': data.plugin_id,
-                      'default_controls': default_controls, 'applied_rules': applied_rules})
+                      source_record=original or data.model_dump(mode='json'), observed=observed, source_last_seen=data.last_seen,
+                      evidence_fingerprint=fingerprint)
     db.add(finding)
     db.flush()
     findings[finding_key] = finding
