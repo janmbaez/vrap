@@ -12,6 +12,7 @@
 | Fresh SQLite migration chain | PASS | `DATABASE_URL=sqlite:////tmp/vrap-m0-migration.db ... alembic upgrade head`. |
 | Docker runtime | NOT RUN | Docker Desktop daemon is unavailable on this workstation. |
 | Direct PostgreSQL migration | NOT RUN | Local host cannot resolve the Compose-only `db` hostname. This is expected outside Compose. |
+| Repository/history secret-pattern scan | PASS (limited pattern scan) | No Docker Hub, GitHub, AWS, Slack, or PEM-key signature matches in tracked files or reachable Git history. Binary history was scanned byte-safe. This is not a replacement for CI secret scanning. |
 
 ## Architecture map
 
