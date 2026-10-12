@@ -12,8 +12,8 @@ from ..models import (User, Asset, Vulnerability, Finding, Assessment, Assessmen
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent,
                       BulkAssessmentJob, BulkAssessmentItem, PluginAssessmentTemplateRevision, RemediationPackage,
-                      RemediationPackageFinding, RemediationPackageEvidence, RemediationPackageEvent)
-from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context, RemediationPackageInput, RemediationPackageUpdate, RemediationEvidenceInput
+                      RemediationPackageFinding, RemediationPackageEvidence, RemediationPackageEvent, RemediationSLAPolicy)
+from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context, RemediationPackageInput, RemediationPackageUpdate, RemediationEvidenceInput, RemediationSLAPolicyInput
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
 from ..risk.engine import calculate
 from ..asset_rules import PROTECTED_CONTEXT_FIELDS
@@ -579,6 +579,32 @@ def verify_remediation_evidence(package_id: int, evidence_id: int, request: Requ
     if not package or package.workspace != _workspace(request) or not row or row.package_id != package.id: raise HTTPException(404, 'Evidence not found')
     row.verified = True; db.add(RemediationPackageEvent(package_id=package.id, action='evidence_verified', details={'evidence_id': row.id}, actor_id=user.id)); db.commit()
     return {'id': row.id, 'verified': True}
+
+@router.get('/remediation-sla/policies')
+def list_sla_policies(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    return [p.__dict__ | {'effective_from': p.effective_from.isoformat(), 'effective_to': p.effective_to.isoformat() if p.effective_to else None} for p in db.scalars(select(RemediationSLAPolicy).where(RemediationSLAPolicy.workspace == _workspace(request)).order_by(RemediationSLAPolicy.version.desc())).all()]
+
+@router.post('/remediation-sla/policies', status_code=201)
+def create_sla_policy(data: RemediationSLAPolicyInput, request: Request, user=Depends(admin), db=Depends(get_db)):
+    workspace = _workspace(request)
+    version = (db.scalar(select(func.max(RemediationSLAPolicy.version)).where(RemediationSLAPolicy.workspace == workspace)) or 0) + 1
+    row = RemediationSLAPolicy(workspace=workspace, version=version, created_by=user.id, **data.model_dump())
+    db.add(row); db.commit(); db.refresh(row)
+    return {'id': row.id, 'version': row.version}
+
+@router.get('/remediation-sla/evaluate')
+def evaluate_remediation_sla(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    workspace = _workspace(request); today = datetime.now(timezone.utc).date()
+    defaults = {('PCI DSS','Critical'):30,('PCI DSS','High'):30,('PCI DSS','Medium'):90,('PCI DSS','Low'):180,('Non-PCI','Critical'):30,('Non-PCI','High'):60,('Non-PCI','Medium'):90,('Non-PCI','Low'):None}
+    policies = db.scalars(select(RemediationSLAPolicy).where(RemediationSLAPolicy.workspace == workspace, RemediationSLAPolicy.approved.is_(True), RemediationSLAPolicy.effective_from <= today, (RemediationSLAPolicy.effective_to.is_(None) | (RemediationSLAPolicy.effective_to >= today)))).all()
+    rows=[]
+    for finding, vuln, asset, workflow in db.execute(select(Finding,Vulnerability,Asset,FindingWorkflow).join(Vulnerability,Vulnerability.id==Finding.vulnerability_id).join(Asset,Asset.id==Finding.asset_id).outerjoin(FindingWorkflow,FindingWorkflow.finding_id==Finding.id).where(Finding.workspace==workspace)).all():
+        tech={**(vuln.technical or {}), **(finding.observed or {})}; severity=tech.get('severity','Low'); scopes=(asset.context or {}).get('regulatory') or []
+        obligations=[(s, next((p.days for p in policies if p.regulatory_scope==s and p.severity==severity), defaults.get((s,severity), defaults.get(('Non-PCI',severity)))) ) for s in (scopes or ['Non-PCI'])]
+        obligations=[x for x in obligations if x[1] is not None]; days=min((x[1] for x in obligations), default=None)
+        first=(finding.source_last_seen or today); age=(today-first).days; due=first+timedelta(days=days) if days else None
+        rows.append({'finding_id':finding.id,'severity':severity,'scopes':scopes,'first_seen':first.isoformat(),'age_days':age,'sla_days':days,'due_date':due.isoformat() if due else None,'overdue':bool(due and today>due),'due_soon':bool(due and not (today>due) and (due-today).days<=7),'exception':False})
+    return {'workspace':workspace,'policies':'provisional defaults plus approved overrides','total':len(rows),'overdue':sum(x['overdue'] for x in rows),'due_soon':sum(x['due_soon'] for x in rows),'items':rows}
 
 def _executive_filters(request):
     allowed = ('period_start', 'period_end', 'severity', 'asset_group', 'business_owner', 'it_owner', 'application_owner', 'regulatory', 'campaign_id')

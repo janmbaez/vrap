@@ -382,6 +382,15 @@ class RemediationEvidenceInput(Strict):
     evidence_type: Literal['rescan', 'test_result', 'change_record', 'other']
     reference: str = Field(min_length=1, max_length=10000)
 
+class RemediationSLAPolicyInput(Strict):
+    name: str = Field(min_length=1, max_length=160)
+    regulatory_scope: Literal['PCI DSS', 'SOC 2', 'Non-PCI']
+    severity: Literal['Critical', 'High', 'Medium', 'Low']
+    days: int | None = Field(default=None, ge=1, le=3650)
+    effective_from: date
+    effective_to: date | None = None
+    approved: bool = False
+
 class ExceptionInput(Strict):
     justification: str = Field(min_length=10, max_length=5000)
     evidence: str = Field(default='', max_length=10000)

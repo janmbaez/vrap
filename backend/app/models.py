@@ -372,6 +372,21 @@ class RemediationPackageEvent(Base):
     actor_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
+class RemediationSLAPolicy(Base):
+    __tablename__ = 'remediation_sla_policies'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    name: Mapped[str] = mapped_column(String(160))
+    regulatory_scope: Mapped[str] = mapped_column(String(40), default='Non-PCI')
+    severity: Mapped[str] = mapped_column(String(20))
+    days: Mapped[int | None] = mapped_column(Integer)
+    effective_from: Mapped[date] = mapped_column(Date)
+    effective_to: Mapped[date | None] = mapped_column(Date)
+    approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 class RiskException(Base):
     __tablename__ = 'risk_exceptions'
     id: Mapped[int] = mapped_column(primary_key=True)
