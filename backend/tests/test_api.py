@@ -419,6 +419,14 @@ def test_mission_center_returns_prioritized_operational_queues(client):
     assert set(body['queues']) == {'urgent_review','missing_context_evidence','automated_provisional','monitor_reassess'}
     assert body['summary']['urgent_review'] == 1
 
+def test_dashboard_exposes_governance_and_remediation_metrics(client):
+    login(client)
+    create(client)
+    dashboard = client.get('/api/dashboard')
+    assert dashboard.status_code == 200
+    remediation = dashboard.json()['remediation']
+    assert {'verified_closure','ticket_coverage','backlog_aging'} <= set(remediation)
+
 def test_plugin_bulk_dry_run_reports_conflicts_without_mutation(client):
     login(client)
     finding = create(client)

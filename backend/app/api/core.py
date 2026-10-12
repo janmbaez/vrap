@@ -786,9 +786,19 @@ def dashboard(request: Request, user=Depends(require_user), db=Depends(get_db)):
     due_dates = [value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value for value in due_rows]
     overdue = sum(value < now for value in due_dates)
     due_soon = sum(now <= value <= now + timedelta(days=7) for value in due_dates)
+    workflow_rows = db.execute(select(FindingWorkflow.status, FindingWorkflow.remediation_due_at,
+                                      FindingWorkflow.remediation_evidence)
+        .join(Finding, Finding.id == FindingWorkflow.finding_id)
+        .where(Finding.workspace == workspace)).all()
+    verified = sum(status == 'Closed' and bool(evidence) for status, _, evidence in workflow_rows)
+    ticket_covered = sum(bool(evidence) for _, _, evidence in workflow_rows)
+    backlog_aging = db.scalar(select(func.count(Finding.id)).outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+        .where(Finding.workspace == workspace, active, FindingWorkflow.status.in_(['New','Investigating','Remediation Planned','Risk Review']))) or 0
     return {'total': total, 'severity': {s: severity_counts.get(s, 0) for s in levels},
             'pending': total - len(current_scores), 'completed': len(current_scores), 'exceptions': sum(row.status == 'Exception Requested' for row in assessment_rows),
-            'remediation': {'overdue': overdue, 'due_soon': due_soon, 'scheduled': len(due_dates)},
+            'remediation': {'overdue': overdue, 'due_soon': due_soon, 'scheduled': len(due_dates),
+                            'verified_closure': verified, 'ticket_coverage': ticket_covered,
+                            'backlog_aging': backlog_aging},
             'above': sum(bool(row.result.get('above_appetite')) for row in current_scores), 'within': sum(not row.result.get('above_appetite') for row in current_scores),
             'distribution': [{'name': s, 'value': sum(row.result.get('residual_level') == s for row in current_scores)} for s in levels],
             'priority': priority,
