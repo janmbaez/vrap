@@ -564,6 +564,24 @@ def test_classification_mission_tracks_review_decision(client):
     }).status_code == 200
     assert client.get(f"/api/assets/{asset['id']}/classification-mission").json()['status'] == 'Rejected'
 
+def test_classification_mission_validates_version_and_answer_contract(client):
+    login(client)
+    asset = client.post('/api/assets', json={'hostname': 'mission-validation-asset'}).json()
+    bad_version = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '0.1-old', 'current_step': 1, 'responses': {},
+    })
+    assert bad_version.status_code == 409
+    bad_answer = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '1.0-provisional', 'current_step': 2,
+        'responses': {'business.criticality': 'Extreme'},
+    })
+    assert bad_answer.status_code == 422
+    good = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '1.0-provisional', 'current_step': 2,
+        'responses': {'business.criticality': 'High', 'scope.regulatory': ['PCI DSS']},
+    })
+    assert good.status_code == 200
+
 def test_classification_questionnaire_uses_stable_versioned_ids(client):
     login(client)
     questionnaire = client.get('/api/classification-questionnaire').json()

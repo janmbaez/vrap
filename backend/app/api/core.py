@@ -17,6 +17,34 @@ from ..classification_questionnaire import QUESTIONNAIRE
 
 router = APIRouter(tags=['Workbench'])
 
+def _question_contract():
+    return {question['id']: question for step in QUESTIONNAIRE['steps'] for question in step['questions']}
+
+def _validate_mission_responses(data: ClassificationMissionDraft):
+    if data.questionnaire_version != QUESTIONNAIRE['version']:
+        raise HTTPException(409, 'Questionnaire version is no longer supported; start a new mission with the current version.')
+    contract = _question_contract()
+    # Drafts created before the versioned question contract used a small set of
+    # opaque keys. Keep accepting those historical drafts so they remain
+    # resumable, while validating every new stable question ID strictly.
+    legacy_keys = {'identity_owner', 'data_scope', 'classification'}
+    unknown = set(data.responses) - set(contract) - legacy_keys
+    if unknown:
+        raise HTTPException(422, f'Unknown questionnaire response: {sorted(unknown)[0]}')
+    for question_id, value in data.responses.items():
+        if question_id in legacy_keys:
+            continue
+        question = contract[question_id]
+        if value in (None, ''):
+            continue
+        if question['type'] == 'choice' and value not in question.get('values', []):
+            raise HTTPException(422, f'Invalid value for {question_id}')
+        if question['type'] == 'multi':
+            if not isinstance(value, list) or any(item not in question.get('values', []) for item in value):
+                raise HTTPException(422, f'Invalid values for {question_id}')
+        if question['type'] == 'text' and (not isinstance(value, str) or len(value) > 200):
+            raise HTTPException(422, f'Invalid value for {question_id}')
+
 @router.get('/saved-filters')
 def saved_filters(request: Request, user=Depends(require_user), db=Depends(get_db)):
     rows = db.scalars(select(SavedFilter).where(SavedFilter.workspace == request.state.session.workspace,
@@ -361,6 +389,7 @@ def classification_mission(id: int, request: Request, user=Depends(require_user)
 
 @router.put('/assets/{id}/classification-mission')
 def save_classification_mission(id: int, data: ClassificationMissionDraft, request: Request, user=Depends(writer), db=Depends(get_db)):
+    _validate_mission_responses(data)
     asset = db.get(Asset, id)
     if not asset or asset.workspace != request.state.session.workspace:
         raise HTTPException(404, 'Asset not found')

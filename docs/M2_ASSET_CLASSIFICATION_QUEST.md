@@ -1,6 +1,6 @@
 # M2 — Asset Classification Quest
 
-**Status:** In progress — protected-change request and reviewer flow delivered locally on 2026-10-12.
+**Status:** In progress — protected-change request and reviewer flow delivered locally on 2026-10-12; questionnaire validation added on 2026-10-12.
 
 ## Delivered first slice
 
@@ -42,3 +42,5 @@ Quest drafts now transition to **Pending GRC Approval** when their protected cha
 Migration `0012` introduces immutable, workspace-scoped mission evidence records. Each record captures the controlled source type, reference, notes, author and timestamp. Evidence attachment requires an existing mission draft, and API tests cover that precondition and workspace isolation. File upload/retention policy remains separate operational work; this slice deliberately stores references rather than raw sensitive artifacts.
 
 The Review stage now supports attaching controlled evidence references to the mission. These are listed independently from the request’s narrative evidence summary, so review evidence can be audited and reused without embedding sensitive artifacts in free text.
+
+Mission saves validate the versioned contract: stable question IDs, choice values and multi-select scope values are rejected when invalid. Legacy draft keys remain readable so historical missions are not stranded during the contract transition.
