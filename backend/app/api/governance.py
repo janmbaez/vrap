@@ -3,7 +3,7 @@ import hashlib
 import json
 import uuid
 from io import BytesIO, StringIO
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select, func, case, update, delete, or_
 from sqlalchemy.orm import aliased
@@ -20,8 +20,91 @@ from ..risk.engine import calculate
 from ..asset_rules import PROTECTED_CONTEXT_FIELDS
 from ..vulnerability_questionnaire import QUESTIONNAIRE
 from ..kpis import calculate_kpis
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(tags=['Governance'])
+
+RACI_SHEETS = {
+    'START HERE': ['TEMPLATE VERSION', 'IMPORT MODE'],
+    'TEAM DIRECTORY': ['Observed team / group', 'Source tag type', 'Support Owner assets', 'Change Owner assets', 'Patching Group assets', 'Proposed function', 'Jira project (APPROVED)', 'Jira team / queue (APPROVED)', 'Accountable manager (APPROVED)', 'Approval state', 'Auto ticket enabled?', 'Approval / evidence reference', 'Notes'],
+    'ROUTING RULES': ['Rule ID', 'Priority', 'Source', 'Match value', 'Technical lane', 'Device type', 'OS', 'Responsible candidate', 'Accountable role', 'Prerequisite', 'Confidence', 'Auto action', 'Approval state', 'Guardrails'],
+    'ASSET OVERRIDES': ['Asset UUID', 'Asset / hostname', 'Business Service ID', 'Remediation action', 'Technical lane', 'Remediation team (approved name)', 'Support Owner', 'Change Owner', 'Patching Group', 'Accountable manager', 'Approval state', 'Approval / evidence reference', 'Notes / exception reason'],
+    'PLUGIN OVERRIDES': ['Plugin ID', 'Plugin / vulnerability', 'Remediation action', 'Technical lane', 'Device type', 'OS', 'Responsible team (approved name)', 'Accountable role', 'Approval state', 'Approval / evidence reference', 'Notes / match scope'],
+    'RACI MATRIX': ['ID', 'Process / Activity', 'TVM', 'Infra Ops Mgr', 'Infra Security', 'Platform Ops', 'Client Eng.', 'Database Team', 'DevOps', 'App Dev / Owner', 'GRC / Sec Leads', 'Business/Service Owner', 'Authorized Risk Owner', 'Change/CAB', 'VRAP Automation', 'Approval state'],
+    'ROLE MAPPING': ['Source role', 'Proposed role', 'Reason', 'Approval needed'],
+    'TECH LANES': ['Technical lane', 'Source', 'Approval state', 'Notes / guardrail']
+}
+
+def _raci_parse(data):
+    from openpyxl import load_workbook
+    import io
+    book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    parsed = {}
+    for name in RACI_SHEETS:
+        if name not in book.sheetnames: raise HTTPException(422, f'Missing required worksheet: {name}')
+        rows = list(book[name].iter_rows(values_only=True)); header = None; start = 0
+        for index, row in enumerate(rows):
+            values = [str(v).strip() if v is not None else '' for v in row]
+            if values and values[0] in RACI_SHEETS[name]: header, start = values, index + 1; break
+        if not header: raise HTTPException(422, f'Missing header row in worksheet: {name}')
+        items = []
+        for row in rows[start:]:
+            values = list(row) + [None] * (len(header) - len(row))
+            if not any(v is not None and str(v).strip() for v in values): continue
+            items.append({header[i]: values[i] for i in range(len(header))})
+        parsed[name] = items
+    return parsed
+
+@router.get('/raci/template')
+def raci_template(user=Depends(require_user)):
+    from openpyxl import Workbook
+    from fastapi.responses import StreamingResponse
+    import io
+    book = Workbook(); book.remove(book.active)
+    for name, headers in RACI_SHEETS.items():
+        ws = book.create_sheet(name); ws.append(headers)
+    output = io.BytesIO(); book.save(output); output.seek(0)
+    return StreamingResponse(output, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition':'attachment; filename="VRAP_RACI_Ownership_Template.xlsx"'})
+
+@router.post('/raci/import', status_code=201)
+async def raci_import(request: Request, file: UploadFile = File(...), user=Depends(writer), db=Depends(get_db)):
+    if not file.filename.lower().endswith('.xlsx'): raise HTTPException(422, 'Upload an .xlsx workbook')
+    parsed = _raci_parse(await file.read()); workspace = _workspace(request)
+    batch = ImportBatch(owner_id=user.id, filename=file.filename, source='RACI', headers=list(parsed), mapping=parsed, counts={k: len(v) for k,v in parsed.items()}, workspace=workspace, status='Preview')
+    db.add(batch); db.add(Audit(actor_id=user.id, action='raci.imported', entity='raci_import', details=batch.counts)); db.commit(); db.refresh(batch)
+    return {'id': batch.id, 'status': batch.status, 'counts': batch.counts, 'sheets': list(parsed)}
+
+@router.get('/raci/imports')
+def raci_imports(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    rows = db.scalars(select(ImportBatch).where(ImportBatch.workspace == _workspace(request), ImportBatch.source == 'RACI').order_by(ImportBatch.id.desc())).all()
+    return [{'id': b.id, 'filename': b.filename, 'status': b.status, 'counts': b.counts, 'created_at': b.created_at.isoformat()} for b in rows]
+
+@router.post('/raci/imports/{import_id}/approve')
+def raci_approve(import_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    batch = db.get(ImportBatch, import_id)
+    if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
+    batch.status = 'Approved'; db.add(Audit(actor_id=user.id, action='raci.approved', entity='raci_import', entity_id=batch.id)); db.commit()
+    return {'id': batch.id, 'status': batch.status}
+
+@router.post('/raci/imports/{import_id}/apply')
+def raci_apply(import_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    batch = db.get(ImportBatch, import_id)
+    if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
+    if batch.status != 'Approved': raise HTTPException(409, 'RACI import must be approved before applying')
+    assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all(); asset_rows = batch.mapping.get('ASSET OVERRIDES', [])
+    applied = conflicts = unmatched = 0; matched_ids = set()
+    for row in asset_rows:
+        candidates = [a for a in assets if (row.get('Asset UUID') and a.external_id == str(row['Asset UUID'])) or (row.get('Asset / hostname') and a.hostname.lower() == str(row['Asset / hostname']).lower())]
+        if len(candidates) > 1: conflicts += 1; continue
+        if not candidates: unmatched += 1; continue
+        if str(row.get('Approval state','')).lower() not in ('approved','approved by admin'): continue
+        asset = candidates[0]; context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {})
+        for column, key in [('Support Owner','support_owner'),('Change Owner','change_owner'),('Patching Group','patching_group'),('Accountable manager','business_owner')]:
+            if row.get(column): context[key] = str(row[column]); provenance[key] = {'source':'raci','approval_state':'Approved'}
+        asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; matched_ids.add(asset.id); applied += 1
+    batch.status = 'Applied'; batch.counts = {**(batch.counts or {}), 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
+    db.add(Audit(actor_id=user.id, action='raci.applied', entity='raci_import', entity_id=batch.id, details=batch.counts)); db.commit()
+    return {'status': batch.status, 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
 
 @router.get('/assessment-questionnaire')
 def assessment_questionnaire(user=Depends(require_user)):
