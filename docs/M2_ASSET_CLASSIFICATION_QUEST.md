@@ -40,3 +40,5 @@ Quest drafts now transition to **Pending GRC Approval** when their protected cha
 ## Evidence lineage slice
 
 Migration `0012` introduces immutable, workspace-scoped mission evidence records. Each record captures the controlled source type, reference, notes, author and timestamp. Evidence attachment requires an existing mission draft, and API tests cover that precondition and workspace isolation. File upload/retention policy remains separate operational work; this slice deliberately stores references rather than raw sensitive artifacts.
+
+The Review stage now supports attaching controlled evidence references to the mission. These are listed independently from the request’s narrative evidence summary, so review evidence can be audited and reused without embedding sensitive artifacts in free text.
