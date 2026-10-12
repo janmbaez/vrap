@@ -18,3 +18,9 @@ This is a governed request/review flow, not yet the full five-stage accessible q
 - Backend: `PYTHONPATH=backend .venv/bin/pytest backend/tests -q` — 89 passed, 2 skipped.
 - Frontend: `npm --prefix frontend run build` — passed; Vite continues to report the pre-existing >500 kB bundle advisory.
 - Rollback: UI rollback leaves the request API/audit data intact. Application rollback keeps migrations additive; do not delete request or scope-history tables.
+
+## Resumable draft slice
+
+- Migration `0011` adds one workspace-scoped, versioned classification mission draft per asset. It stores the questionnaire version, current step, responses, creator/updater and timestamps separately from operative asset context.
+- The protected-change form restores its prior draft and offers **Save draft**. Draft persistence never modifies the asset, scope memberships, finding scores or approval state.
+- API tests verify draft retrieval and Demo/Production isolation. A full stepper, branching question bank, explicit owner validation, evidence objects and accessibility test suite remain subsequent M2 slices.

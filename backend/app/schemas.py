@@ -245,6 +245,12 @@ class ClassificationChangeDecision(Strict):
     justification: str = Field(min_length=1, max_length=5000)
 
 
+class ClassificationMissionDraft(Strict):
+    questionnaire_version: str = Field(default='1.0-provisional', min_length=1, max_length=50)
+    current_step: int = Field(default=1, ge=1, le=5)
+    responses: dict[str, Any] = Field(default_factory=dict, max_length=50)
+
+
 class AssetEdit(AssetUpdate):
     # Supplied by the asset editor to reject stale protected-context writes.
     expected_context_version: int | None = Field(default=None, ge=1)

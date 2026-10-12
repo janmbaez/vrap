@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision
+from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -331,6 +331,53 @@ def classification_change_requests(request: Request, status: str = '', user=Depe
         query = query.where(AssetClassificationChangeRequest.status == status)
     rows = db.scalars(query.order_by(AssetClassificationChangeRequest.id.desc())).all()
     return [_classification_request_output(db, item) for item in rows]
+
+
+def _mission_output(item):
+    return {'id': item.id, 'asset_id': item.asset_id, 'workspace': item.workspace,
+            'questionnaire_version': item.questionnaire_version, 'status': item.status,
+            'current_step': item.current_step, 'responses': item.responses,
+            'created_by': item.created_by, 'updated_by': item.updated_by,
+            'updated_at': item.updated_at.isoformat()}
+
+
+@router.get('/assets/{id}/classification-mission')
+def classification_mission(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    item = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    return _mission_output(item) if item else None
+
+
+@router.put('/assets/{id}/classification-mission')
+def save_classification_mission(id: int, data: ClassificationMissionDraft, request: Request, user=Depends(writer), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    item = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    if item:
+        item.questionnaire_version = data.questionnaire_version
+        item.current_step = data.current_step
+        item.responses = data.responses
+        item.updated_by = user.id
+        item.status = 'In Progress'
+    else:
+        item = AssetClassificationMission(asset_id=id, workspace=asset.workspace,
+            questionnaire_version=data.questionnaire_version, current_step=data.current_step,
+            responses=data.responses, created_by=user.id, updated_by=user.id, status='Draft')
+        db.add(item)
+    db.flush()
+    db.add(Audit(actor_id=user.id, action='asset.classification_mission_saved', entity='asset', entity_id=id,
+                 details={'mission_id': item.id, 'step': data.current_step, 'questionnaire_version': data.questionnaire_version}))
+    db.commit(); db.refresh(item)
+    return _mission_output(item)
 
 
 @router.post('/assets/{id}/classification-change-requests', status_code=201)

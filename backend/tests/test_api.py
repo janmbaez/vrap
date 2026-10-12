@@ -490,3 +490,19 @@ def test_classification_change_request_is_workspace_scoped(client):
     assert client.put(f"/api/classification-change-requests/{change['id']}", json={
         'status': 'Approved', 'justification': 'Guessed ID.'
     }).status_code == 404
+
+
+def test_classification_mission_draft_is_resumable_and_workspace_scoped(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'mission-asset'}).json()
+    saved = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'questionnaire_version': '1.0-provisional', 'current_step': 3,
+        'responses': {'identity_owner': 'Infrastructure', 'data_scope': 'PCI DSS'},
+    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()['status'] == 'Draft' and saved.json()['current_step'] == 3
+    resumed = client.get(f"/api/assets/{asset['id']}/classification-mission")
+    assert resumed.status_code == 200 and resumed.json()['responses']['data_scope'] == 'PCI DSS'
+    assert client.post('/api/auth/logout').status_code == 200
+    login(client, environment='Demo')
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission").status_code == 404

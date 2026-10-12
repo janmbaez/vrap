@@ -70,6 +70,21 @@ class AssetClassificationChangeRequest(Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+class AssetClassificationMission(Base):
+    __tablename__ = 'asset_classification_missions'
+    __table_args__ = (UniqueConstraint('workspace', 'asset_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'))
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    questionnaire_version: Mapped[str] = mapped_column(String(50), default='1.0-provisional')
+    status: Mapped[str] = mapped_column(String(40), default='Draft')
+    current_step: Mapped[int] = mapped_column(Integer, default=1)
+    responses: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
 class Vulnerability(Base):
     __tablename__ = 'vulnerabilities'
     id: Mapped[int] = mapped_column(primary_key=True)
