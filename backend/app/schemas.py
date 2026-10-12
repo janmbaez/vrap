@@ -377,6 +377,7 @@ class RemediationPackageUpdate(Strict):
     jira_reference: str | None = Field(default=None, max_length=300)
     due_date: date | None = None
     blockers: list[str] | None = Field(default=None, max_length=50)
+    finding_ids: list[int] | None = Field(default=None, max_length=5000)
 
 class RemediationEvidenceInput(Strict):
     evidence_type: Literal['rescan', 'test_result', 'change_record', 'other']

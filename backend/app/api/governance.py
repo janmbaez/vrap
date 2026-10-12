@@ -589,6 +589,20 @@ def update_remediation_package(package_id: int, data: RemediationPackageUpdate, 
     package = db.get(RemediationPackage, package_id)
     if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
     changes = data.model_dump(exclude_none=True)
+    finding_ids = changes.pop('finding_ids', None)
+    if finding_ids is not None:
+        ids = set(finding_ids)
+        valid = set(db.scalars(select(Finding.id).where(Finding.workspace == package.workspace, Finding.id.in_(ids))).all()) if ids else set()
+        if valid != ids:
+            raise HTTPException(422, 'All findings must belong to the current workspace')
+        existing_rows = db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id)).all()
+        existing = {row.finding_id: row for row in existing_rows}
+        for finding_id in ids - existing.keys():
+            db.add(RemediationPackageFinding(package_id=package.id, finding_id=finding_id, added_by=user.id))
+        for finding_id, row in existing.items():
+            if finding_id not in ids:
+                db.delete(row)
+        changes['finding_ids'] = sorted(ids)
     if data.status == 'Verified Closed':
         evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id, RemediationPackageEvidence.verified.is_(True))).all()
         if not any(e.evidence_type == 'rescan' for e in evidence): raise HTTPException(409, 'A verified rescan is required before closure')
