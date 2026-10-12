@@ -438,6 +438,25 @@ def test_mission_center_returns_prioritized_operational_queues(client):
     assert set(body['queues']) == {'urgent_review','missing_context_evidence','automated_provisional','monitor_reassess'}
     assert body['summary']['urgent_review'] == 1
 
+def test_remediation_package_requires_verified_rescan_before_closure(client):
+    login(client); finding = create(client)
+    package = client.post('/api/remediation-packages', json={'name':'Patch wave','remediation_action':'Patch and rescan','finding_ids':[finding['id']]})
+    assert package.status_code == 201, package.text
+    pid = package.json()['id']
+    assert client.put(f'/api/remediation-packages/{pid}', json={'status':'Verified Closed'}).status_code == 409
+    evidence = client.post(f'/api/remediation-packages/{pid}/evidence', json={'evidence_type':'rescan','reference':'scan-1'})
+    assert evidence.status_code == 201
+    assert client.post(f"/api/remediation-packages/{pid}/evidence/{evidence.json()['id']}/verify").status_code == 200
+    assert client.put(f'/api/remediation-packages/{pid}', json={'status':'Verified Closed'}).status_code == 200
+
+def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
+    login(client); create(client)
+    response = client.get('/api/kpis')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['total_findings'] >= 1 and body['assessment_coverage'] >= 0
+    assert body['workspace'] == 'Production' and body['as_of']
+
 def test_dashboard_exposes_governance_and_remediation_metrics(client):
     login(client)
     create(client)
