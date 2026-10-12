@@ -24,3 +24,7 @@ This is a governed request/review flow, not yet the full five-stage accessible q
 - Migration `0011` adds one workspace-scoped, versioned classification mission draft per asset. It stores the questionnaire version, current step, responses, creator/updater and timestamps separately from operative asset context.
 - The protected-change form restores its prior draft and offers **Save draft**. Draft persistence never modifies the asset, scope memberships, finding scores or approval state.
 - API tests verify draft retrieval and Demo/Production isolation. A full stepper, branching question bank, explicit owner validation, evidence objects and accessibility test suite remain subsequent M2 slices.
+
+## Guided quest slice
+
+The protected classification form is now a five-stage flow: identity, business context, data/regulatory scope, exposure, and review. Each forward step persists a resumable draft. The final stage presents the proposed context and submits a governed approval request; it does not publish a classification directly.
