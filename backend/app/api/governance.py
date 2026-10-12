@@ -51,7 +51,7 @@ def _bulk_context(asset, submitted):
     return Context(**effective)
 
 def _bulk_signature(finding, context, data):
-    payload = {'finding_revision': finding.revision, 'context': context.model_dump(mode='json'),
+    payload = {'context': context.model_dump(mode='json'),
                'controls': [c.model_dump(mode='json') for c in data.controls],
                'notes': data.notes, 'justification': data.justification,
                'decision': data.decision, 'status': data.status, 'workflow_status': data.workflow_status,
