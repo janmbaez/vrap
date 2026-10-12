@@ -45,6 +45,12 @@ def _validate_mission_responses(data: ClassificationMissionDraft):
         if question['type'] == 'text' and (not isinstance(value, str) or len(value) > 200):
             raise HTTPException(422, f'Invalid value for {question_id}')
 
+def _mission_history(db, mission, actor_id, action):
+    db.add(AssetClassificationMissionHistory(
+        mission_id=mission.id, asset_id=mission.asset_id, workspace=mission.workspace,
+        action=action, status=mission.status, current_step=mission.current_step,
+        responses=mission.responses or {}, actor_id=actor_id,
+    ))
 @router.get('/saved-filters')
 def saved_filters(request: Request, user=Depends(require_user), db=Depends(get_db)):
     rows = db.scalars(select(SavedFilter).where(SavedFilter.workspace == request.state.session.workspace,
@@ -409,10 +415,30 @@ def save_classification_mission(id: int, data: ClassificationMissionDraft, reque
             responses=data.responses, created_by=user.id, updated_by=user.id, status='Draft')
         db.add(item)
     db.flush()
+    _mission_history(db, item, user.id, 'draft_saved')
     db.add(Audit(actor_id=user.id, action='asset.classification_mission_saved', entity='asset', entity_id=id,
                  details={'mission_id': item.id, 'step': data.current_step, 'questionnaire_version': data.questionnaire_version}))
     db.commit(); db.refresh(item)
     return _mission_output(item)
+
+@router.get('/assets/{id}/classification-mission/history')
+def classification_mission_history(id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    asset = db.get(Asset, id)
+    if not asset or asset.workspace != request.state.session.workspace:
+        raise HTTPException(404, 'Asset not found')
+    mission = db.scalar(select(AssetClassificationMission).where(
+        AssetClassificationMission.asset_id == id,
+        AssetClassificationMission.workspace == asset.workspace,
+    ))
+    if not mission:
+        return []
+    return [{'id': row.id, 'action': row.action, 'status': row.status,
+             'current_step': row.current_step, 'responses': row.responses,
+             'actor_id': row.actor_id, 'created_at': row.created_at.isoformat()}
+            for row in db.scalars(select(AssetClassificationMissionHistory).where(
+                AssetClassificationMissionHistory.mission_id == mission.id,
+                AssetClassificationMissionHistory.workspace == asset.workspace,
+            ).order_by(AssetClassificationMissionHistory.id.desc()))]
 
 
 @router.get('/assets/{id}/classification-mission/evidence')
@@ -476,6 +502,7 @@ def request_classification_change(id: int, data: ClassificationChangeRequestInpu
                           else 'Pending GRC Approval')
         mission.current_step = 5
         mission.updated_by = user.id
+        _mission_history(db, mission, user.id, 'submitted_for_approval')
     db.add(Audit(actor_id=user.id, action='asset.classification_change_requested', entity='asset', entity_id=asset.id,
                  details={'request_id': item.id, 'before': before, 'proposed': proposed}))
     db.commit(); db.refresh(item)
@@ -552,6 +579,7 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
     if mission:
         mission.status = data.status
         mission.updated_by = user.id
+        _mission_history(db, mission, user.id, f'review_{data.status.lower()}')
     db.add(Audit(actor_id=user.id, action='asset.classification_change_' + data.status.casefold(), entity='asset', entity_id=item.asset_id,
                  details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification}))
     db.commit(); db.refresh(item)

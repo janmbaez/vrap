@@ -590,6 +590,18 @@ def test_classification_questionnaire_uses_stable_versioned_ids(client):
     assert len(question_ids) == len(set(question_ids))
     assert {'identity.business_owner', 'scope.regulatory', 'exposure.network'} <= set(question_ids)
 
+def test_classification_mission_history_is_workspace_scoped_and_resumable(client):
+    login(client, environment='Production')
+    asset = client.post('/api/assets', json={'hostname': 'mission-history-asset'}).json()
+    saved = client.put(f"/api/assets/{asset['id']}/classification-mission", json={
+        'current_step': 2, 'responses': {'business.criticality': 'High'},
+    })
+    assert saved.status_code == 200
+    history = client.get(f"/api/assets/{asset['id']}/classification-mission/history")
+    assert history.status_code == 200 and history.json()[0]['action'] == 'draft_saved'
+    login(client, environment='Demo')
+    assert client.get(f"/api/assets/{asset['id']}/classification-mission/history").status_code == 404
+
 def test_classification_evidence_requires_mission_and_is_workspace_scoped(client):
     login(client, environment='Production')
     asset = client.post('/api/assets', json={'hostname': 'evidence-asset'}).json()

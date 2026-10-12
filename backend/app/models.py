@@ -85,6 +85,20 @@ class AssetClassificationMission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
+class AssetClassificationMissionHistory(Base):
+    __tablename__ = 'asset_classification_mission_history'
+    __table_args__ = (Index('ix_asset_classification_mission_history_mission', 'mission_id', 'created_at'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    mission_id: Mapped[int] = mapped_column(ForeignKey('asset_classification_missions.id'), index=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey('assets.id'), index=True)
+    workspace: Mapped[str] = mapped_column(String(20), default='Production')
+    action: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(50))
+    current_step: Mapped[int] = mapped_column(Integer)
+    responses: Mapped[dict] = mapped_column(JSON, default=dict)
+    actor_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 class AssetClassificationEvidence(Base):
     __tablename__ = 'asset_classification_evidence'
     id: Mapped[int] = mapped_column(primary_key=True)
