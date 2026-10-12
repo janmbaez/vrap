@@ -18,6 +18,7 @@
 - The asset editor supplies the context version it loaded; stale protected-context writes are rejected with a conflict response.
 - Assessment-group detail is workspace-scoped, and the CI publish workflow’s malformed shell footer was removed and YAML-validated.
 - Tenable ingestion now keeps live writes in one transaction while progress uses a separate transaction; a failed or cancelled export cannot publish a partial finding population.
+- CI now runs Python and frontend dependency audits plus a repository secret scan before a manually-triggered image publication can proceed. Audit reports are retained as workflow artifacts for review.
 
 ## Migration and rollback
 
@@ -27,7 +28,7 @@
 
 - Replace transitional JSON provenance with independent classification/membership and approval/effective-date records.
 - Extend the shared current/stale/draft assessment denominator to every queue and export route, and define the operational policy for which non-scanner asset/control changes are material.
-- Complete the mutation-route workspace audit and add snapshot-based Tenable ingestion.
+- Complete the mutation-route workspace audit and replace the transitional Tenable transaction with durable, resumable staging for very large exports.
 - Add delegated risk-owner/GRC approval workflow for formal acceptance.
 
 ### Governed regulatory-scope memberships (current slice)
