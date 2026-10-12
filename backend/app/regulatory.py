@@ -33,13 +33,25 @@ def add_scope_memberships(db, asset, scopes, *, source_system, approval_state='P
         AssetRegulatoryScope.active.is_(True),
     )).all())
     for scope in requested - persisted:
-        db.add(AssetRegulatoryScope(
-            asset_id=asset.id,
-            scope=scope,
-            source_system=source_system,
-            source_record_id=source_record_id,
-            approval_state=approval_state,
-            verified_by=verified_by,
-            verified_at=verified_at,
+        existing = db.scalar(select(AssetRegulatoryScope).where(
+            AssetRegulatoryScope.asset_id == asset.id,
+            AssetRegulatoryScope.scope == scope,
         ))
+        if existing:
+            # Reactivate the original membership so its identity and historical
+            # approval/provenance remain intact; removal history is retained.
+            existing.active = True
+            existing.removed_at = None
+            existing.source_system = source_system
+            if source_record_id is not None:
+                existing.source_record_id = source_record_id
+            existing.approval_state = approval_state
+            existing.verified_by = verified_by
+            existing.verified_at = verified_at
+        else:
+            db.add(AssetRegulatoryScope(
+                asset_id=asset.id, scope=scope, source_system=source_system,
+                source_record_id=source_record_id, approval_state=approval_state,
+                verified_by=verified_by, verified_at=verified_at,
+            ))
     return active_scopes(db, asset) | requested

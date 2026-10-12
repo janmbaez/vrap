@@ -2,7 +2,7 @@ from copy import deepcopy
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,SyncJob,User,now
+from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,SyncJob,User,now
 from app.api.tenable import recover_stale_syncs
 from app.risk.policy import DEFAULT
 from conftest import login
@@ -519,6 +519,30 @@ def test_classification_change_request_requires_independent_approval(client, db)
     assert by_scope['PCI DSS'].active is False
     assert by_scope['SOC 2'].active is True
     assert by_scope['SOC 2'].approval_state == 'Approved'
+
+    # Re-add the approved scope and remove it again: membership identity must
+    # remain stable while the audit lifecycle records both transitions.
+    current = db.get(Asset, asset_id)
+    login(client, 'analyst')
+    readd = client.post(f'/api/assets/{asset_id}/classification-change-requests', json={
+        'expected_context_version': current.context_version, 'changes': {'regulatory': ['PCI DSS', 'SOC 2']},
+        'justification': 'PCI scope restored after approved system change.', 'evidence': 'GRC-RESTORE-1',
+    }).json()
+    login(client)
+    assert client.put(f"/api/classification-change-requests/{readd['id']}", json={'status':'Approved','justification':'GRC approved restoration.'}).status_code == 200
+    restored = {row.scope: row for row in db.scalars(select(AssetRegulatoryScope).where(AssetRegulatoryScope.asset_id == asset_id)).all()}
+    pci_id = restored['PCI DSS'].id
+    assert restored['PCI DSS'].active is True and restored['PCI DSS'].approval_state == 'Approved'
+    current = db.get(Asset, asset_id)
+    login(client, 'analyst')
+    remove_again = client.post(f'/api/assets/{asset_id}/classification-change-requests', json={
+        'expected_context_version': current.context_version, 'changes': {'regulatory': ['SOC 2']},
+        'justification': 'PCI scope removed again with approved evidence.', 'evidence': 'GRC-REMOVE-2',
+    }).json()
+    login(client)
+    assert client.put(f"/api/classification-change-requests/{remove_again['id']}", json={'status':'Approved','justification':'GRC approved removal.'}).status_code == 200
+    db.expire_all(); final = db.scalar(select(AssetRegulatoryScope).where(AssetRegulatoryScope.id == pci_id))
+    assert final.active is False and final.id == pci_id and final.removed_at is not None
 
 
 def test_classification_change_request_is_workspace_scoped(client):

@@ -19,7 +19,7 @@ def upgrade():
             sa.Column('id', sa.Integer(), primary_key=True),
             sa.Column('asset_id', sa.Integer(), sa.ForeignKey('assets.id'), nullable=False),
             sa.Column('scope', sa.String(length=40), nullable=False),
-            sa.Column('active', sa.Boolean(), nullable=False, server_default=sa.text('1')),
+            sa.Column('active', sa.Boolean(), nullable=False, server_default=sa.true()),
             sa.Column('source_system', sa.String(length=80), nullable=False, server_default='legacy'),
             sa.Column('source_record_id', sa.String(length=200)),
             sa.Column('approval_state', sa.String(length=40), nullable=False, server_default='Pending verification'),
@@ -39,7 +39,9 @@ def upgrade():
             if scope and scope != 'None':
                 exists = bind.execute(sa.text('SELECT 1 FROM asset_regulatory_scopes WHERE asset_id = :asset_id AND scope = :scope'), {'asset_id': row['id'], 'scope': str(scope)}).scalar()
                 if not exists:
-                    bind.execute(sa.text("INSERT INTO asset_regulatory_scopes (asset_id, scope, active, source_system, approval_state, valid_from) VALUES (:asset_id, :scope, 1, 'legacy', 'Pending verification', CURRENT_TIMESTAMP)"), {'asset_id': row['id'], 'scope': str(scope)})
+                    bind.execute(sa.text("INSERT INTO asset_regulatory_scopes (asset_id, scope, active, source_system, approval_state, valid_from) VALUES (:asset_id, :scope, TRUE, 'legacy', 'Pending verification', CURRENT_TIMESTAMP)"), {'asset_id': row['id'], 'scope': str(scope)})
+    # Normalize legacy integer defaults when upgrading an existing PostgreSQL table.
+    bind.execute(sa.text("UPDATE asset_regulatory_scopes SET active = TRUE WHERE active = 1"))
 
 def downgrade():
     # Membership history is retained for audit even if application code is rolled back.
