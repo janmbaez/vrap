@@ -92,9 +92,21 @@ def raci_apply(import_id: int, request: Request, user=Depends(admin), db=Depends
     if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
     if batch.status != 'Approved': raise HTTPException(409, 'RACI import must be approved before applying')
     assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all(); asset_rows = batch.mapping.get('ASSET OVERRIDES', [])
+    by_uuid, by_host, by_ip, by_service = {}, {}, {}, {}
+    for asset in assets:
+        if asset.external_id: by_uuid.setdefault(str(asset.external_id).lower(), []).append(asset)
+        if asset.hostname: by_host.setdefault(str(asset.hostname).lower(), []).append(asset)
+        if asset.ip: by_ip.setdefault(str(asset.ip).lower(), []).append(asset)
+        service = (asset.context or {}).get('business_service')
+        if service: by_service.setdefault(str(service).lower(), []).append(asset)
     applied = updated = unchanged = conflicts = unmatched = pending_approval = 0; matched_ids = set()
     for row in asset_rows:
-        candidates = [a for a in assets if (row.get('Asset UUID') and a.external_id == str(row['Asset UUID'])) or (row.get('Asset / hostname') and a.hostname.lower() == str(row['Asset / hostname']).lower()) or (row.get('IP') and a.ip == str(row['IP'])) or (row.get('Business Service ID') and (a.context or {}).get('business_service') == str(row['Business Service ID']))]
+        candidate_lists = []
+        if row.get('Asset UUID'): candidate_lists.append(by_uuid.get(str(row['Asset UUID']).lower(), []))
+        if row.get('Asset / hostname'): candidate_lists.append(by_host.get(str(row['Asset / hostname']).lower(), []))
+        if row.get('IP'): candidate_lists.append(by_ip.get(str(row['IP']).lower(), []))
+        if row.get('Business Service ID'): candidate_lists.append(by_service.get(str(row['Business Service ID']).lower(), []))
+        candidates = list({a.id: a for group in candidate_lists for a in group}.values())
         if len(candidates) > 1: conflicts += 1; continue
         if not candidates: unmatched += 1; continue
         state = str(row.get('Approval state','')).strip().lower()
