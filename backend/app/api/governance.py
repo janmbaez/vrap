@@ -92,20 +92,55 @@ def raci_apply(import_id: int, request: Request, user=Depends(admin), db=Depends
     if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
     if batch.status != 'Approved': raise HTTPException(409, 'RACI import must be approved before applying')
     assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all(); asset_rows = batch.mapping.get('ASSET OVERRIDES', [])
-    applied = conflicts = unmatched = 0; matched_ids = set()
+    applied = updated = unchanged = conflicts = unmatched = pending_approval = 0; matched_ids = set()
     for row in asset_rows:
         candidates = [a for a in assets if (row.get('Asset UUID') and a.external_id == str(row['Asset UUID'])) or (row.get('Asset / hostname') and a.hostname.lower() == str(row['Asset / hostname']).lower()) or (row.get('IP') and a.ip == str(row['IP'])) or (row.get('Business Service ID') and (a.context or {}).get('business_service') == str(row['Business Service ID']))]
         if len(candidates) > 1: conflicts += 1; continue
         if not candidates: unmatched += 1; continue
-        if str(row.get('Approval state','')).lower() in ('rejected','disabled'): continue
-        asset = candidates[0]; context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {})
+        state = str(row.get('Approval state','')).strip().lower()
+        if state in ('pending approval','pending','draft',''):
+            pending_approval += 1; continue
+        if state in ('rejected','disabled'): continue
+        if state not in ('approved','approved for use','active'):
+            pending_approval += 1; continue
+        asset = candidates[0]; context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {}); changed = False
         for column, key in [('Support Owner','it_owner'),('Change Owner','application_owner'),('Patching Group','patching_group'),('Accountable manager','business_owner'),('Remediation team (approved name)','remediation_owner')]:
-            if row.get(column): context[key] = str(row[column]); provenance[key] = {'source':'raci','approval_state':'Approved'}
-        context['raci_enabled'] = True; context['raci_roles'] = {k: row.get(k) for k in ('Support Owner','Change Owner','Patching Group','Accountable manager') if row.get(k)}
-        asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; matched_ids.add(asset.id); applied += 1
+            value = row.get(column)
+            if not value: continue
+            existing = provenance.get(key) or {}
+            if existing.get('approval_state') == 'Approved' and existing.get('source') not in ('raci','RACI'): continue
+            value = str(value)
+            if context.get(key) != value: context[key] = value; changed = True
+            provenance[key] = {'source':'raci','approval_state':'Approved'}
+        if changed:
+            context['raci_enabled'] = True; context['raci_roles'] = {k: row.get(k) for k in ('Support Owner','Change Owner','Patching Group','Accountable manager') if row.get(k)}
+            asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; updated += 1
+        else: unchanged += 1
+        matched_ids.add(asset.id); applied += 1
+    batch.status = 'Applied'; batch.counts = {**(batch.counts or {}), 'matched': applied, 'updated': updated, 'unchanged': unchanged, 'applied': updated, 'conflicts': conflicts, 'unmatched': unmatched, 'pending_approval': pending_approval}
     batch.status = 'Applied'; batch.counts = {**(batch.counts or {}), 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
     db.add(Audit(actor_id=user.id, action='raci.applied', entity='raci_import', entity_id=batch.id, details=batch.counts)); db.commit()
     return {'status': batch.status, 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
+
+@router.post('/raci/imports/{import_id}/reconcile')
+def raci_reconcile(import_id: int, request: Request, apply: bool = Query(False), user=Depends(admin), db=Depends(get_db)):
+    batch = db.get(ImportBatch, import_id)
+    if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
+    assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all()
+    candidates = [a for a in assets if (a.context or {}).get('raci_enabled') or any((v or {}).get('source') == 'raci' for v in (a.context_provenance or {}).values())]
+    removable = 0; changed = 0
+    for asset in candidates:
+        context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {}); keys = [k for k,v in provenance.items() if isinstance(v, dict) and v.get('source') == 'raci']
+        if not keys and not context.get('raci_enabled'): continue
+        removable += 1
+        if apply:
+            for key in keys: context.pop(key, None); provenance.pop(key, None)
+            context.pop('raci_roles', None); context.pop('raci_enabled', None)
+            asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; changed += 1
+    result = {'dry_run': not apply, 'candidates': len(candidates), 'reversible_assignments': removable, 'updated': changed}
+    if apply:
+        db.add(Audit(actor_id=user.id, action='raci.reconciled', entity='raci_import', entity_id=batch.id, details=result)); db.commit()
+    return result
 
 @router.post('/raci/imports/{import_id}/toggle')
 def raci_toggle(import_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
