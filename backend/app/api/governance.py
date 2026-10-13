@@ -139,6 +139,8 @@ def raci_reconcile(import_id: int, request: Request, apply: bool = Query(False),
             asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; changed += 1
     result = {'dry_run': not apply, 'candidates': len(candidates), 'reversible_assignments': removable, 'updated': changed}
     if apply:
+        batch.counts = {**(batch.counts or {}), 'matched': 0, 'updated': 0, 'unchanged': 0, 'applied': 0, 'pending_approval': len(batch.mapping.get('ASSET OVERRIDES', [])), 'reconciled': changed}
+        result['batch_counts'] = batch.counts
         db.add(Audit(actor_id=user.id, action='raci.reconciled', entity='raci_import', entity_id=batch.id, details=result)); db.commit()
     return result
 
