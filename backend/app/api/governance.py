@@ -217,12 +217,14 @@ def _bulk_context(asset, submitted):
         effective['publicly_accessible'] = None
     return Context(**effective)
 
-def _bulk_signature(finding, context, data):
+def _bulk_signature(finding, context, data, effective_status=None, effective_decision=None):
     payload = {'context': context.model_dump(mode='json'),
                'controls': [c.model_dump(mode='json') for c in data.controls],
                'notes': data.notes, 'justification': data.justification,
-               'decision': data.decision, 'status': data.status, 'workflow_status': data.workflow_status,
-               'owner_id': data.owner_id}
+               'decision': effective_decision or data.decision, 'status': effective_status or data.status, 'workflow_status': data.workflow_status,
+               'owner_id': data.owner_id, 'questionnaire_version': data.questionnaire_version,
+               'answers': data.answers, 'scenario_evidence': data.scenario_evidence,
+               'scenario_notes': data.scenario_notes}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 def _bulk_job_output(db, job):
@@ -231,6 +233,7 @@ def _bulk_job_output(db, job):
     return {'id': job.id, 'status': job.status, 'vulnerability_id': job.vulnerability_id,
             'correlation_id': job.correlation_id, 'total': job.total, 'processed': job.processed,
             'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed,
+            'pending': max(0, job.total - job.processed),
             'progress_percent': round((job.processed / job.total) * 100) if job.total else 100,
             'error': job.error, 'errors': errors,
             'created_at': job.created_at.isoformat(), 'started_at': job.started_at.isoformat() if job.started_at else None,
@@ -264,14 +267,24 @@ def run_bulk_assessment_job(job_id: int, request_db=None):
                 asset = db.get(Asset, finding.asset_id)
                 effective_context = _bulk_context(asset, data.context)
                 method, result = preview_score(db, finding, AssessmentInput(context=effective_context, controls=data.controls, methodology_id=active_methodology(db).id, expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status))
-                signature = _bulk_signature(finding, effective_context, data)
+                if data.decision == 'Within Risk Appetite' and result['above_appetite']:
+                    raise ValueError('Residual risk is above appetite; select Remediation Required, Exception Required, or Escalation Required')
                 latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+                effective_status = ('Context Required' if result['missing_required'] else
+                                    'Pending Validation' if data.answers.get('applicability') == 'Needs validation' or data.decision == 'Needs Further Assessment' else 'Assessed')
+                effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else data.decision
+                signature = _bulk_signature(finding, effective_context, data, effective_status, effective_decision)
                 if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision:
                     item.status, job.skipped = 'Skipped', job.skipped + 1
                 else:
                     finding.revision += 1
-                    context_json = effective_context.model_dump(mode='json'); context_json['_bulk_signature'] = signature
-                    assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=job.requested_by, context=context_json, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+                    context_json = effective_context.model_dump(mode='json'); context_json.update({
+                        '_bulk_signature': signature,
+                        '_technical_investigation': {'questionnaire_version': data.questionnaire_version, 'answers': data.answers,
+                            'evidence': data.scenario_evidence, 'evidence_notes': data.scenario_notes},
+                    })
+                    assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=job.requested_by, context=context_json, notes=data.notes, justification=data.justification, decision=effective_decision, status=data.status)
+                    assessment.status = effective_status
                     db.add(assessment); db.flush()
                     rules = {rule['name']: rule for rule in method.configuration['controls']}
                     for control in data.controls:
@@ -393,7 +406,8 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
     from .core import preview_score
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace); _owner(db, data.owner_id)
     query = select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)
-    findings = list(db.scalars(query))
+    all_findings = list(db.scalars(query))
+    findings = all_findings
     if data.active_only:
         findings = [finding for finding in findings if (db.get(FindingWorkflow, finding.id) or FindingWorkflow(status='New')).status != 'Closed']
     if not findings: raise HTTPException(404, 'No findings are available for this plugin')
@@ -414,30 +428,52 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
         assessment_data = AssessmentInput(context=effective_context, controls=data.controls, methodology_id=methodology.id,
             expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
         method, result = preview_score(db, finding, assessment_data)
-        if data.decision == 'Within Risk Appetite' and result['above_appetite']:
-            raise HTTPException(422, 'Residual risk is above appetite for one or more affected assets')
-        if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
-            raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
         prepared.append((finding, method, result, effective_context))
     if data.dry_run:
         latest_by_finding = {finding.id: db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1)) for finding, _, _, _ in prepared}
         unchanged = changed = 0; distribution = {}; regulatory = {}
         for finding, _, result, context in prepared:
             latest = latest_by_finding[finding.id]
-            signature = _bulk_signature(finding, context, data)
+            effective_status = ('Context Required' if result['missing_required'] else
+                                'Pending Validation' if data.answers.get('applicability') == 'Needs validation' or data.decision == 'Needs Further Assessment' else 'Assessed')
+            effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else data.decision
+            signature = _bulk_signature(finding, context, data, effective_status, effective_decision)
             if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision: unchanged += 1
             else: changed += 1
             level = result.get('residual_level', 'Unknown'); distribution[level] = distribution.get(level, 0) + 1
             for scope in context.regulatory: regulatory[scope] = regulatory.get(scope, 0) + 1
-        all_findings = db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)).all()
         excluded = len(all_findings) - len(prepared)
         cohorts = {}
         for finding, _, _, context in prepared:
             key = '|'.join([context.environment or 'Unknown', context.exposure or 'Unknown', ','.join(sorted(context.regulatory)) or 'None'])
             cohorts[key] = cohorts.get(key, 0) + 1
+        conflict_ids = {item['finding_id'] for item in conflicts}
+        categories = {'ready': [], 'missing_context': [], 'above_appetite': [], 'conflicting_or_excluded': []}
+        for finding, _, result, context in prepared:
+            item = {'finding_id': finding.id, 'asset_id': finding.asset_id,
+                    'residual_score': result.get('residual_score'), 'residual_level': result.get('residual_level'),
+                    'missing_fields': result.get('missing_required', [])}
+            if finding.id in conflict_ids:
+                item['reason'] = 'Submitted values conflict with authoritative asset context'
+                categories['conflicting_or_excluded'].append(item)
+            elif result['missing_required']:
+                item['permissible_actions'] = ['Complete asset classification', 'Submit as Context Required']
+                categories['missing_context'].append(item)
+            elif result['above_appetite']:
+                item['permissible_actions'] = ['Remediation Required', 'Exception Required', 'Escalation Required']
+                categories['above_appetite'].append(item)
+            else:
+                categories['ready'].append(item)
+        for finding in all_findings:
+            if finding not in findings:
+                categories['conflicting_or_excluded'].append({'finding_id': finding.id, 'asset_id': finding.asset_id, 'reason': 'Closed finding excluded by active-only scope'})
         return {'dry_run': True, 'findings': len(prepared), 'assets_affected': len({finding.asset_id for finding,_,_,_ in prepared}),
                 'changed': changed, 'unchanged': unchanged, 'excluded': excluded, 'conflicts': conflicts,
                 'regulatory_scope': regulatory, 'cohorts': [{'name': k, 'findings': v} for k, v in cohorts.items()],
+                'scope': {'total_findings': len(all_findings), 'active_findings': len(findings), 'eligible_findings': changed,
+                          'existing_assessments': sum(1 for value in latest_by_finding.values() if value),
+                          'excluded_findings': excluded, 'affected_assets': len({finding.asset_id for finding,_,_,_ in prepared})},
+                'categories': {key: {'count': len(value), 'items': value[:100]} for key, value in categories.items()},
                 'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
                                  'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required']), 'distribution': distribution}}
     key = data.idempotency_key or str(uuid.uuid4())

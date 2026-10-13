@@ -143,9 +143,16 @@ def assessment_group(vulnerability_id: int, request: Request, limit: int = Query
     base = (select(Finding).join(Asset).where(Finding.workspace == request.state.session.workspace,
                                                 Finding.vulnerability_id == vulnerability_id).order_by(Asset.hostname, Finding.id))
     total = db.scalar(select(func.count()).select_from(base.order_by(None).subquery())) or 0
+    closed = db.scalar(select(func.count()).select_from(Finding).join(FindingWorkflow, FindingWorkflow.finding_id == Finding.id).where(
+        Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id,
+        FindingWorkflow.status == 'Closed')) or 0
+    assessed = db.scalar(select(func.count(func.distinct(Assessment.instance_id))).join(Finding, Finding.id == Assessment.instance_id).where(
+        Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id)) or 0
     rows = db.scalars(base.limit(limit).offset(offset)).all()
     return {'id': vulnerability.id, 'name': vulnerability.name, 'plugin_id': vulnerability.plugin_id, 'cves': vulnerability.cves,
-            'total': total, 'items': [{'finding_id': finding.id, 'asset': detail(db, finding)['asset'],
+            'total': total, 'active': total - closed, 'closed': closed, 'assessed': assessed,
+            'assets': db.scalar(select(func.count(func.distinct(Finding.asset_id))).where(Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id)) or 0,
+            'items': [{'finding_id': finding.id, 'asset': detail(db, finding)['asset'],
                                       'context': db.get(Asset, finding.asset_id).context,
                                       'status': detail(db, finding)['status']} for finding in rows]}
 

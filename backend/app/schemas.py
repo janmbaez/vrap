@@ -354,6 +354,21 @@ class PluginBulkAssessmentInput(Strict):
     def unique_controls(self):
         if len({control.name for control in self.controls}) != len(self.controls):
             raise ValueError('Duplicate controls are not allowed')
+        # Legacy API callers remain supported; the guided quest is schema
+        # validated once it submits any versioned investigation material.
+        if self.answers or self.scenario_evidence or self.scenario_notes:
+            applicability = self.answers.get('applicability')
+            if applicability not in ('Applicable', 'Not applicable', 'Needs validation'):
+                raise ValueError('A valid applicability answer is required')
+            if applicability == 'Applicable':
+                required = ('attack_prerequisite', 'exploit_validation', 'remediation_feasibility', 'internet_exposure')
+                missing = [field for field in required if not self.answers.get(field)]
+                if missing:
+                    raise ValueError('Required technical answers are missing: ' + ', '.join(missing))
+            if not self.scenario_evidence:
+                raise ValueError('At least one technical evidence reference is required')
+            if not self.scenario_notes.strip():
+                raise ValueError('Technical evidence notes are required')
         return self
 
 class WorkflowInput(Strict):

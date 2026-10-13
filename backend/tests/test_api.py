@@ -3,7 +3,7 @@ import pytest
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,ImportRow,IntegrationSettings,SyncJob,User,now
+from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,Finding,FindingWorkflow,ImportRow,IntegrationSettings,SyncJob,User,Vulnerability,now
 from app.api.tenable import recover_stale_syncs
 from app.risk.policy import DEFAULT
 from conftest import login
@@ -540,13 +540,66 @@ def test_vulnerability_questionnaire_and_preview_explain_cohorts(client):
     group=next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id']=='test-100')
     response=client.post(f"/api/assessment-groups/{group['id']}/bulk-assess",json={
         'context':CONTEXT,'controls':[],'justification':'Preview scenario evidence and cohorts',
-        'answers':{'attack_prerequisite':'Low','exploit_validation':'Observed'},
+        'answers':{'applicability':'Applicable','attack_prerequisite':'Low','exploit_validation':'Observed',
+                   'remediation_feasibility':'Available','internet_exposure':'All affected assets'},
         'scenario_evidence':['TENABLE-PLUGIN-100'],'scenario_notes':'Shared synthetic evidence',
         'decision':'Remediation Required','status':'Assessed','dry_run':True})
     body=response.json()
     assert response.status_code == 200
     assert {'changed','unchanged','excluded','conflicts','regulatory_scope','cohorts'} <= body.keys()
     assert 'distribution' in body['risk_preview']
+
+def test_bulk_preview_returns_missing_context_and_job_retains_investigation(client):
+    login(client); finding = create(client)
+    group = next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id'] == 'test-100')
+    payload = {'context':{}, 'controls':[], 'justification':'Validated shared technical investigation',
+        'answers':{'applicability':'Applicable','attack_prerequisite':'Low','exploit_validation':'Observed',
+                   'remediation_feasibility':'Available','internet_exposure':'All affected assets'},
+        'scenario_evidence':['SCAN-100'], 'scenario_notes':'Scanner output reviewed',
+        'decision':'Remediation Required','status':'Assessed'}
+    preview = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json={**payload,'dry_run':True})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()['categories']['missing_context']['count'] == 1
+    queued = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json=payload)
+    assert queued.status_code == 200, queued.text
+    finished = client.get(f"/api/bulk-assessment-jobs/{queued.json()['id']}").json()
+    assert finished['succeeded'] == 1 and finished['processed'] == finished['total']
+    detail = client.get(f"/api/findings/{finding['id']}").json()
+    assert detail['status'] == 'Context Required'
+    assert detail['context']['_technical_investigation']['answers']['applicability'] == 'Applicable'
+
+def test_bulk_preview_and_job_handle_one_thousand_mixed_findings(client, db):
+    login(client)
+    vulnerability = Vulnerability(identity='mixed-1000', plugin_id='mixed-1000', name='Mixed bulk population', cves=[],
+                                  technical={'severity':'High','cvss':8.0,'vpr':7.5})
+    db.add(vulnerability); db.flush()
+    findings = []
+    for index in range(1000):
+        asset = Asset(hostname=f'MIXED-{index:04d}', context=CONTEXT if index % 4 else {}, workspace='Production')
+        db.add(asset); db.flush()
+        finding = Finding(asset_id=asset.id, vulnerability_id=vulnerability.id, source='Manual', workspace='Production')
+        db.add(finding); db.flush(); findings.append(finding)
+        if index < 50: db.add(FindingWorkflow(finding_id=finding.id, status='Closed', updated_by=1))
+        elif index < 60: db.add(Assessment(instance_id=finding.id, revision=0, methodology_id=1, analyst_id=1,
+                                             context={}, justification='Existing assessment', decision='Exception Required', status='Assessed'))
+    db.commit()
+    group = next(x for x in client.get('/api/assessment-groups?limit=100').json()['items'] if x['plugin_id'] == 'mixed-1000')
+    payload = {'context':{},'controls':[],'justification':'Mixed population investigation',
+        'answers':{'applicability':'Applicable','attack_prerequisite':'Low','exploit_validation':'Observed',
+                   'remediation_feasibility':'Available','internet_exposure':'All affected assets'},
+        'scenario_evidence':['SCAN-MIXED-1000'],'scenario_notes':'Validated synthetic evidence',
+        'decision':'Remediation Required','status':'Assessed'}
+    preview = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json={**payload,'dry_run':True})
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body['scope']['total_findings'] == 1000 and body['scope']['active_findings'] == 950
+    assert body['scope']['excluded_findings'] == 50 and body['scope']['existing_assessments'] == 10
+    assert body['categories']['missing_context']['count'] > 0
+    queued = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json=payload)
+    finished = client.get(f"/api/bulk-assessment-jobs/{queued.json()['id']}").json()
+    assert finished['processed'] == 950 and finished['processed'] <= finished['total'] and finished['failed'] == 0
+    preserved = db.scalar(select(Assessment).where(Assessment.instance_id == findings[55].id).order_by(Assessment.revision.desc()).limit(1))
+    assert preserved.decision == 'Exception Required'
 def test_saved_filters_are_personal_and_workspace_scoped(client):
     login(client)
     created=client.post('/api/saved-filters',json={'name':'Critical unassessed','filters':{'severity':'Critical','status':'Not Assessed','q':''}})
