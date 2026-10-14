@@ -515,6 +515,17 @@ def test_remediation_package_2_suggests_compatible_work_and_tracks_progress(clie
     refreshed = client.get('/api/remediation-packages').json()[0]
     assert refreshed['finding_statuses']['Fixed'] == 1 and refreshed['verified_findings'] == 1
 
+def test_remediation_package_linking_and_empty_package_lifecycle(client):
+    login(client); finding = create(client)
+    package = client.post('/api/remediation-packages', json={'name':'Empty coordination','remediation_action':'Configure and verify'}).json()
+    pid = package['id']; assert package['finding_ids'] == []
+    linked = client.put(f'/api/remediation-packages/{pid}', json={'link_asset_ids':[finding['asset']['id']], 'status':'In Progress'})
+    assert linked.status_code == 200 and finding['id'] in linked.json()['finding_ids']
+    edited = client.put(f'/api/remediation-packages/{pid}', json={'status':'Pending Verification','change_window':'CAB-42'})
+    assert edited.status_code == 200 and edited.json()['change_window'] == 'CAB-42'
+    removed = client.put(f'/api/remediation-packages/{pid}', json={'unlink_finding_ids':[finding['id']]})
+    assert removed.status_code == 200 and removed.json()['finding_ids'] == []
+
 def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
     login(client); create(client)
     response = client.get('/api/kpis')
