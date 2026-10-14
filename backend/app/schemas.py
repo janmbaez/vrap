@@ -392,13 +392,17 @@ class RemediationPackageInput(Strict):
 class RemediationPackageUpdate(Strict):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     remediation_action: str | None = Field(default=None, min_length=1, max_length=10000)
-    status: Literal['Open', 'In Progress', 'Blocked', 'Pending Verification', 'Verified Closed', 'Reopened'] | None = None
+    status: Literal['Planned', 'Open', 'In Progress', 'Blocked', 'Partially Remediated', 'Pending Verification', 'Verified Closed', 'Reopened'] | None = None
     owner_id: int | None = None
     jira_reference: str | None = Field(default=None, max_length=300)
     due_date: date | None = None
     blockers: list[str] | None = Field(default=None, max_length=50)
     finding_ids: list[int] | None = Field(default=None, max_length=5000)
     change_window: str | None = Field(default=None, max_length=120)
+    link_plugin_ids: list[str] | None = Field(default=None, max_length=5000)
+    link_asset_ids: list[int] | None = Field(default=None, max_length=5000)
+    link_remediation_action: str | None = Field(default=None, max_length=10000)
+    unlink_finding_ids: list[int] | None = Field(default=None, max_length=5000)
 
 class RemediationEvidenceInput(Strict):
     evidence_type: Literal['rescan', 'test_result', 'change_record', 'other']

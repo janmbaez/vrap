@@ -875,6 +875,19 @@ def list_remediation_packages(request: Request, user=Depends(require_user), db=D
 def create_remediation_package(data: RemediationPackageInput, request: Request, user=Depends(writer), db=Depends(get_db)):
     workspace = _workspace(request)
     ids = set(data.finding_ids)
+    if data.suggestion_key and not ids:
+        # Resolve suggestions server-side so large Tenable estates are never
+        # serialized into the browser just to create a package.
+        parts = data.suggestion_key.split('|', 2)
+        if len(parts) == 3:
+            action_key, product_key, platform_key = parts
+            rows = db.execute(select(Finding.id, Vulnerability.technical).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace)).all()
+            for finding_id, technical in rows:
+                t = technical if isinstance(technical, dict) else {}
+                action = str(t.get('remediation_action') or t.get('solution') or 'Unspecified').strip().casefold()
+                product = str(t.get('product') or t.get('software_family') or t.get('plugin_family') or 'Unknown').strip().casefold()
+                platform = str(t.get('os') or t.get('device_type') or 'General').strip().casefold()
+                if (action, product, platform) == (action_key, product_key, platform_key): ids.add(finding_id)
     if ids and len(db.scalars(select(Finding.id).where(Finding.workspace == workspace, Finding.id.in_(ids))).all()) != len(ids):
         raise HTTPException(422, 'All findings must belong to the current workspace')
     package = RemediationPackage(workspace=workspace, name=data.name, remediation_action=data.remediation_action, owner_id=data.owner_id,
@@ -891,6 +904,7 @@ def update_remediation_package(package_id: int, data: RemediationPackageUpdate, 
     if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
     changes = data.model_dump(exclude_none=True)
     finding_ids = changes.pop('finding_ids', None)
+    link_plugin_ids = changes.pop('link_plugin_ids', None); link_asset_ids = changes.pop('link_asset_ids', None); link_action = changes.pop('link_remediation_action', None); unlink_ids = changes.pop('unlink_finding_ids', None)
     if finding_ids is not None:
         ids = set(finding_ids)
         valid = set(db.scalars(select(Finding.id).where(Finding.workspace == package.workspace, Finding.id.in_(ids))).all()) if ids else set()
@@ -904,6 +918,18 @@ def update_remediation_package(package_id: int, data: RemediationPackageUpdate, 
             if finding_id not in ids:
                 db.delete(row)
         changes['finding_ids'] = sorted(ids)
+    if link_plugin_ids is not None or link_asset_ids is not None or link_action:
+        query = select(Finding.id).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == package.workspace)
+        if link_plugin_ids: query = query.where(Vulnerability.plugin_id.in_(link_plugin_ids))
+        if link_asset_ids: query = query.where(Finding.asset_id.in_(link_asset_ids))
+        if link_action:
+            query = query.where(or_(Vulnerability.technical['remediation_action'].as_string() == link_action, Vulnerability.technical['solution'].as_string() == link_action))
+        existing_ids = set(db.scalars(select(RemediationPackageFinding.finding_id).where(RemediationPackageFinding.package_id == package.id)).all())
+        for fid in set(db.scalars(query).all()) - existing_ids: db.add(RemediationPackageFinding(package_id=package.id, finding_id=fid, added_by=user.id))
+        changes['linked_by_filter'] = {'plugins': link_plugin_ids or [], 'assets': link_asset_ids or [], 'action': link_action}
+    if unlink_ids:
+        for row in db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id, RemediationPackageFinding.finding_id.in_(unlink_ids))).all(): db.delete(row)
+        changes['unlinked_finding_ids'] = unlink_ids
     if data.status == 'Verified Closed':
         rows = db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id)).all()
         if not rows or any(r.remediation_status != 'Fixed' or not r.verified_at for r in rows):
