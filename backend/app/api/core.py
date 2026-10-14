@@ -11,7 +11,7 @@ from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
 from ..query import finding_query, validate_filters
-from ..assessment_state import assessment_currency, latest_assessment_revision
+from ..assessment_state import assessment_currency, latest_assessment_revision, current_assessment_columns
 from ..regulatory import active_scopes, add_scope_memberships, normalize_scopes
 from ..classification_questionnaire import QUESTIONNAIRE
 
@@ -113,14 +113,24 @@ def create_finding(data: FindingCreate, request: Request, user=Depends(writer), 
 @router.get('/assessment-groups')
 def assessment_groups(request: Request, q: str = '', severity: str = '', limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     workspace = request.state.session.workspace
-    assessed_ids = select(Assessment.instance_id).distinct().subquery()
+    methodology = active_methodology(db)
+    latest = latest_assessment_revision()
+    # Progress must use the same completion contract as the dashboard: only the
+    # latest revision, current methodology, completed status, and persisted score.
+    current_assessed = (select(Assessment.instance_id.label('finding_id'))
+                        .join(latest, (latest.c.finding_id == Assessment.instance_id) & (latest.c.revision == Assessment.revision))
+                        .join(RiskScore, RiskScore.assessment_id == Assessment.id)
+                        .where(current_assessment_columns(Assessment.status, Assessment.revision,
+                                                          Finding.revision, Assessment.methodology_id,
+                                                          methodology.id, RiskScore.result))
+                        .distinct().subquery())
     severity_value = func.coalesce(Finding.observed['severity'].as_string(), Vulnerability.technical['severity'].as_string())
     severity_rank = case((severity_value == 'Critical', 4), (severity_value == 'High', 3), (severity_value == 'Medium', 2), (severity_value == 'Low', 1), else_=0)
     query = (select(Vulnerability.id, Vulnerability.name, Vulnerability.plugin_id,
                     func.count(Finding.id).label('findings'), func.count(func.distinct(Finding.asset_id)).label('assets'),
-                    func.count(assessed_ids.c.instance_id).label('assessed'), func.max(severity_rank).label('severity_rank'))
+                    func.count(current_assessed.c.finding_id).label('assessed'), func.max(severity_rank).label('severity_rank'))
              .join(Finding, Finding.vulnerability_id == Vulnerability.id)
-             .outerjoin(assessed_ids, assessed_ids.c.instance_id == Finding.id)
+             .outerjoin(current_assessed, current_assessed.c.finding_id == Finding.id)
              .where(Finding.workspace == workspace))
     if q:
         query = query.where((Vulnerability.name.ilike(f'%{q}%')) | (Vulnerability.plugin_id.ilike(f'%{q}%')) | (Vulnerability.cves.cast(Text).ilike(f'%{q}%')))
