@@ -629,6 +629,30 @@ def test_bulk_not_applicable_requires_evidence_and_creates_no_risk_score(client,
     assert detail['status'] == 'Not Applicable' and detail['saved_score'] is None
     assert db.scalar(select(RiskScore).join(Assessment).where(Assessment.instance_id == finding['id'])) is None
 
+def test_approved_asset_context_recalculates_completed_investigation(client, db):
+    login(client); finding = create(client)
+    group = next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id'] == 'test-100')
+    payload = {'context': {}, 'controls': [], 'justification': 'Technical investigation completed pending authoritative classification.',
+               'answers': {'applicability': 'Applicable', 'attack_prerequisite': 'Low', 'exploit_validation': 'Observed',
+                           'remediation_feasibility': 'Available', 'internet_exposure': 'All affected assets'},
+               'scenario_evidence': ['SCAN-CONTEXT-1'], 'scenario_notes': 'Scanner evidence reviewed.',
+               'decision': 'Remediation Required', 'status': 'Assessed'}
+    queued = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json=payload)
+    assert queued.status_code == 200
+    assert client.get(f"/api/findings/{finding['id']}").json()['status'] == 'Context Required'
+    asset = client.get('/api/assets').json()['items'][0]
+    login(client, 'analyst')
+    request = client.post(f"/api/assets/{asset['id']}/classification-change-requests", json={
+        'expected_context_version': asset['context_version'], 'changes': CONTEXT,
+        'justification': 'BIA and service inventory approved.', 'evidence': 'BIA-CONTEXT-1'})
+    assert request.status_code == 201
+    login(client)
+    approved = client.put(f"/api/classification-change-requests/{request.json()['id']}", json={
+        'status': 'Approved', 'justification': 'GRC approved authoritative context.'})
+    assert approved.status_code == 200, approved.text
+    detail = client.get(f"/api/findings/{finding['id']}").json()
+    assert detail['status'] == 'Assessed' and detail['saved_score'] is not None
+
 def test_bulk_preview_and_job_handle_one_thousand_mixed_findings(client, db):
     login(client)
     vulnerability = Vulnerability(identity='mixed-1000', plugin_id='mixed-1000', name='Mixed bulk population', cves=[],

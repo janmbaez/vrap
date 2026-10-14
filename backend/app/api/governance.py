@@ -241,6 +241,7 @@ def _bulk_job_output(db, job):
             'not_applicable': outcome_counts.get('Not Applicable', 0),
             'context_required': outcome_counts.get('Context Required', 0),
             'pending_validation': outcome_counts.get('Pending Validation', 0),
+            'technical_completed': sum(outcome_counts.values()),
             'error': job.error, 'errors': errors,
             'created_at': job.created_at.isoformat(), 'started_at': job.started_at.isoformat() if job.started_at else None,
             'finished_at': job.finished_at.isoformat() if job.finished_at else None}
@@ -732,6 +733,7 @@ def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1)
     rows = db.execute(statement.order_by(Finding.id.desc())).all()
     queues = {key: [] for key in ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')}
     today = datetime.now(timezone.utc).date()
+    required_context = active_methodology(db).configuration.get('required_context', [])
     for finding, vuln, asset, workflow, assessment in rows:
         status = workflow.status if workflow else 'New'
         tech = {**(vuln.technical or {}), **(finding.observed or {}).get('technical', finding.observed or {})}
@@ -743,17 +745,19 @@ def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1)
         if context.get('exposure') == 'Internet Facing' or context.get('publicly_accessible') is True: factors.append('Internet exposed')
         overdue = bool(workflow and workflow.remediation_due_at and workflow.remediation_due_at.date() < today and status not in ('Closed', 'Accepted'))
         if overdue: factors.append('Overdue')
-        missing = not assessment or not context.get('asset_criticality') or not context.get('business_criticality')
+        missing_fields = [field for field in required_context if context.get(field) in (None, '', [])]
+        missing = not assessment or bool(missing_fields)
         stale = bool(assessment and assessment.revision != finding.revision)
         severity = str(tech.get('severity') or '').lower()
         priority = (40 if tech.get('kev') else 0) + (25 if tech.get('exploit_available') else 0) + (20 if context.get('asset_criticality') in ('Critical','High') else 0) + (15 if context.get('exposure') == 'Internet Facing' else 0) + (15 if overdue else 0) + (10 if missing else 0) + (10 if stale else 0) + ({'critical':20,'high':10,'medium':4}.get(severity, 0))
-        if severity in ('critical', 'high') or priority >= 45 or overdue or status in ('Assessment In Progress', 'Above Risk Appetite'): bucket = 'urgent_review'
+        if assessment and assessment.status == 'Context Required': bucket = 'missing_context_evidence'
+        elif severity in ('critical', 'high') or priority >= 45 or overdue or status in ('Assessment In Progress', 'Above Risk Appetite'): bucket = 'urgent_review'
         elif stale or (not assessment and status not in ('Closed', 'Accepted')): bucket = 'monitor_reassess' if stale else 'automated_provisional'
         elif missing: bucket = 'missing_context_evidence'
         else: bucket = 'monitor_reassess'
         item = {'finding_id': finding.id, 'name': vuln.name, 'asset': asset.hostname, 'plugin_id': vuln.plugin_id,
                 'status': status, 'owner_id': workflow.owner_id if workflow else None, 'priority_score': priority,
-                'priority_factors': factors, 'overdue': overdue, 'recommended_action':
+                'missing_fields': missing_fields, 'priority_factors': factors, 'overdue': overdue, 'recommended_action':
                 'Reassess changed evidence' if stale else ('Collect authoritative context/evidence' if missing else ('Address overdue remediation' if overdue else 'Open finding and complete the assessment'))}
         queues[bucket].append(item)
     for items in queues.values(): items.sort(key=lambda x: (-x['priority_score'], x['finding_id']))

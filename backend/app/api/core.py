@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
+from ..schemas import FindingCreate, AssessmentInput, Context, Control, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -199,9 +199,15 @@ def assessment_group(vulnerability_id: int, request: Request, limit: int = Query
         FindingWorkflow.status == 'Closed')) or 0
     assessed = db.scalar(select(func.count(func.distinct(Assessment.instance_id))).join(Finding, Finding.id == Assessment.instance_id).where(
         Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id)) or 0
+    risk_assessed = db.scalar(select(func.count(func.distinct(Assessment.instance_id))).join(Finding, Finding.id == Assessment.instance_id).join(RiskScore, RiskScore.assessment_id == Assessment.id).where(
+        Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id,
+        Assessment.status.in_(['Assessed', 'Above Risk Appetite', 'Remediation Required', 'Exception Requested', 'Risk Accepted']))) or 0
+    context_required = db.scalar(select(func.count(func.distinct(Assessment.instance_id))).join(Finding, Finding.id == Assessment.instance_id).where(
+        Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id, Assessment.status == 'Context Required')) or 0
     rows = db.scalars(base.limit(limit).offset(offset)).all()
     return {'id': vulnerability.id, 'name': vulnerability.name, 'plugin_id': vulnerability.plugin_id, 'cves': vulnerability.cves,
-            'total': total, 'active': total - closed, 'closed': closed, 'assessed': assessed,
+            'total': total, 'active': total - closed, 'closed': closed, 'assessed': risk_assessed,
+            'technical_completed': assessed, 'risk_assessed': risk_assessed, 'context_required': context_required,
             'assets': db.scalar(select(func.count(func.distinct(Finding.asset_id))).where(Finding.workspace == request.state.session.workspace, Finding.vulnerability_id == vulnerability_id)) or 0,
             'items': [{'finding_id': finding.id, 'asset': detail(db, finding)['asset'],
                                       'context': db.get(Asset, finding.asset_id).context,
@@ -603,6 +609,45 @@ def request_classification_change(id: int, data: ClassificationChangeRequestInpu
     db.commit(); db.refresh(item)
     return _classification_request_output(db, item)
 
+def _recalculate_context_required(db, asset, actor_id):
+    """Promote completed technical investigations after approved context arrives.
+
+    A new revision is created only when the current finding revision and context
+    now satisfy the methodology. Existing investigation evidence and decisions
+    remain embedded in the new assessment snapshot.
+    """
+    method = active_methodology(db)
+    context_keys = set(Context.model_fields)
+    promoted = 0
+    for finding in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.workspace == asset.workspace)).all():
+        assessment = latest_assessment(db, finding.id)
+        technical = (assessment.context or {}).get('_technical_investigation') if assessment else None
+        if not assessment or assessment.status != 'Context Required' or not technical:
+            continue
+        context = Context.model_validate({key: value for key, value in (asset.context or {}).items() if key in context_keys})
+        controls = [Control.model_validate({'name': row.name, 'effectiveness': row.effectiveness, 'applicable': row.applicable,
+                                            'validated': row.validated, 'evidence': row.evidence, 'notes': row.notes,
+                                            'design_maturity': row.design_maturity, 'operating_effectiveness': row.operating_effectiveness})
+                    for row in db.scalars(select(AssessmentControl).where(AssessmentControl.assessment_id == assessment.id)).all()]
+        input_data = AssessmentInput(context=context, controls=controls, methodology_id=method.id,
+                                     expected_revision=finding.revision, notes=assessment.notes,
+                                     justification=assessment.justification, decision=assessment.decision, status='Assessed')
+        _, result = preview_score(db, finding, input_data)
+        if result['missing_required']:
+            continue
+        new_assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id,
+                                    analyst_id=assessment.analyst_id, context={**context.model_dump(), '_technical_investigation': technical},
+                                    notes=assessment.notes, justification=assessment.justification,
+                                    decision=assessment.decision, status='Assessed')
+        db.add(new_assessment); db.flush()
+        result.update({'methodology_id': method.id, 'methodology_version': method.version,
+                       'asset_snapshot': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}})
+        db.add(RiskScore(assessment_id=new_assessment.id, result=result))
+        db.add(Audit(actor_id=actor_id, action='assessment.context_recalculated', entity='finding', entity_id=finding.id,
+                     details={'previous_assessment_id': assessment.id, 'assessment_id': new_assessment.id, 'methodology_version': method.version}))
+        promoted += 1
+    return promoted
+
 
 @router.put('/classification-change-requests/{id}')
 def decide_classification_change(id: int, data: ClassificationChangeDecision, request: Request, user=Depends(admin), db=Depends(get_db)):
@@ -666,6 +711,7 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
         asset.context_version += 1
         for finding in db.scalars(select(Finding).where(Finding.asset_id == asset.id, Finding.workspace == asset.workspace)):
             finding.revision += 1
+        recalculated = _recalculate_context_required(db, asset, user.id)
         item.applied_at = datetime.now(timezone.utc)
     mission = db.scalar(select(AssetClassificationMission).where(
         AssetClassificationMission.asset_id == item.asset_id,
@@ -676,7 +722,7 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
         mission.updated_by = user.id
         _mission_history(db, mission, user.id, f'review_{data.status.lower()}')
     db.add(Audit(actor_id=user.id, action='asset.classification_change_' + data.status.casefold(), entity='asset', entity_id=item.asset_id,
-                 details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification}))
+                 details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification, 'risk_recalculated': recalculated if data.status == 'Approved' else 0}))
     db.commit(); db.refresh(item)
     return _classification_request_output(db, item)
 
