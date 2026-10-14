@@ -34,7 +34,7 @@ export const scopeLabels: Record<string, string> = {
 export const scopeOptions: Record<string, string[]> = {
   severity: ['Critical', 'High', 'Medium', 'Low', 'Informational'], residual: ['Critical', 'High', 'Medium', 'Low', 'Informational'],
   inherent: ['Critical', 'High', 'Medium', 'Low', 'Informational'], appetite: ['Above', 'Within'],
-  status: ['Not Assessed', 'Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'],
+  status: ['Not Assessed', 'Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Not Applicable', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'],
   source: ['Tenable', 'CSV', 'Excel', 'Manual', 'Demo'], business: ['Critical', 'High', 'Medium', 'Low'],
   classification: ['Public', 'Internal', 'Confidential', 'Restricted'], regulatory: ['PCI DSS', 'SOC 2', 'SOX', 'HIPAA', 'GDPR', 'Other', 'None'],
 }

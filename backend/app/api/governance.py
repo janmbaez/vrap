@@ -230,11 +230,17 @@ def _bulk_signature(finding, context, data, effective_status=None, effective_dec
 def _bulk_job_output(db, job):
     errors = [{'finding_id': row.finding_id, 'error': row.error} for row in db.scalars(
         select(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Failed'))]
+    outcome_rows = db.execute(select(Assessment.status, func.count(Assessment.id)).join(BulkAssessmentItem, BulkAssessmentItem.assessment_id == Assessment.id).where(BulkAssessmentItem.job_id == job.id).group_by(Assessment.status)).all()
+    outcome_counts = {status: count for status, count in outcome_rows}
     return {'id': job.id, 'status': job.status, 'vulnerability_id': job.vulnerability_id,
             'correlation_id': job.correlation_id, 'total': job.total, 'processed': job.processed,
             'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed,
             'pending': max(0, job.total - job.processed),
             'progress_percent': round((job.processed / job.total) * 100) if job.total else 100,
+            'assessed': outcome_counts.get('Assessed', 0),
+            'not_applicable': outcome_counts.get('Not Applicable', 0),
+            'context_required': outcome_counts.get('Context Required', 0),
+            'pending_validation': outcome_counts.get('Pending Validation', 0),
             'error': job.error, 'errors': errors,
             'created_at': job.created_at.isoformat(), 'started_at': job.started_at.isoformat() if job.started_at else None,
             'finished_at': job.finished_at.isoformat() if job.finished_at else None}
@@ -266,13 +272,17 @@ def run_bulk_assessment_job(job_id: int, request_db=None):
                     raise ValueError('Finding changed after preflight; review conflict before retrying')
                 asset = db.get(Asset, finding.asset_id)
                 effective_context = _bulk_context(asset, data.context)
-                method, result = preview_score(db, finding, AssessmentInput(context=effective_context, controls=data.controls, methodology_id=active_methodology(db).id, expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status))
+                is_not_applicable = data.answers.get('applicability') == 'Not applicable' or data.decision == 'Not Applicable'
+                if is_not_applicable and (not data.scenario_evidence or not data.scenario_notes.strip() or not data.justification.strip()):
+                    raise ValueError('Not Applicable requires evidence references, evidence notes, and rationale')
+                method, result = preview_score(db, finding, AssessmentInput(context=effective_context, controls=data.controls, methodology_id=active_methodology(db).id, expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=('Not Applicable' if is_not_applicable else data.decision), status=data.status))
                 if data.decision == 'Within Risk Appetite' and result['above_appetite']:
                     raise ValueError('Residual risk is above appetite; select Remediation Required, Exception Required, or Escalation Required')
                 latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
-                effective_status = ('Context Required' if result['missing_required'] else
-                                    'Pending Validation' if data.answers.get('applicability') == 'Needs validation' or data.decision == 'Needs Further Assessment' else 'Assessed')
-                effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else data.decision
+                effective_status = ('Not Applicable' if is_not_applicable else
+                                    'Context Required' if result['missing_required'] else
+                                    'Pending Validation' if data.answers.get('applicability') == 'Needs validation' else 'Assessed')
+                effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else ('Not Applicable' if is_not_applicable else data.decision)
                 signature = _bulk_signature(finding, effective_context, data, effective_status, effective_decision)
                 if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision:
                     item.status, job.skipped = 'Skipped', job.skipped + 1
@@ -291,7 +301,8 @@ def run_bulk_assessment_job(job_id: int, request_db=None):
                         db.add(AssessmentControl(assessment_id=assessment.id, component=rules[control.name]['component'], **control.model_dump()))
                     asset_snapshot = {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}
                     result.update({'methodology_id': method.id, 'methodology_version': method.version, 'asset_snapshot': asset_snapshot})
-                    db.add(RiskScore(assessment_id=assessment.id, result=result))
+                    if not is_not_applicable:
+                        db.add(RiskScore(assessment_id=assessment.id, result=result))
                     workflow = db.get(FindingWorkflow, finding.id)
                     if not workflow:
                         workflow = FindingWorkflow(finding_id=finding.id, updated_by=job.requested_by); db.add(workflow)
@@ -413,6 +424,9 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
     if not findings: raise HTTPException(404, 'No findings are available for this plugin')
     if data.decision == 'Risk Accepted' or data.status == 'Risk Accepted':
         raise HTTPException(422, 'Bulk assessment cannot approve risk acceptance; use the governed exception workflow')
+    is_not_applicable = data.answers.get('applicability') == 'Not applicable' or data.decision == 'Not Applicable'
+    if is_not_applicable and (not data.scenario_evidence or not data.scenario_notes.strip() or not data.justification.strip()):
+        raise HTTPException(422, 'Not Applicable requires evidence references, evidence notes, and rationale')
     methodology = active_methodology(db)
     prepared=[]; conflicts=[]
     for finding in findings:
@@ -434,13 +448,15 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
         unchanged = changed = 0; distribution = {}; regulatory = {}
         for finding, _, result, context in prepared:
             latest = latest_by_finding[finding.id]
-            effective_status = ('Context Required' if result['missing_required'] else
-                                'Pending Validation' if data.answers.get('applicability') == 'Needs validation' or data.decision == 'Needs Further Assessment' else 'Assessed')
-            effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else data.decision
+            effective_status = ('Not Applicable' if is_not_applicable else
+                                'Context Required' if result['missing_required'] else
+                                'Pending Validation' if data.answers.get('applicability') == 'Needs validation' else 'Assessed')
+            effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else ('Not Applicable' if is_not_applicable else data.decision)
             signature = _bulk_signature(finding, context, data, effective_status, effective_decision)
             if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision: unchanged += 1
             else: changed += 1
-            level = result.get('residual_level', 'Unknown'); distribution[level] = distribution.get(level, 0) + 1
+            if not is_not_applicable:
+                level = result.get('residual_level', 'Unknown'); distribution[level] = distribution.get(level, 0) + 1
             for scope in context.regulatory: regulatory[scope] = regulatory.get(scope, 0) + 1
         excluded = len(all_findings) - len(prepared)
         cohorts = {}
@@ -451,9 +467,12 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
         categories = {'ready': [], 'missing_context': [], 'above_appetite': [], 'conflicting_or_excluded': []}
         for finding, _, result, context in prepared:
             item = {'finding_id': finding.id, 'asset_id': finding.asset_id,
-                    'residual_score': result.get('residual_score'), 'residual_level': result.get('residual_level'),
+                    'residual_score': None if is_not_applicable else result.get('residual_score'), 'residual_level': None if is_not_applicable else result.get('residual_level'),
                     'missing_fields': result.get('missing_required', [])}
-            if finding.id in conflict_ids:
+            if is_not_applicable:
+                item['determination'] = 'Not Applicable; evidence-backed and no risk score created'
+                categories['ready'].append(item)
+            elif finding.id in conflict_ids:
                 item['reason'] = 'Submitted values conflict with authoritative asset context'
                 categories['conflicting_or_excluded'].append(item)
             elif result['missing_required']:

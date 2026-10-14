@@ -277,7 +277,7 @@ def save_assessment(id: int, data: AssessmentInput, request: Request, user=Depen
             raise HTTPException(422, 'Risk acceptance decision and status must agree')
     if data.decision == 'Within Risk Appetite' and result['above_appetite']:
         raise HTTPException(422, 'Residual risk is above appetite')
-    if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
+    if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress', 'Not Applicable'):
         raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
     previous = latest_assessment(db, id)
     previous_score = db.scalar(select(RiskScore).where(RiskScore.assessment_id == previous.id)) if previous else None
@@ -294,7 +294,8 @@ def save_assessment(id: int, data: AssessmentInput, request: Request, user=Depen
             raise HTTPException(422, 'Unknown control: ' + c.name)
         db.add(AssessmentControl(assessment_id=assessment.id, component=rules[c.name]['component'], **c.model_dump()))
     result['asset_snapshot'] = detail(db, finding)['asset']
-    db.add(RiskScore(assessment_id=assessment.id, result=result))
+    if data.status != 'Not Applicable' and data.decision != 'Not Applicable':
+        db.add(RiskScore(assessment_id=assessment.id, result=result))
     db.add(Audit(actor_id=user.id, action='assessment.saved', entity='finding', entity_id=id, details={'assessment_id': assessment.id, 'previous_residual': previous_score.result['residual'] if previous_score else None, 'new_residual': result['residual'], 'reason': data.justification, 'methodology_version': method.version, 'decision': data.decision, 'status': data.status}))
     db.commit()
     return detail(db, finding)
