@@ -361,6 +361,12 @@ def test_assessment_recommendations_large_dataset_is_bounded_and_fast(client, db
     assert len(payload['groups']) <= 20
     assert payload['total_compatible_groups'] == 10
     assert elapsed < 3.0
+    categories = client.get('/api/assessment-categories')
+    assert categories.status_code == 200
+    category_payload = categories.json()
+    assert category_payload['plugin_count'] == 2725
+    assert category_payload['category_count'] <= 20
+    assert sum(len(category['plugin_ids']) for category in category_payload['categories']) == 2725
 
 def test_protected_asset_context_rejects_a_stale_editor_version(client):
     login(client)

@@ -12,7 +12,7 @@ from ..auth import require_user, writer, admin
 from ..models import (User, Asset, Vulnerability, Finding, Assessment, AssessmentControl, RiskScore, Audit, ImportBatch,
                       ImportRow, SyncJob, PluginAssessmentTemplate, FindingWorkflow, RiskException, ControlLibrary,
                       ReviewCampaign, CampaignReviewer, CampaignFinding, CampaignFindingTag, CampaignEvidence, CampaignAuditEvent,
-                      BulkAssessmentJob, BulkAssessmentItem, PluginAssessmentTemplateRevision, RemediationPackage,
+                      BulkAssessmentJob, BulkAssessmentItem, SmartAssessmentCategory, PluginAssessmentTemplateRevision, RemediationPackage,
                       RemediationPackageFinding, RemediationPackageEvidence, RemediationPackageEvent, RemediationSLAPolicy)
 from ..schemas import PluginTemplateInput, PluginBulkAssessmentInput, WorkflowInput, ExceptionInput, ExceptionDecision, ControlLibraryInput, DataCleanupRequest, DuplicateCleanupRequest, AssessmentInput, Context, RemediationPackageInput, RemediationPackageUpdate, RemediationEvidenceInput, RemediationSLAPolicyInput
 from ..services import active_methodology, cleanup_tenable_duplicates, detail, tenable_duplicate_summary
@@ -258,6 +258,8 @@ def run_bulk_assessment_job(job_id: int, request_db=None):
         db.commit()
         payload = dict(job.payload)
         snapshot_revisions = payload.pop('finding_revisions', {})
+        payload.pop('category_plugin_ids', None)
+        payload.pop('category_key', None)
         data = PluginBulkAssessmentInput(**payload)
         for item in db.scalars(select(BulkAssessmentItem).where(BulkAssessmentItem.job_id == job.id, BulkAssessmentItem.status == 'Pending').order_by(BulkAssessmentItem.id)).all():
             db.refresh(job)
@@ -705,6 +707,90 @@ def operations(request:Request,user=Depends(require_user),db=Depends(get_db)):
 def kpis(request: Request, user=Depends(require_user), db=Depends(get_db)):
     """Single denominator/as-of KPI contract for dashboards, exports and reports."""
     return calculate_kpis(db, _workspace(request))
+
+SMART_CATEGORY_NAMES = ('Windows', 'Linux', 'Microsoft Applications', 'Databases', 'Network', 'Web Servers',
+                        'TLS', 'Identity', 'Third-Party Software', 'End-of-Life', 'Cloud', 'Containers',
+                        'Virtualization', 'Security Tools', 'Other / Manual Review')
+
+def _smart_category(technical, name, plugin_id):
+    text = ' '.join(str(technical.get(key, '')) for key in ('family','plugin_family','product','vendor','os','description','solution','name')).casefold()
+    action = str(technical.get('remediation_action') or technical.get('solution') or '').casefold()
+    if any(x in text for x in ('end of life','unsupported','obsolete','deprecated')): return 'End-of-Life'
+    if any(x in text for x in ('tls','ssl','certificate','cipher')): return 'TLS'
+    if any(x in text for x in ('identity','active directory','kerberos','ldap','saml','iam')): return 'Identity'
+    if any(x in text for x in ('database','sql server','mysql','oracle','postgres','mongodb','redis')): return 'Databases'
+    if any(x in text for x in ('web server','apache','nginx','iis','httpd')): return 'Web Servers'
+    if any(x in text for x in ('windows','microsoft')): return 'Windows' if 'office' not in text and 'sql' not in text and 'exchange' not in text else 'Microsoft Applications'
+    if any(x in text for x in ('linux','ubuntu','debian','red hat','rhel','centos','unix')): return 'Linux'
+    if any(x in text for x in ('router','switch','firewall','network','cisco','fortinet','palo alto')): return 'Network'
+    if any(x in text for x in ('aws','azure','gcp','cloud')): return 'Cloud'
+    if any(x in text for x in ('docker','kubernetes','container')): return 'Containers'
+    if any(x in text for x in ('vmware','virtualbox','hyper-v','virtualization')): return 'Virtualization'
+    if any(x in text for x in ('security tool','antivirus','edr','scanner')): return 'Security Tools'
+    if action and any(x in action for x in ('patch','upgrade','update')): return 'Third-Party Software'
+    return 'Other / Manual Review'
+
+def _smart_category_data(db, workspace):
+    state = db.scalar(select(SmartAssessmentCategory).where(SmartAssessmentCategory.workspace == workspace))
+    overrides = (state.overrides if state else {}) or {}; renames = (state.renames if state else {}) or {}
+    rows = db.execute(select(Vulnerability, func.count(Finding.id), func.count(func.distinct(Finding.asset_id))
+                             ).outerjoin(Finding, (Finding.vulnerability_id == Vulnerability.id) & (Finding.workspace == workspace))
+                      .group_by(Vulnerability.id)).all()
+    groups = {key: {'key': key, 'name': renames.get(key, key), 'plugin_ids': [], 'plugins': [], 'findings': 0, 'assets': 0,
+                    'severity': {}, 'technical_completed': 0, 'risk_assessed': 0, 'context_required': 0, 'uncertain': key == 'Other / Manual Review'} for key in SMART_CATEGORY_NAMES}
+    assessment_rows = db.execute(select(Vulnerability.plugin_id, Assessment.status, func.count(func.distinct(Assessment.instance_id)))
+        .join(Finding, Finding.vulnerability_id == Vulnerability.id).join(Assessment, Assessment.instance_id == Finding.id)
+        .where(Finding.workspace == workspace).group_by(Vulnerability.plugin_id, Assessment.status)).all()
+    counts = {}
+    for plugin_id, status, count in assessment_rows: counts.setdefault(plugin_id, {})[status] = counts.setdefault(plugin_id, {}).get(status, 0) + count
+    for vuln, finding_count, asset_count in rows:
+        key = overrides.get(str(vuln.plugin_id)) or _smart_category(vuln.technical or {}, vuln.name, vuln.plugin_id)
+        group = groups.setdefault(key, {'key': key, 'name': renames.get(key, key), 'plugin_ids': [], 'plugins': [], 'findings': 0, 'assets': 0, 'severity': {}, 'technical_completed': 0, 'risk_assessed': 0, 'context_required': 0, 'uncertain': True})
+        severity = str((vuln.technical or {}).get('severity') or 'Unknown')
+        plugin_counts = counts.get(vuln.plugin_id, {})
+        group['plugin_ids'].append(vuln.plugin_id); group['plugins'].append({'id': vuln.plugin_id, 'name': vuln.name, 'findings': finding_count, 'assets': asset_count, 'severity': severity})
+        group['findings'] += finding_count; group['assets'] += asset_count; group['severity'][severity] = group['severity'].get(severity, 0) + finding_count
+        group['technical_completed'] += sum(plugin_counts.values()); group['risk_assessed'] += sum(plugin_counts.get(s, 0) for s in ('Assessed','Above Risk Appetite','Remediation Required','Exception Requested','Risk Accepted')); group['context_required'] += plugin_counts.get('Context Required', 0)
+    return [group for group in groups.values() if group['plugin_ids']]
+
+@router.get('/assessment-categories')
+def assessment_categories(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    groups = _smart_category_data(db, _workspace(request))
+    return {'workspace': _workspace(request), 'category_count': len(groups), 'plugin_count': sum(len(g['plugin_ids']) for g in groups), 'categories': groups}
+
+@router.patch('/assessment-categories/{category_key}')
+def update_assessment_category(category_key: str, data: dict, request: Request, user=Depends(writer), db=Depends(get_db)):
+    workspace = _workspace(request); state = db.scalar(select(SmartAssessmentCategory).where(SmartAssessmentCategory.workspace == workspace))
+    if not state: state = SmartAssessmentCategory(workspace=workspace, overrides={}, renames={}, updated_by=user.id); db.add(state); db.flush()
+    target = str(data.get('merge_into') or data.get('new_category') or category_key)
+    if data.get('name'): state.renames = {**(state.renames or {}), category_key: str(data['name'])[:120]}
+    for plugin_id in data.get('plugin_ids', []) + data.get('split_plugin_ids', []): state.overrides = {**(state.overrides or {}), str(plugin_id): target}
+    if target not in SMART_CATEGORY_NAMES and target not in set((state.renames or {}).values()):
+        if len(_smart_category_data(db, workspace)) >= 20: raise HTTPException(422, 'The 20-category cap would be exceeded')
+        state.renames = {**(state.renames or {}), target: target}
+    state.updated_by = user.id
+    db.add(Audit(actor_id=user.id, action='assessment_category.updated', entity='assessment_category', entity_id=state.id, details={'category': category_key, 'changes': data}))
+    db.commit(); return {'updated': True, 'categories': _smart_category_data(db, workspace)}
+
+@router.post('/assessment-categories/{category_key}/bulk-assess')
+def bulk_assess_category(category_key: str, data: PluginBulkAssessmentInput, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):
+    workspace = _workspace(request); category = next((g for g in _smart_category_data(db, workspace) if g['key'] == category_key), None)
+    if not category: raise HTTPException(404, 'Assessment category not found')
+    plugin_ids = category['plugin_ids']; findings = db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id.in_(select(Vulnerability.id).where(Vulnerability.plugin_id.in_(plugin_ids))))).all()
+    if data.active_only:
+        findings = [f for f in findings if not (db.get(FindingWorkflow, f.id) and db.get(FindingWorkflow, f.id).status == 'Closed')]
+    if not findings: raise HTTPException(404, 'No active findings are available for this category')
+    if data.dry_run:
+        return {'dry_run': True, 'category': category_key, 'plugin_count': len(plugin_ids), 'findings': len(findings), 'assets_affected': len({f.asset_id for f in findings}), 'changed': len(findings), 'unchanged': 0, 'categories': {'ready': [], 'missing_context': [], 'above_appetite': [], 'conflicting_or_excluded': []}}
+    key = data.idempotency_key or f'category-{workspace}-{category_key}-{data.questionnaire_version}'
+    existing = db.scalar(select(BulkAssessmentJob).where(BulkAssessmentJob.workspace == workspace, BulkAssessmentJob.idempotency_key == key))
+    if existing: return _bulk_job_output(db, existing)
+    first_vuln = db.scalar(select(Vulnerability.id).where(Vulnerability.plugin_id.in_(plugin_ids)))
+    payload = data.model_dump(mode='json', exclude={'dry_run','idempotency_key'}); payload['category_key'] = category_key; payload['category_plugin_ids'] = plugin_ids; payload['finding_revisions'] = {str(f.id): f.revision for f in findings}
+    job = BulkAssessmentJob(workspace=workspace, vulnerability_id=first_vuln, requested_by=user.id, idempotency_key=key, status='Queued', active_only=data.active_only, payload=payload, finding_ids=[f.id for f in findings], total=len(findings), correlation_id=uuid.uuid4().hex)
+    db.add(job); db.flush(); db.add_all([BulkAssessmentItem(job_id=job.id, finding_id=f.id) for f in findings]); db.commit(); db.refresh(job)
+    background.add_task(run_bulk_assessment_job, job.id, db if db.bind.dialect.name == 'sqlite' else None)
+    return _bulk_job_output(db, job)
 
 @router.get('/mission-center')
 def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str = '', owner_id: int | None = None, user=Depends(require_user), db=Depends(get_db)):
