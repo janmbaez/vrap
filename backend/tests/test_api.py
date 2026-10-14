@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,Finding,FindingWorkflow,ImportRow,IntegrationSettings,SyncJob,User,Vulnerability,now
+from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,Finding,FindingWorkflow,ImportRow,IntegrationSettings,SyncJob,User,Vulnerability,RiskScore,now
 from app.api.tenable import recover_stale_syncs
 from app.risk.policy import DEFAULT
 from conftest import login
@@ -610,6 +610,24 @@ def test_bulk_preview_returns_missing_context_and_job_retains_investigation(clie
     detail = client.get(f"/api/findings/{finding['id']}").json()
     assert detail['status'] == 'Context Required'
     assert detail['context']['_technical_investigation']['answers']['applicability'] == 'Applicable'
+
+def test_bulk_not_applicable_requires_evidence_and_creates_no_risk_score(client, db):
+    login(client)
+    finding = create(client)
+    group = next(x for x in client.get('/api/assessment-groups').json()['items'] if x['plugin_id'] == 'test-100')
+    base = {'context': CONTEXT, 'controls': [], 'justification': 'Evidence confirms the plugin is not applicable to this service.',
+            'answers': {'applicability': 'Not applicable'}, 'scenario_evidence': ['APP-NA-001'],
+            'scenario_notes': 'Service inventory and vendor validation reviewed.', 'decision': 'Not Applicable', 'status': 'Assessed'}
+    response = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json={**base, 'dry_run': True})
+    assert response.status_code == 200, response.text
+    assert response.json()['risk_preview']['distribution'] == {}
+    queued = client.post(f"/api/assessment-groups/{group['id']}/bulk-assess", json=base)
+    assert queued.status_code == 200, queued.text
+    finished = client.get(f"/api/bulk-assessment-jobs/{queued.json()['id']}").json()
+    assert finished['not_applicable'] == 1 and finished['assessed'] == 0 and finished['failed'] == 0
+    detail = client.get(f"/api/findings/{finding['id']}").json()
+    assert detail['status'] == 'Not Applicable' and detail['saved_score'] is None
+    assert db.scalar(select(RiskScore).join(Assessment).where(Assessment.instance_id == finding['id'])) is None
 
 def test_bulk_preview_and_job_handle_one_thousand_mixed_findings(client, db):
     login(client)

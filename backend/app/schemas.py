@@ -128,8 +128,8 @@ class AssessmentInput(Strict):
     expected_revision: int = Field(ge=0)
     notes: str = Field(default='', max_length=10000)
     justification: str = Field(default='', max_length=5000)
-    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Risk Accepted'] = 'Needs Further Assessment'
-    status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
+    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Not Applicable', 'Risk Accepted'] = 'Needs Further Assessment'
+    status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Not Applicable', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
 
     @model_validator(mode='after')
     def unique_controls(self):
@@ -326,7 +326,7 @@ class PluginTemplateInput(Strict):
     status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed'] = 'New'
     notes: str = Field(default='', max_length=10000)
     justification: str = Field(default='', max_length=5000)
-    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required'] = 'Needs Further Assessment'
+    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Not Applicable'] = 'Needs Further Assessment'
     controls: list[Control] = Field(default_factory=list, max_length=50)
     applicability: dict[str, Any] = Field(default_factory=dict, max_length=20)
     technical_rationale: str = Field(default='', max_length=10000)
@@ -340,8 +340,8 @@ class PluginBulkAssessmentInput(Strict):
     workflow_status: Literal['New', 'Investigating', 'Remediation Planned', 'Risk Review', 'Reviewed', 'Accepted', 'Closed'] = 'Investigating'
     notes: str = Field(default='', max_length=10000)
     justification: str = Field(min_length=1, max_length=5000)
-    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Risk Accepted'] = 'Needs Further Assessment'
-    status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
+    decision: Literal['Needs Further Assessment', 'Within Risk Appetite', 'Remediation Required', 'Risk Acceptance Required', 'Exception Required', 'Escalation Required', 'Not Applicable', 'Risk Accepted'] = 'Needs Further Assessment'
+    status: Literal['Assessment In Progress', 'Context Required', 'Assessed', 'Pending Validation', 'Not Applicable', 'Above Risk Appetite', 'Exception Requested', 'Risk Accepted', 'Remediation Required', 'Closed'] = 'Assessment In Progress'
     active_only: bool = True
     dry_run: bool = False
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=120)
