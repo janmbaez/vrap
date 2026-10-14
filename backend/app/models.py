@@ -315,6 +315,16 @@ class BulkAssessmentItem(Base):
     assessment_id: Mapped[int | None] = mapped_column(ForeignKey('assessments.id'))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+class SmartAssessmentCategory(Base):
+    __tablename__ = 'smart_assessment_categories'
+    __table_args__ = (UniqueConstraint('workspace', name='uq_smart_category_workspace'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), unique=True)
+    overrides: Mapped[dict] = mapped_column(JSON, default=dict)
+    renames: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
 class FindingWorkflow(Base):
     __tablename__ = 'finding_workflows'
     finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), primary_key=True)
