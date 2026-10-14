@@ -1,4 +1,5 @@
 from copy import deepcopy
+from time import monotonic
 import pytest
 from sqlalchemy import select
 from cryptography.fernet import Fernet
@@ -321,6 +322,45 @@ def test_assessment_groups_plugin_assets_and_bulk_context(client):
     updated=client.put(f"/api/assessment-groups/{group['id']}/assets",json={'asset_group':'Windows fleet'})
     assert updated.status_code==200 and updated.json()=={'assets_updated':2,'findings_flagged':3}
     assert client.get(f"/api/findings/{other['id']}").json()['context']['asset_group']=='Windows fleet'
+
+def test_assessment_recommendations_are_bounded_and_workspace_scoped(client):
+    login(client)
+    create(client)
+    client.post('/api/findings', json={**DATA, 'hostname': 'TEST-02', 'plugin_id': 'test-101', 'name': 'Another finding'})
+    response = client.get('/api/assessment-recommendations?limit=20')
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload['groups']) <= 20
+    assert payload['target_groups'] == len(payload['groups'])
+    assert payload['total_compatible_groups'] >= 1
+    assert all(group['findings'] >= 1 and group['plugins'] for group in payload['groups'])
+
+def test_assessment_recommendations_large_dataset_is_bounded_and_fast(client, db):
+    """Acceptance guard for the recommendation query at the expected plugin scale."""
+    login(client)
+    assets = [Asset(hostname=f'PERF-{index:04d}', workspace='Production') for index in range(2725)]
+    db.add_all(assets)
+    db.flush()
+    vulnerabilities = [Vulnerability(identity=f'perf-{index}', plugin_id=f'perf-{index}',
+                                      name=f'Performance plugin {index}',
+                                      technical={'severity': 'Medium', 'remediation_action': f'Action {index % 10}',
+                                                 'software_family': f'Family {index % 5}', 'technical_lane': 'server'})
+                       for index in range(2725)]
+    db.add_all(vulnerabilities)
+    db.flush()
+    findings = [Finding(asset_id=assets[index].id, vulnerability_id=vulnerabilities[index].id,
+                        source='synthetic', observed={'severity': 'Medium'}, workspace='Production')
+                for index in range(2725)]
+    db.add_all(findings)
+    db.commit()
+    started = monotonic()
+    response = client.get('/api/assessment-recommendations?limit=20')
+    elapsed = monotonic() - started
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert len(payload['groups']) <= 20
+    assert payload['total_compatible_groups'] == 10
+    assert elapsed < 3.0
 
 def test_protected_asset_context_rejects_a_stale_editor_version(client):
     login(client)

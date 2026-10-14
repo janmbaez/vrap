@@ -144,6 +144,47 @@ def assessment_groups(request: Request, q: str = '', severity: str = '', limit: 
                                       'findings': row.findings, 'assets': row.assets, 'assessed': row.assessed,
                                       'severity': levels.get(row.severity_rank, 'Informational')} for row in rows]}
 
+@router.get('/assessment-recommendations')
+def assessment_recommendations(request: Request, limit: int = Query(20, ge=1, le=20), user=Depends(require_user), db=Depends(get_db)):
+    """Recommend compatible analyst investigation groups without changing findings.
+
+    The grouping key deliberately uses scanner-provided technical evidence only;
+    asset context, regulatory scope, ownership, and risk decisions remain
+    per-finding and are never merged by this recommendation view.
+    """
+    workspace = request.state.session.workspace
+    severity_value = func.coalesce(Finding.observed['severity'].as_string(), Vulnerability.technical['severity'].as_string())
+    query = (select(Vulnerability.name, Vulnerability.plugin_id,
+                             Vulnerability.technical, func.count(Finding.id),
+                             func.count(func.distinct(Finding.asset_id)))
+                      .join(Finding, Finding.vulnerability_id == Vulnerability.id)
+                      .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+                      .where(Finding.workspace == workspace,
+                             or_(FindingWorkflow.status.is_(None), FindingWorkflow.status != 'Closed'))
+                      .group_by(Vulnerability.name, Vulnerability.plugin_id, Vulnerability.technical)
+                      )
+    rows = db.execute(query).all()
+    groups = {}
+    for name, plugin_id, scanner_technical, finding_count, asset_count in rows:
+        technical = scanner_technical if isinstance(scanner_technical, dict) else {}
+        action = str(technical.get('remediation_action') or technical.get('solution') or 'Unspecified remediation').strip()
+        family = str(technical.get('software_family') or technical.get('product') or technical.get('plugin_family') or 'Unclassified software').strip()
+        lane = str(technical.get('technical_lane') or technical.get('device_type') or technical.get('os') or 'General').strip()
+        key = (action.casefold(), family.casefold(), lane.casefold())
+        group = groups.setdefault(key, {'name': f'{family} · {action}', 'remediation_action': action,
+            'software_family': family, 'technical_lane': lane, 'plugin_ids': [], 'findings': 0,
+            'assets': 0, 'plugins': []})
+        group['plugin_ids'].append(plugin_id)
+        group['plugins'].append({'id': plugin_id, 'name': name, 'findings': finding_count, 'assets': asset_count})
+        group['findings'] += finding_count; group['assets'] += asset_count
+    ordered = sorted(groups.values(), key=lambda item: (-item['findings'], -item['assets'], item['name']))
+    for index, group in enumerate(ordered):
+        group['rank'] = index + 1
+        group['priority'] = 'Priority' if index < limit else 'Exception review'
+        group['rationale'] = 'Shared remediation action, software family, and technical lane; asset risk remains calculated individually.'
+    return {'workspace': workspace, 'target_groups': min(limit, len(ordered)), 'total_compatible_groups': len(ordered),
+            'groups': ordered[:limit], 'exceptions': ordered[limit:]}
+
 @router.get('/assessment-groups/{vulnerability_id}')
 def assessment_group(vulnerability_id: int, request: Request, limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     vulnerability = db.get(Vulnerability, vulnerability_id)
