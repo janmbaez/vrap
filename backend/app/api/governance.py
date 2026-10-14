@@ -92,19 +92,85 @@ def raci_apply(import_id: int, request: Request, user=Depends(admin), db=Depends
     if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
     if batch.status != 'Approved': raise HTTPException(409, 'RACI import must be approved before applying')
     assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all(); asset_rows = batch.mapping.get('ASSET OVERRIDES', [])
-    applied = conflicts = unmatched = 0; matched_ids = set()
+    by_uuid, by_host, by_ip, by_service = {}, {}, {}, {}
+    for asset in assets:
+        if asset.external_id: by_uuid.setdefault(str(asset.external_id).lower(), []).append(asset)
+        if asset.hostname: by_host.setdefault(str(asset.hostname).lower(), []).append(asset)
+        if asset.ip: by_ip.setdefault(str(asset.ip).lower(), []).append(asset)
+        service = (asset.context or {}).get('business_service')
+        if service: by_service.setdefault(str(service).lower(), []).append(asset)
+    applied = updated = unchanged = conflicts = unmatched = pending_approval = 0; matched_ids = set()
     for row in asset_rows:
-        candidates = [a for a in assets if (row.get('Asset UUID') and a.external_id == str(row['Asset UUID'])) or (row.get('Asset / hostname') and a.hostname.lower() == str(row['Asset / hostname']).lower())]
+        candidate_lists = []
+        if row.get('Asset UUID'): candidate_lists.append(by_uuid.get(str(row['Asset UUID']).lower(), []))
+        if row.get('Asset / hostname'): candidate_lists.append(by_host.get(str(row['Asset / hostname']).lower(), []))
+        if row.get('IP'): candidate_lists.append(by_ip.get(str(row['IP']).lower(), []))
+        if row.get('Business Service ID'): candidate_lists.append(by_service.get(str(row['Business Service ID']).lower(), []))
+        candidates = list({a.id: a for group in candidate_lists for a in group}.values())
         if len(candidates) > 1: conflicts += 1; continue
         if not candidates: unmatched += 1; continue
-        if str(row.get('Approval state','')).lower() not in ('approved','approved by admin'): continue
-        asset = candidates[0]; context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {})
-        for column, key in [('Support Owner','support_owner'),('Change Owner','change_owner'),('Patching Group','patching_group'),('Accountable manager','business_owner')]:
-            if row.get(column): context[key] = str(row[column]); provenance[key] = {'source':'raci','approval_state':'Approved'}
-        asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; matched_ids.add(asset.id); applied += 1
+        state = str(row.get('Approval state','')).strip().lower()
+        if state in ('pending approval','pending','draft',''):
+            pending_approval += 1; continue
+        if state in ('rejected','disabled'): continue
+        if state not in ('approved','approved for use','active'):
+            pending_approval += 1; continue
+        asset = candidates[0]; context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {}); changed = False
+        for column, key in [('Support Owner','it_owner'),('Change Owner','application_owner'),('Patching Group','patching_group'),('Accountable manager','business_owner'),('Remediation team (approved name)','remediation_owner')]:
+            value = row.get(column)
+            if not value: continue
+            existing = provenance.get(key) or {}
+            if existing.get('approval_state') == 'Approved' and existing.get('source') not in ('raci','RACI'): continue
+            value = str(value)
+            if context.get(key) != value: context[key] = value; changed = True
+            provenance[key] = {'source':'raci','approval_state':'Approved'}
+        if changed:
+            context['raci_enabled'] = True; context['raci_roles'] = {k: row.get(k) for k in ('Support Owner','Change Owner','Patching Group','Accountable manager') if row.get(k)}
+            asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; updated += 1
+        else: unchanged += 1
+        matched_ids.add(asset.id); applied += 1
+    batch.status = 'Applied'; batch.counts = {**(batch.counts or {}), 'matched': applied, 'updated': updated, 'unchanged': unchanged, 'applied': updated, 'conflicts': conflicts, 'unmatched': unmatched, 'pending_approval': pending_approval}
     batch.status = 'Applied'; batch.counts = {**(batch.counts or {}), 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
     db.add(Audit(actor_id=user.id, action='raci.applied', entity='raci_import', entity_id=batch.id, details=batch.counts)); db.commit()
     return {'status': batch.status, 'applied': applied, 'conflicts': conflicts, 'unmatched': unmatched}
+
+@router.post('/raci/imports/{import_id}/reconcile')
+def raci_reconcile(import_id: int, request: Request, apply: bool = Query(False), user=Depends(admin), db=Depends(get_db)):
+    batch = db.get(ImportBatch, import_id)
+    if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
+    assets = db.scalars(select(Asset).where(Asset.workspace == batch.workspace)).all()
+    candidates = [a for a in assets if (a.context or {}).get('raci_enabled') or any((v or {}).get('source') == 'raci' for v in (a.context_provenance or {}).values())]
+    removable = 0; changed = 0
+    for asset in candidates:
+        context = dict(asset.context or {}); provenance = dict(asset.context_provenance or {}); keys = [k for k,v in provenance.items() if isinstance(v, dict) and v.get('source') == 'raci']
+        if not keys and not context.get('raci_enabled'): continue
+        removable += 1
+        if apply:
+            for key in keys: context.pop(key, None); provenance.pop(key, None)
+            context.pop('raci_roles', None); context.pop('raci_enabled', None)
+            asset.context, asset.context_provenance, asset.context_version = context, provenance, asset.context_version + 1; changed += 1
+    result = {'dry_run': not apply, 'candidates': len(candidates), 'reversible_assignments': removable, 'updated': changed}
+    if apply:
+        batch.counts = {**(batch.counts or {}), 'matched': 0, 'updated': 0, 'unchanged': 0, 'applied': 0, 'pending_approval': len(batch.mapping.get('ASSET OVERRIDES', [])), 'reconciled': changed}
+        result['batch_counts'] = batch.counts
+        db.add(Audit(actor_id=user.id, action='raci.reconciled', entity='raci_import', entity_id=batch.id, details=result)); db.commit()
+    return result
+
+@router.post('/raci/imports/{import_id}/toggle')
+def raci_toggle(import_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    batch = db.get(ImportBatch, import_id)
+    if not batch or batch.workspace != _workspace(request) or batch.source != 'RACI': raise HTTPException(404, 'RACI import not found')
+    batch.status = 'Disabled' if batch.status != 'Disabled' else 'Approved'
+    db.add(Audit(actor_id=user.id, action='raci.toggled', entity='raci_import', entity_id=batch.id, details={'status': batch.status})); db.commit()
+    return {'id': batch.id, 'status': batch.status}
+
+@router.get('/assets.csv')
+def assets_csv(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    import csv
+    out = StringIO(); writer = csv.writer(out); writer.writerow(['id','external_id','hostname','ip','os','business_owner','it_owner','application_owner','patching_group','remediation_owner','raci_enabled','workspace'])
+    for asset in db.scalars(select(Asset).where(Asset.workspace == _workspace(request)).order_by(Asset.id)).all():
+        c = asset.context or {}; writer.writerow([asset.id, asset.external_id or '', asset.hostname, asset.ip or '', asset.os or '', c.get('business_owner',''), c.get('it_owner',''), c.get('application_owner',''), c.get('patching_group',''), c.get('remediation_owner',''), c.get('raci_enabled',False), asset.workspace])
+    return StreamingResponse(iter([out.getvalue()]), media_type='text/csv', headers={'Content-Disposition':'attachment; filename=vrap-assets.csv'})
 
 @router.get('/assessment-questionnaire')
 def assessment_questionnaire(user=Depends(require_user)):
@@ -151,12 +217,14 @@ def _bulk_context(asset, submitted):
         effective['publicly_accessible'] = None
     return Context(**effective)
 
-def _bulk_signature(finding, context, data):
+def _bulk_signature(finding, context, data, effective_status=None, effective_decision=None):
     payload = {'context': context.model_dump(mode='json'),
                'controls': [c.model_dump(mode='json') for c in data.controls],
                'notes': data.notes, 'justification': data.justification,
-               'decision': data.decision, 'status': data.status, 'workflow_status': data.workflow_status,
-               'owner_id': data.owner_id}
+               'decision': effective_decision or data.decision, 'status': effective_status or data.status, 'workflow_status': data.workflow_status,
+               'owner_id': data.owner_id, 'questionnaire_version': data.questionnaire_version,
+               'answers': data.answers, 'scenario_evidence': data.scenario_evidence,
+               'scenario_notes': data.scenario_notes}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 def _bulk_job_output(db, job):
@@ -165,6 +233,7 @@ def _bulk_job_output(db, job):
     return {'id': job.id, 'status': job.status, 'vulnerability_id': job.vulnerability_id,
             'correlation_id': job.correlation_id, 'total': job.total, 'processed': job.processed,
             'succeeded': job.succeeded, 'skipped': job.skipped, 'failed': job.failed,
+            'pending': max(0, job.total - job.processed),
             'progress_percent': round((job.processed / job.total) * 100) if job.total else 100,
             'error': job.error, 'errors': errors,
             'created_at': job.created_at.isoformat(), 'started_at': job.started_at.isoformat() if job.started_at else None,
@@ -198,14 +267,24 @@ def run_bulk_assessment_job(job_id: int, request_db=None):
                 asset = db.get(Asset, finding.asset_id)
                 effective_context = _bulk_context(asset, data.context)
                 method, result = preview_score(db, finding, AssessmentInput(context=effective_context, controls=data.controls, methodology_id=active_methodology(db).id, expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status))
-                signature = _bulk_signature(finding, effective_context, data)
+                if data.decision == 'Within Risk Appetite' and result['above_appetite']:
+                    raise ValueError('Residual risk is above appetite; select Remediation Required, Exception Required, or Escalation Required')
                 latest = db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1))
+                effective_status = ('Context Required' if result['missing_required'] else
+                                    'Pending Validation' if data.answers.get('applicability') == 'Needs validation' or data.decision == 'Needs Further Assessment' else 'Assessed')
+                effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else data.decision
+                signature = _bulk_signature(finding, effective_context, data, effective_status, effective_decision)
                 if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision:
                     item.status, job.skipped = 'Skipped', job.skipped + 1
                 else:
                     finding.revision += 1
-                    context_json = effective_context.model_dump(mode='json'); context_json['_bulk_signature'] = signature
-                    assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=job.requested_by, context=context_json, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
+                    context_json = effective_context.model_dump(mode='json'); context_json.update({
+                        '_bulk_signature': signature,
+                        '_technical_investigation': {'questionnaire_version': data.questionnaire_version, 'answers': data.answers,
+                            'evidence': data.scenario_evidence, 'evidence_notes': data.scenario_notes},
+                    })
+                    assessment = Assessment(instance_id=finding.id, revision=finding.revision, methodology_id=method.id, analyst_id=job.requested_by, context=context_json, notes=data.notes, justification=data.justification, decision=effective_decision, status=data.status)
+                    assessment.status = effective_status
                     db.add(assessment); db.flush()
                     rules = {rule['name']: rule for rule in method.configuration['controls']}
                     for control in data.controls:
@@ -327,7 +406,8 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
     from .core import preview_score
     workspace = _workspace(request); vulnerability = _plugin(db, vulnerability_id, workspace); _owner(db, data.owner_id)
     query = select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)
-    findings = list(db.scalars(query))
+    all_findings = list(db.scalars(query))
+    findings = all_findings
     if data.active_only:
         findings = [finding for finding in findings if (db.get(FindingWorkflow, finding.id) or FindingWorkflow(status='New')).status != 'Closed']
     if not findings: raise HTTPException(404, 'No findings are available for this plugin')
@@ -348,30 +428,52 @@ def bulk_assess_plugin(vulnerability_id: int, data: PluginBulkAssessmentInput, b
         assessment_data = AssessmentInput(context=effective_context, controls=data.controls, methodology_id=methodology.id,
             expected_revision=finding.revision, notes=data.notes, justification=data.justification, decision=data.decision, status=data.status)
         method, result = preview_score(db, finding, assessment_data)
-        if data.decision == 'Within Risk Appetite' and result['above_appetite']:
-            raise HTTPException(422, 'Residual risk is above appetite for one or more affected assets')
-        if result['missing_required'] and data.status not in ('Context Required', 'Assessment In Progress'):
-            raise HTTPException(422, 'Required context is missing: ' + ', '.join(result['missing_required']))
         prepared.append((finding, method, result, effective_context))
     if data.dry_run:
         latest_by_finding = {finding.id: db.scalar(select(Assessment).where(Assessment.instance_id == finding.id).order_by(Assessment.revision.desc()).limit(1)) for finding, _, _, _ in prepared}
         unchanged = changed = 0; distribution = {}; regulatory = {}
         for finding, _, result, context in prepared:
             latest = latest_by_finding[finding.id]
-            signature = _bulk_signature(finding, context, data)
+            effective_status = ('Context Required' if result['missing_required'] else
+                                'Pending Validation' if data.answers.get('applicability') == 'Needs validation' or data.decision == 'Needs Further Assessment' else 'Assessed')
+            effective_decision = latest.decision if latest and latest.status in ('Assessed','Risk Accepted','Closed') else data.decision
+            signature = _bulk_signature(finding, context, data, effective_status, effective_decision)
             if latest and latest.context.get('_bulk_signature') == signature and latest.revision == finding.revision: unchanged += 1
             else: changed += 1
             level = result.get('residual_level', 'Unknown'); distribution[level] = distribution.get(level, 0) + 1
             for scope in context.regulatory: regulatory[scope] = regulatory.get(scope, 0) + 1
-        all_findings = db.scalars(select(Finding).where(Finding.workspace == workspace, Finding.vulnerability_id == vulnerability_id)).all()
         excluded = len(all_findings) - len(prepared)
         cohorts = {}
         for finding, _, _, context in prepared:
             key = '|'.join([context.environment or 'Unknown', context.exposure or 'Unknown', ','.join(sorted(context.regulatory)) or 'None'])
             cohorts[key] = cohorts.get(key, 0) + 1
+        conflict_ids = {item['finding_id'] for item in conflicts}
+        categories = {'ready': [], 'missing_context': [], 'above_appetite': [], 'conflicting_or_excluded': []}
+        for finding, _, result, context in prepared:
+            item = {'finding_id': finding.id, 'asset_id': finding.asset_id,
+                    'residual_score': result.get('residual_score'), 'residual_level': result.get('residual_level'),
+                    'missing_fields': result.get('missing_required', [])}
+            if finding.id in conflict_ids:
+                item['reason'] = 'Submitted values conflict with authoritative asset context'
+                categories['conflicting_or_excluded'].append(item)
+            elif result['missing_required']:
+                item['permissible_actions'] = ['Complete asset classification', 'Submit as Context Required']
+                categories['missing_context'].append(item)
+            elif result['above_appetite']:
+                item['permissible_actions'] = ['Remediation Required', 'Exception Required', 'Escalation Required']
+                categories['above_appetite'].append(item)
+            else:
+                categories['ready'].append(item)
+        for finding in all_findings:
+            if finding not in findings:
+                categories['conflicting_or_excluded'].append({'finding_id': finding.id, 'asset_id': finding.asset_id, 'reason': 'Closed finding excluded by active-only scope'})
         return {'dry_run': True, 'findings': len(prepared), 'assets_affected': len({finding.asset_id for finding,_,_,_ in prepared}),
                 'changed': changed, 'unchanged': unchanged, 'excluded': excluded, 'conflicts': conflicts,
                 'regulatory_scope': regulatory, 'cohorts': [{'name': k, 'findings': v} for k, v in cohorts.items()],
+                'scope': {'total_findings': len(all_findings), 'active_findings': len(findings), 'eligible_findings': changed,
+                          'existing_assessments': sum(1 for value in latest_by_finding.values() if value),
+                          'excluded_findings': excluded, 'affected_assets': len({finding.asset_id for finding,_,_,_ in prepared})},
+                'categories': {key: {'count': len(value), 'items': value[:100]} for key, value in categories.items()},
                 'risk_preview': {'above_appetite': sum(1 for _,_,result,_ in prepared if result['above_appetite']),
                                  'missing_context': sum(1 for _,_,result,_ in prepared if result['missing_required']), 'distribution': distribution}}
     key = data.idempotency_key or str(uuid.uuid4())
