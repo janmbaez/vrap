@@ -385,6 +385,9 @@ class RemediationPackageInput(Strict):
     due_date: date | None = None
     blockers: list[str] = Field(default_factory=list, max_length=50)
     finding_ids: list[int] = Field(default_factory=list, max_length=5000)
+    change_window: str | None = Field(default=None, max_length=120)
+    source: Literal['manual', 'suggested', 'smart-category', 'mission-center'] = 'manual'
+    suggestion_key: str | None = Field(default=None, max_length=300)
 
 class RemediationPackageUpdate(Strict):
     name: str | None = Field(default=None, min_length=1, max_length=200)
@@ -395,6 +398,7 @@ class RemediationPackageUpdate(Strict):
     due_date: date | None = None
     blockers: list[str] | None = Field(default=None, max_length=50)
     finding_ids: list[int] | None = Field(default=None, max_length=5000)
+    change_window: str | None = Field(default=None, max_length=120)
 
 class RemediationEvidenceInput(Strict):
     evidence_type: Literal['rescan', 'test_result', 'change_record', 'other']

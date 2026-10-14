@@ -499,6 +499,22 @@ def test_remediation_package_requires_verified_rescan_before_closure(client):
     assert reopened.status_code == 200
     assert reopened.json()['finding_ids'] == [finding['id']]
 
+def test_remediation_package_2_suggests_compatible_work_and_tracks_progress(client):
+    login(client); finding = create(client)
+    suggestions = client.get('/api/remediation-packages/suggestions')
+    assert suggestions.status_code == 200 and suggestions.json()
+    suggestion = suggestions.json()[0]
+    package = client.post('/api/remediation-packages', json={
+        'name': 'Suggested patch wave', 'remediation_action': suggestion['remediation_action'],
+        'finding_ids': [finding['id']], 'source': 'suggested', 'suggestion_key': suggestion['suggestion_key'],
+        'change_window': 'Saturday 02:00 UTC'})
+    assert package.status_code == 201
+    body = package.json(); assert body['unique_assets'] == 1 and body['finding_statuses']['Unknown'] == 1
+    evidence = client.post(f"/api/remediation-packages/{body['id']}/evidence", json={'evidence_type':'rescan','reference':'verified-scan-2'}).json()
+    assert client.post(f"/api/remediation-packages/{body['id']}/evidence/{evidence['id']}/verify").status_code == 200
+    refreshed = client.get('/api/remediation-packages').json()[0]
+    assert refreshed['finding_statuses']['Fixed'] == 1 and refreshed['verified_findings'] == 1
+
 def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
     login(client); create(client)
     response = client.get('/api/kpis')

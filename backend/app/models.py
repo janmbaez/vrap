@@ -356,6 +356,9 @@ class RemediationPackage(Base):
     created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    change_window: Mapped[str | None] = mapped_column(String(120))
+    source: Mapped[str] = mapped_column(String(30), default='manual')
+    suggestion_key: Mapped[str | None] = mapped_column(String(300), index=True)
 
 class RemediationPackageFinding(Base):
     __tablename__ = 'remediation_package_findings'
@@ -365,6 +368,10 @@ class RemediationPackageFinding(Base):
     finding_id: Mapped[int] = mapped_column(ForeignKey('vulnerability_instances.id'), index=True)
     added_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    remediation_status: Mapped[str] = mapped_column(String(30), default='Unknown', index=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    evidence_id: Mapped[int | None] = mapped_column(ForeignKey('remediation_package_evidence.id'))
 
 class RemediationPackageEvidence(Base):
     __tablename__ = 'remediation_package_evidence'

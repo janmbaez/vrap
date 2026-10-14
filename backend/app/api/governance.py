@@ -853,11 +853,17 @@ def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1)
             'generated_at': datetime.now(timezone.utc).isoformat()}
 
 def _package_output(db, package):
-    findings = db.scalars(select(RemediationPackageFinding.finding_id).where(RemediationPackageFinding.package_id == package.id)).all()
+    finding_rows = db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id)).all()
+    findings = [row.finding_id for row in finding_rows]
     evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id).order_by(RemediationPackageEvidence.id.desc())).all()
+    verified = sum(1 for row in finding_rows if row.remediation_status == 'Fixed' and row.verified_at)
+    statuses = {s: sum(1 for row in finding_rows if row.remediation_status == s) for s in ('Fixed','Active','Reopened','Exception','Unknown')}
     return {'id': package.id, 'name': package.name, 'workspace': package.workspace, 'remediation_action': package.remediation_action,
             'owner_id': package.owner_id, 'jira_reference': package.jira_reference, 'due_date': package.due_date.isoformat() if package.due_date else None,
+            'change_window': package.change_window, 'source': package.source, 'suggestion_key': package.suggestion_key,
             'status': package.status, 'blockers': package.blockers or [], 'finding_ids': findings,
+            'finding_statuses': statuses, 'unique_assets': db.scalar(select(func.count(func.distinct(Finding.asset_id))).where(Finding.id.in_(findings))) or 0,
+            'verified_findings': verified, 'closure_blockers': [f'{len(findings)-verified} findings require verified remediation evidence'] if findings and verified < len(findings) else [],
             'evidence': [{'id': e.id, 'type': e.evidence_type, 'reference': e.reference, 'verified': e.verified, 'created_at': e.created_at.isoformat()} for e in evidence]}
 
 @router.get('/remediation-packages')
@@ -872,7 +878,8 @@ def create_remediation_package(data: RemediationPackageInput, request: Request, 
     if ids and len(db.scalars(select(Finding.id).where(Finding.workspace == workspace, Finding.id.in_(ids))).all()) != len(ids):
         raise HTTPException(422, 'All findings must belong to the current workspace')
     package = RemediationPackage(workspace=workspace, name=data.name, remediation_action=data.remediation_action, owner_id=data.owner_id,
-        jira_reference=data.jira_reference, due_date=data.due_date, blockers=data.blockers, created_by=user.id)
+        jira_reference=data.jira_reference, due_date=data.due_date, blockers=data.blockers, created_by=user.id,
+        change_window=data.change_window, source=data.source, suggestion_key=data.suggestion_key)
     db.add(package); db.flush()
     for finding_id in ids: db.add(RemediationPackageFinding(package_id=package.id, finding_id=finding_id, added_by=user.id))
     db.add(RemediationPackageEvent(package_id=package.id, action='created', details={'finding_count': len(ids)}, actor_id=user.id))
@@ -898,8 +905,9 @@ def update_remediation_package(package_id: int, data: RemediationPackageUpdate, 
                 db.delete(row)
         changes['finding_ids'] = sorted(ids)
     if data.status == 'Verified Closed':
-        evidence = db.scalars(select(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package.id, RemediationPackageEvidence.verified.is_(True))).all()
-        if not any(e.evidence_type == 'rescan' for e in evidence): raise HTTPException(409, 'A verified rescan is required before closure')
+        rows = db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id)).all()
+        if not rows or any(r.remediation_status != 'Fixed' or not r.verified_at for r in rows):
+            raise HTTPException(409, 'Every linked finding requires verified remediation evidence before closure')
     for key, value in changes.items(): setattr(package, key, value)
     db.add(RemediationPackageEvent(package_id=package.id, action='updated', details=changes, actor_id=user.id)); db.commit(); db.refresh(package)
     return _package_output(db, package)
@@ -916,8 +924,35 @@ def add_remediation_evidence(package_id: int, data: RemediationEvidenceInput, re
 def verify_remediation_evidence(package_id: int, evidence_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
     package = db.get(RemediationPackage, package_id); row = db.get(RemediationPackageEvidence, evidence_id)
     if not package or package.workspace != _workspace(request) or not row or row.package_id != package.id: raise HTTPException(404, 'Evidence not found')
-    row.verified = True; db.add(RemediationPackageEvent(package_id=package.id, action='evidence_verified', details={'evidence_id': row.id}, actor_id=user.id)); db.commit()
+    row.verified = True
+    if row.evidence_type == 'rescan':
+        # A verified rescan is attached to every linked finding, while each link
+        # retains its own status and verification timestamp for audit/reporting.
+        for link in db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package_id)).all():
+            link.remediation_status = 'Fixed'; link.verified_at = datetime.now(timezone.utc); link.verified_by = user.id; link.evidence_id = row.id
+    db.add(RemediationPackageEvent(package_id=package.id, action='evidence_verified', details={'evidence_id': row.id}, actor_id=user.id)); db.commit()
     return {'id': row.id, 'verified': True}
+
+@router.post('/remediation-packages/{package_id}/findings/{finding_id}/verify')
+def verify_package_finding(package_id: int, finding_id: int, request: Request, evidence_id: int = Query(...), user=Depends(admin), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id); link = db.scalar(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package_id, RemediationPackageFinding.finding_id == finding_id)); evidence = db.get(RemediationPackageEvidence, evidence_id)
+    if not package or package.workspace != _workspace(request) or not link or not evidence or evidence.package_id != package_id or not evidence.verified:
+        raise HTTPException(409, 'Verified package evidence is required for this finding')
+    link.remediation_status = 'Fixed'; link.verified_at = datetime.now(timezone.utc); link.verified_by = user.id; link.evidence_id = evidence_id
+    db.add(RemediationPackageEvent(package_id=package_id, action='finding_verified', details={'finding_id': finding_id, 'evidence_id': evidence_id}, actor_id=user.id)); db.commit()
+    return _package_output(db, package)
+
+@router.get('/remediation-packages/suggestions')
+def remediation_package_suggestions(request: Request, user=Depends(require_user), db=Depends(get_db)):
+    """Suggest packages only when scanner action, product/platform and approved routing agree."""
+    workspace = _workspace(request); groups = {}
+    rows = db.execute(select(Finding, Vulnerability).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace)).all()
+    for finding, vuln in rows:
+        t = vuln.technical if isinstance(vuln.technical, dict) else {}; action = str(t.get('remediation_action') or t.get('solution') or 'Unspecified').strip(); product = str(t.get('product') or t.get('software_family') or t.get('plugin_family') or 'Unknown').strip(); platform = str(t.get('os') or t.get('device_type') or 'General').strip()
+        key = '|'.join((action.casefold(), product.casefold(), platform.casefold()))
+        group = groups.setdefault(key, {'suggestion_key': key, 'name': f'{product} · {action}', 'remediation_action': action, 'product': product, 'platform': platform, 'plugin_ids': set(), 'finding_ids': set(), 'assets': set()})
+        group['plugin_ids'].add(vuln.plugin_id or str(vuln.id)); group['finding_ids'].add(finding.id); group['assets'].add(finding.asset_id)
+    return [{'suggestion_key': g['suggestion_key'], 'name': g['name'], 'remediation_action': g['remediation_action'], 'product': g['product'], 'platform': g['platform'], 'plugin_ids': sorted(g['plugin_ids']), 'finding_ids': sorted(g['finding_ids']), 'assets': len(g['assets']), 'findings': len(g['finding_ids'])} for g in sorted(groups.values(), key=lambda x: (-len(x['finding_ids']), x['name']))]
 
 @router.get('/remediation-sla/policies')
 def list_sla_policies(request: Request, user=Depends(require_user), db=Depends(get_db)):
