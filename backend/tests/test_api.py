@@ -542,6 +542,18 @@ def test_remediation_package_linking_and_empty_package_lifecycle(client):
     removed = client.put(f'/api/remediation-packages/{pid}', json={'unlink_finding_ids':[finding['id']]})
     assert removed.status_code == 200 and removed.json()['finding_ids'] == []
 
+def test_remediation_package_archive_restore_and_guarded_delete(client):
+    login(client)
+    empty = client.post('/api/remediation-packages', json={'name':'Archive me','remediation_action':'Coordinate change'}).json()
+    pid = empty['id']
+    archived = client.post(f'/api/remediation-packages/{pid}/archive')
+    assert archived.status_code == 200 and archived.json()['archived'] is True
+    listing = client.get('/api/remediation-packages?include_archived=true').json()
+    assert listing['total'] >= 1 and any(row['id'] == pid and row['archived'] for row in listing['items'])
+    restored = client.post(f'/api/remediation-packages/{pid}/restore')
+    assert restored.status_code == 200 and restored.json()['archived'] is False
+    assert client.delete(f'/api/remediation-packages/{pid}').status_code == 409
+
 def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
     login(client); create(client)
     response = client.get('/api/kpis')

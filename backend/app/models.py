@@ -359,6 +359,8 @@ class RemediationPackage(Base):
     change_window: Mapped[str | None] = mapped_column(String(120))
     source: Mapped[str] = mapped_column(String(30), default='manual')
     suggestion_key: Mapped[str | None] = mapped_column(String(300), index=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    archived_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
 
 class RemediationPackageFinding(Base):
     __tablename__ = 'remediation_package_findings'

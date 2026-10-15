@@ -862,14 +862,25 @@ def _package_output(db, package):
             'owner_id': package.owner_id, 'jira_reference': package.jira_reference, 'due_date': package.due_date.isoformat() if package.due_date else None,
             'change_window': package.change_window, 'source': package.source, 'suggestion_key': package.suggestion_key,
             'status': package.status, 'blockers': package.blockers or [], 'finding_ids': findings,
+            'archived': package.archived_at is not None,
+            'archived_at': package.archived_at.isoformat() if package.archived_at else None,
             'finding_statuses': statuses, 'unique_assets': db.scalar(select(func.count(func.distinct(Finding.asset_id))).where(Finding.id.in_(findings))) or 0,
             'verified_findings': verified, 'closure_blockers': [f'{len(findings)-verified} findings require verified remediation evidence'] if findings and verified < len(findings) else [],
             'evidence': [{'id': e.id, 'type': e.evidence_type, 'reference': e.reference, 'verified': e.verified, 'created_at': e.created_at.isoformat()} for e in evidence]}
 
 @router.get('/remediation-packages')
-def list_remediation_packages(request: Request, user=Depends(require_user), db=Depends(get_db)):
+def list_remediation_packages(request: Request, user=Depends(require_user), db=Depends(get_db), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str | None = None, status: str | None = None, owner_id: int | None = None, include_archived: bool = False):
     workspace = _workspace(request)
-    return [_package_output(db, p) for p in db.scalars(select(RemediationPackage).where(RemediationPackage.workspace == workspace).order_by(RemediationPackage.updated_at.desc())).all()]
+    query = select(RemediationPackage).where(RemediationPackage.workspace == workspace)
+    if not include_archived: query = query.where(RemediationPackage.archived_at.is_(None))
+    if q:
+        needle = f'%{q.strip()}%'; query = query.where(or_(RemediationPackage.name.ilike(needle), RemediationPackage.remediation_action.ilike(needle), RemediationPackage.jira_reference.ilike(needle)))
+    if status: query = query.where(RemediationPackage.status == status)
+    if owner_id is not None: query = query.where(RemediationPackage.owner_id == owner_id)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    packages = db.scalars(query.order_by(RemediationPackage.updated_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
+    items = [_package_output(db, p) for p in packages]
+    return items if page == 1 and page_size == 50 and not any((q, status, owner_id, include_archived)) else {'items': items, 'page': page, 'page_size': page_size, 'total': total, 'pages': (total + page_size - 1)//page_size}
 
 @router.post('/remediation-packages', status_code=201)
 def create_remediation_package(data: RemediationPackageInput, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -940,6 +951,30 @@ def update_remediation_package(package_id: int, data: RemediationPackageUpdate, 
     db.add(RemediationPackageEvent(package_id=package.id, action='updated', details=changes, actor_id=user.id)); db.commit(); db.refresh(package)
     return _package_output(db, package)
 
+@router.post('/remediation-packages/{package_id}/archive')
+def archive_remediation_package(package_id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    package.archived_at = datetime.now(timezone.utc); package.archived_by = user.id
+    db.add(RemediationPackageEvent(package_id=package.id, action='archived', details={}, actor_id=user.id)); db.commit(); db.refresh(package)
+    return _package_output(db, package)
+
+@router.post('/remediation-packages/{package_id}/restore')
+def restore_remediation_package(package_id: int, request: Request, user=Depends(writer), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    package.archived_at = None; package.archived_by = None
+    db.add(RemediationPackageEvent(package_id=package.id, action='restored', details={}, actor_id=user.id)); db.commit(); db.refresh(package)
+    return _package_output(db, package)
+
+@router.delete('/remediation-packages/{package_id}')
+def delete_remediation_package(package_id: int, request: Request, user=Depends(admin), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    if db.scalar(select(func.count()).select_from(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package_id)) or db.scalar(select(func.count()).select_from(RemediationPackageEvidence).where(RemediationPackageEvidence.package_id == package_id)) or db.scalar(select(func.count()).select_from(RemediationPackageEvent).where(RemediationPackageEvent.package_id == package_id)):
+        raise HTTPException(409, 'Packages with linked findings, evidence or history must be archived')
+    db.delete(package); db.commit(); return {'deleted': True, 'id': package_id}
+
 @router.post('/remediation-packages/{package_id}/evidence', status_code=201)
 def add_remediation_evidence(package_id: int, data: RemediationEvidenceInput, request: Request, user=Depends(writer), db=Depends(get_db)):
     package = db.get(RemediationPackage, package_id)
@@ -986,6 +1021,12 @@ def remediation_package_suggestions(request: Request, user=Depends(require_user)
         group = groups.setdefault(key, {'suggestion_key': key, 'name': f'{product} · {action}', 'remediation_action': action, 'product': product, 'platform': platform, 'plugin_ids': set(), 'findings': 0, 'assets': 0})
         group['plugin_ids'].add(plugin_id or str(vuln_id)); group['findings'] += findings; group['assets'] += assets
     return [{'suggestion_key': g['suggestion_key'], 'name': g['name'], 'remediation_action': g['remediation_action'], 'product': g['product'], 'platform': g['platform'], 'plugin_ids': sorted(g['plugin_ids']), 'findings': g['findings'], 'assets': g['assets']} for g in sorted(groups.values(), key=lambda x: (-x['findings'], x['name']))]
+
+@router.get('/remediation-packages/{package_id}')
+def get_remediation_package(package_id: int, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    package = db.get(RemediationPackage, package_id)
+    if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
+    return _package_output(db, package)
 
 @router.get('/remediation-sla/policies')
 def list_sla_policies(request: Request, user=Depends(require_user), db=Depends(get_db)):
