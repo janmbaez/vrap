@@ -554,6 +554,17 @@ def test_remediation_package_archive_restore_and_guarded_delete(client):
     assert restored.status_code == 200 and restored.json()['archived'] is False
     assert client.delete(f'/api/remediation-packages/{pid}').status_code == 409
 
+def test_smart_assessment_context_required_bulk_classification_is_governed(client):
+    login(client); finding = create(client)
+    asset_id = finding['asset']['id']
+    response = client.get('/api/smart-assessment/context-required?limit=10')
+    assert response.status_code == 200 and {'items', 'total'} <= set(response.json())
+    submitted = client.post('/api/smart-assessment/context-required/bulk-classify', json={
+        'asset_ids': [asset_id], 'changes': {'environment': 'Production'},
+        'justification': 'Validated by CMDB owner', 'evidence': 'CMDB-123'})
+    assert submitted.status_code == 202, submitted.text
+    assert submitted.json()['status'] == 'Awaiting Approval'
+
 def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
     login(client); create(client)
     response = client.get('/api/kpis')

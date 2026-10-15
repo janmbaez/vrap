@@ -240,6 +240,13 @@ class ClassificationChangeRequestInput(Strict):
             raise ValueError('At least one governed asset field is required')
         return self
 
+class BulkClassificationChangeInput(Strict):
+    asset_ids: list[int] = Field(min_length=1, max_length=5000)
+    changes: AssetUpdate = Field(default_factory=AssetUpdate)
+    per_asset_changes: dict[str, AssetUpdate] = Field(default_factory=dict, max_length=5000)
+    justification: str = Field(min_length=1, max_length=5000)
+    evidence: str = Field(default='', max_length=10000)
+
 class ClassificationChangeDecision(Strict):
     status: Literal['Approved', 'Rejected']
     justification: str = Field(min_length=1, max_length=5000)

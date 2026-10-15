@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, Context, Control, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
+from ..schemas import FindingCreate, AssessmentInput, Context, Control, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, BulkClassificationChangeInput, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -16,6 +16,41 @@ from ..regulatory import active_scopes, add_scope_memberships, normalize_scopes
 from ..classification_questionnaire import QUESTIONNAIRE
 
 router = APIRouter(tags=['Workbench'])
+
+@router.get('/smart-assessment/context-required')
+def smart_assessment_context_required(request: Request, q: str = '', os: str = '', missing_field: str = '', limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
+    workspace = request.state.session.workspace
+    # Keep this query bounded and workspace-scoped. Each returned finding is one
+    # technical investigation awaiting authoritative asset context.
+    query = select(Finding, Asset, Vulnerability, Assessment).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(Assessment, Assessment.instance_id == Finding.id).where(Finding.workspace == workspace, Assessment.status == 'Context Required')
+    if q.strip():
+        term = f'%{q.strip()}%'; query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term), Vulnerability.name.ilike(term), Vulnerability.plugin_id.ilike(term)))
+    if os.strip(): query = query.where(Asset.os.ilike(f'%{os.strip()}%'))
+    rows = db.execute(query.order_by(Asset.hostname, Finding.id).offset(offset).limit(limit)).all()
+    required = active_methodology(db).configuration.get('required_context', [])
+    items=[]; seen=set()
+    for finding, asset, vuln, assessment in rows:
+        if finding.id in seen: continue
+        seen.add(finding.id); missing=[field for field in required if (asset.context or {}).get(field) in (None,'',[])]
+        if missing_field and missing_field not in missing: continue
+        items.append({'finding_id': finding.id, 'plugin_id': vuln.plugin_id, 'category': (vuln.technical or {}).get('category') or 'Other / Manual Review', 'name': vuln.name, 'asset': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}, 'missing_fields': missing, 'technical_completed': True, 'risk_assessed': False, 'status': 'Context Required'})
+    total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
+    return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
+
+@router.post('/smart-assessment/context-required/bulk-classify', status_code=202)
+def bulk_classify_context(data: BulkClassificationChangeInput, request: Request, user=Depends(writer), db=Depends(get_db)):
+    workspace=request.state.session.workspace; ids=list(dict.fromkeys(data.asset_ids)); assets=db.scalars(select(Asset).where(Asset.workspace==workspace, Asset.id.in_(ids))).all()
+    if len(assets)!=len(ids): raise HTTPException(422, 'Every selected asset must belong to the current workspace')
+    requested=[]; unchanged=0; protected=0
+    for asset in assets:
+        incoming=(data.per_asset_changes.get(str(asset.id)) or data.changes).model_dump(exclude_none=True)
+        current=asset.context or {}; proposed={k:v for k,v in incoming.items() if current.get(k)!=v}
+        if not proposed: unchanged+=1; continue
+        # Every change goes through the existing owner/GRC separation workflow.
+        item=AssetClassificationChangeRequest(asset_id=asset.id, workspace=workspace, requested_by=user.id, expected_context_version=asset.context_version, before_context={k:current.get(k) for k in proposed}, proposed_context=proposed, justification=data.justification.strip(), evidence=data.evidence.strip())
+        db.add(item); db.flush(); requested.append(item.id)
+        db.add(Audit(actor_id=user.id, action='asset.classification_change_requested.bulk', entity='asset', entity_id=asset.id, details={'request_id':item.id,'fields':sorted(proposed)}))
+    db.commit(); return {'status':'Awaiting Approval','requests_created':len(requested),'request_ids':requested,'unchanged':unchanged,'protected_preserved':protected,'assets_selected':len(ids)}
 
 def _question_contract():
     return {question['id']: question for step in QUESTIONNAIRE['steps'] for question in step['questions']}
