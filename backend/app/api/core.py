@@ -22,7 +22,8 @@ def smart_assessment_context_required(request: Request, q: str = '', os: str = '
     workspace = request.state.session.workspace
     # Keep this query bounded and workspace-scoped. Each returned finding is one
     # technical investigation awaiting authoritative asset context.
-    query = select(Finding, Asset, Vulnerability, Assessment).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(Assessment, Assessment.instance_id == Finding.id).where(Finding.workspace == workspace, Assessment.status == 'Context Required')
+    latest = select(func.max(Assessment.id).label('latest_id')).where(Assessment.instance_id == Finding.id).correlate(Finding).scalar_subquery()
+    query = select(Finding, Asset, Vulnerability, Assessment).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(Assessment, Assessment.id == latest).where(Finding.workspace == workspace, Assessment.status == 'Context Required')
     if q.strip():
         term = f'%{q.strip()}%'; query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term), Vulnerability.name.ilike(term), Vulnerability.plugin_id.ilike(term)))
     if os.strip(): query = query.where(Asset.os.ilike(f'%{os.strip()}%'))
@@ -33,13 +34,36 @@ def smart_assessment_context_required(request: Request, q: str = '', os: str = '
         if finding.id in seen: continue
         seen.add(finding.id); missing=[field for field in required if (asset.context or {}).get(field) in (None,'',[])]
         if missing_field and missing_field not in missing: continue
-        items.append({'finding_id': finding.id, 'plugin_id': vuln.plugin_id, 'category': (vuln.technical or {}).get('category') or 'Other / Manual Review', 'name': vuln.name, 'asset': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}, 'missing_fields': missing, 'technical_completed': True, 'risk_assessed': False, 'status': 'Context Required'})
+        tech = vuln.technical or {}; raw_os=(asset.os or tech.get('os') or '').lower(); device=str(tech.get('device_type') or '').lower(); product=str(tech.get('product') or tech.get('software_family') or '').lower()
+        if 'windows' in raw_os and any(x in raw_os for x in ('server','datacenter')): category='Windows Servers'
+        elif 'windows' in raw_os: category='Windows Workstations'
+        elif any(x in raw_os for x in ('linux','unix','ubuntu','red hat','rhel','debian')): category='Linux Servers'
+        elif any(x in device for x in ('network','router','switch','firewall')): category='Network Devices'
+        elif any(x in device for x in ('storage','san','nas')) or any(x in product for x in ('powerscale','storage')): category='Storage'
+        elif any(x in product for x in ('sql','oracle','postgres','database')): category='Databases'
+        elif any(x in product for x in ('aws','azure','gcp','cloud')): category='Cloud'
+        elif product: category='Applications'
+        else: category='Unknown'
+        items.append({'finding_id': finding.id, 'plugin_id': vuln.plugin_id, 'category': category, 'name': vuln.name, 'asset': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}, 'missing_fields': missing, 'technical_completed': True, 'risk_assessed': False, 'status': 'Context Required'})
     total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
     return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
 
 @router.post('/smart-assessment/context-required/bulk-classify', status_code=202)
 def bulk_classify_context(data: BulkClassificationChangeInput, request: Request, user=Depends(writer), db=Depends(get_db)):
-    workspace=request.state.session.workspace; ids=list(dict.fromkeys(data.asset_ids)); assets=db.scalars(select(Asset).where(Asset.workspace==workspace, Asset.id.in_(ids))).all()
+    workspace=request.state.session.workspace
+    ids=list(dict.fromkeys(data.asset_ids))
+    if data.selection:
+        # Resolve the saved server-side cohort before applying changes. The
+        # browser never needs to hold all matching IDs.
+        cohort=select(Finding.asset_id).join(Asset, Asset.id==Finding.asset_id).where(Finding.workspace==workspace)
+        if data.selection.get('q'):
+            term=f"%{str(data.selection['q']).strip()}%"; cohort=cohort.where(or_(Asset.hostname.ilike(term),Asset.ip.ilike(term),Asset.os.ilike(term)))
+        if data.selection.get('os'): cohort=cohort.where(Asset.os.ilike(f"%{data.selection['os']}%"))
+        if data.selection.get('category'):
+            cohort=cohort.join(Vulnerability, Vulnerability.id==Finding.vulnerability_id).where(Vulnerability.technical['category'].as_string()==data.selection['category'])
+        ids=list(dict.fromkeys(db.scalars(cohort.distinct()).all()))
+    if not ids: raise HTTPException(422, 'The selection matches no assets')
+    assets=db.scalars(select(Asset).where(Asset.workspace==workspace, Asset.id.in_(ids))).all()
     if len(assets)!=len(ids): raise HTTPException(422, 'Every selected asset must belong to the current workspace')
     requested=[]; unchanged=0; protected=0
     for asset in assets:
