@@ -881,13 +881,15 @@ def create_remediation_package(data: RemediationPackageInput, request: Request, 
         parts = data.suggestion_key.split('|', 2)
         if len(parts) == 3:
             action_key, product_key, platform_key = parts
-            rows = db.execute(select(Finding.id, Vulnerability.technical).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace)).all()
-            for finding_id, technical in rows:
+            matching_vulns = []
+            for vuln_id, technical in db.execute(select(Vulnerability.id, Vulnerability.technical)).all():
                 t = technical if isinstance(technical, dict) else {}
                 action = str(t.get('remediation_action') or t.get('solution') or 'Unspecified').strip().casefold()
                 product = str(t.get('product') or t.get('software_family') or t.get('plugin_family') or 'Unknown').strip().casefold()
                 platform = str(t.get('os') or t.get('device_type') or 'General').strip().casefold()
-                if (action, product, platform) == (action_key, product_key, platform_key): ids.add(finding_id)
+                if (action, product, platform) == (action_key, product_key, platform_key): matching_vulns.append(vuln_id)
+            if matching_vulns:
+                ids.update(db.scalars(select(Finding.id).where(Finding.workspace == workspace, Finding.vulnerability_id.in_(matching_vulns))).all())
     if ids and len(db.scalars(select(Finding.id).where(Finding.workspace == workspace, Finding.id.in_(ids))).all()) != len(ids):
         raise HTTPException(422, 'All findings must belong to the current workspace')
     package = RemediationPackage(workspace=workspace, name=data.name, remediation_action=data.remediation_action, owner_id=data.owner_id,
@@ -972,13 +974,18 @@ def verify_package_finding(package_id: int, finding_id: int, request: Request, e
 def remediation_package_suggestions(request: Request, user=Depends(require_user), db=Depends(get_db)):
     """Suggest packages only when scanner action, product/platform and approved routing agree."""
     workspace = _workspace(request); groups = {}
-    rows = db.execute(select(Finding, Vulnerability).join(Vulnerability, Finding.vulnerability_id == Vulnerability.id).where(Finding.workspace == workspace)).all()
-    for finding, vuln in rows:
-        t = vuln.technical if isinstance(vuln.technical, dict) else {}; action = str(t.get('remediation_action') or t.get('solution') or 'Unspecified').strip(); product = str(t.get('product') or t.get('software_family') or t.get('plugin_family') or 'Unknown').strip(); platform = str(t.get('os') or t.get('device_type') or 'General').strip()
-        key = '|'.join((action.casefold(), product.casefold(), platform.casefold()))
-        group = groups.setdefault(key, {'suggestion_key': key, 'name': f'{product} · {action}', 'remediation_action': action, 'product': product, 'platform': platform, 'plugin_ids': set(), 'finding_ids': set(), 'assets': set()})
-        group['plugin_ids'].add(vuln.plugin_id or str(vuln.id)); group['finding_ids'].add(finding.id); group['assets'].add(finding.asset_id)
-    return [{'suggestion_key': g['suggestion_key'], 'name': g['name'], 'remediation_action': g['remediation_action'], 'product': g['product'], 'platform': g['platform'], 'plugin_ids': sorted(g['plugin_ids']), 'finding_ids': sorted(g['finding_ids']), 'assets': len(g['assets']), 'findings': len(g['finding_ids'])} for g in sorted(groups.values(), key=lambda x: (-len(x['finding_ids']), x['name']))]
+    # Read one row per plugin, not one row per finding. Counts are computed by
+    # bounded SQL aggregates, keeping this endpoint responsive for 100k findings.
+    plugins = db.execute(select(Vulnerability.id, Vulnerability.plugin_id, Vulnerability.name, Vulnerability.technical).where(
+        select(Finding.id).where(Finding.vulnerability_id == Vulnerability.id, Finding.workspace == workspace).exists())).all()
+    counts = db.execute(select(Finding.vulnerability_id, func.count(Finding.id), func.count(func.distinct(Finding.asset_id))).where(Finding.workspace == workspace).group_by(Finding.vulnerability_id)).all()
+    count_map = {v: (int(f), int(a)) for v, f, a in counts}
+    for vuln_id, plugin_id, vuln_name, technical in plugins:
+        t = technical if isinstance(technical, dict) else {}; action = str(t.get('remediation_action') or t.get('solution') or 'Unspecified').strip(); product = str(t.get('product') or t.get('software_family') or t.get('plugin_family') or 'Unknown').strip(); platform = str(t.get('os') or t.get('device_type') or 'General').strip()
+        key = '|'.join((action.casefold(), product.casefold(), platform.casefold())); findings, assets = count_map.get(vuln_id, (0, 0))
+        group = groups.setdefault(key, {'suggestion_key': key, 'name': f'{product} · {action}', 'remediation_action': action, 'product': product, 'platform': platform, 'plugin_ids': set(), 'findings': 0, 'assets': 0})
+        group['plugin_ids'].add(plugin_id or str(vuln_id)); group['findings'] += findings; group['assets'] += assets
+    return [{'suggestion_key': g['suggestion_key'], 'name': g['name'], 'remediation_action': g['remediation_action'], 'product': g['product'], 'platform': g['platform'], 'plugin_ids': sorted(g['plugin_ids']), 'findings': g['findings'], 'assets': g['assets']} for g in sorted(groups.values(), key=lambda x: (-x['findings'], x['name']))]
 
 @router.get('/remediation-sla/policies')
 def list_sla_policies(request: Request, user=Depends(require_user), db=Depends(get_db)):
