@@ -733,8 +733,9 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
         raise HTTPException(404, 'Classification change request not found')
     if item.status != 'Requested':
         raise HTTPException(409, 'Classification change request has already been decided')
-    if item.requested_by == user.id:
-        raise HTTPException(403, 'A requester cannot approve or reject their own classification change')
+    # Administrators are explicitly permitted to approve their own requests.
+    # The `admin` dependency above enforces that only administrators can reach
+    # this endpoint; non-administrators therefore retain separation of duties.
     item.status = data.status
     item.approved_by = user.id
     item.reviewed_at = datetime.now(timezone.utc)

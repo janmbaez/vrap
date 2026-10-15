@@ -1,6 +1,13 @@
 import {FormEvent,useEffect,useState} from 'react'
 import {api,post,User} from '../api'
 import {Badge,ErrorBox,PageTitle} from '../components/UI'
+import {ExecutiveReport} from './ExecutiveReport'
+
+export function GovernanceHub({user}:{user:User}){
+ const [tab,setTab]=useState<'exceptions'|'controls'|'data-quality'|'executive'>('exceptions')
+ const tabs=[['exceptions','Risk Exceptions'],['controls','Control Library'],['data-quality','Data Quality'],['executive','Executive Report']] as const
+ return <><PageTitle title="Governance" description="Review risk decisions, controls, data quality, and executive reporting in one workspace."/><nav className="governance-tabs" aria-label="Governance sections">{tabs.map(([key,label])=><button key={key} className={tab===key?'active':''} onClick={()=>setTab(key)} aria-current={tab===key?'page':undefined}>{label}</button>)}</nav>{tab==='exceptions'&&<Exceptions user={user}/>} {tab==='controls'&&<Controls user={user}/>} {tab==='data-quality'&&<DataQuality/>} {tab==='executive'&&<ExecutiveReport/>}</>
+}
 
 export function DataQuality(){
  const [data,setData]=useState<any>(),[error,setError]=useState(''),[message,setMessage]=useState(''),[clearing,setClearing]=useState(false),[deduplicating,setDeduplicating]=useState(false)
@@ -32,4 +39,4 @@ export function Controls({user}:{user:User}){
  return <><PageTitle title="Control library" description="Reusable control definitions, owners, evidence expectations, maturity, and framework mappings."/><ErrorBox error={error}/>{message&&<div className="notice success">{message}</div>}<div className="management-grid"><section className="panel table-panel"><table><thead><tr><th>Control</th><th>Owner</th><th>Maturity</th><th>Mappings</th></tr></thead><tbody>{items.map(x=><tr key={x.id}><td><strong>{x.name}</strong><small>{x.description}</small></td><td>{x.owner||'Unassigned'}</td><td>{x.design_maturity||'—'} / {x.operating_effectiveness||'—'}</td><td>{Object.entries(x.mappings||{}).flatMap(([k,v]:any)=>v.map((n:string)=>`${k} ${n}`)).join(', ')||'—'}</td></tr>)}</tbody></table></section>{user.role==='Administrator'&&<form className="panel" onSubmit={create}><h2>Add control</h2><label>Name<input name="name" required/></label><label>Description<textarea name="description"/></label><label>Owner<select name="owner_id"><option value="">Unassigned</option>{owners.map(x=><option value={x.id} key={x.id}>{x.username}</option>)}</select></label><label>Evidence requirements<textarea name="evidence_requirements"/></label><div className="form-grid"><label>Design maturity<input name="design_maturity" type="number" min="1" max="5"/></label><label>Operating effectiveness<input name="operating_effectiveness" type="number" min="1" max="5"/></label><label>NIST mappings<input name="nist" placeholder="PR.AC-5, DE.CM-1"/></label><label>CIS mappings<input name="cis" placeholder="12.2, 13.3"/></label></div><button className="primary full">Add control</button></form>}</div></>
 }
 
-export {ExecutiveReport} from './ExecutiveReport'
+export {ExecutiveReport}
