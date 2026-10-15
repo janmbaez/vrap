@@ -564,6 +564,8 @@ def test_smart_assessment_context_required_bulk_classification_is_governed(clien
         'justification': 'Validated by CMDB owner', 'evidence': 'CMDB-123'})
     assert submitted.status_code == 202, submitted.text
     assert submitted.json()['status'] == 'Awaiting Approval'
+    rejected = client.post('/api/smart-assessment/context-required/bulk-classify', json={'asset_ids': [asset_id], 'changes': {'environment': 'Test'}})
+    assert rejected.status_code == 422
 
 def test_kpi_contract_is_workspace_scoped_and_has_consistent_denominator(client):
     login(client); create(client)

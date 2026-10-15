@@ -18,7 +18,7 @@ from ..classification_questionnaire import QUESTIONNAIRE
 router = APIRouter(tags=['Workbench'])
 
 @router.get('/smart-assessment/context-required')
-def smart_assessment_context_required(request: Request, q: str = '', os: str = '', missing_field: str = '', limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
+def smart_assessment_context_required(request: Request, q: str = '', os: str = '', subcategory: str = '', device_type: str = '', missing_field: str = '', raci_owner: str = '', tag: str = '', environment: str = '', regulatory: str = '', limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     workspace = request.state.session.workspace
     # Keep this query bounded and workspace-scoped. Each returned finding is one
     # technical investigation awaiting authoritative asset context.
@@ -27,6 +27,11 @@ def smart_assessment_context_required(request: Request, q: str = '', os: str = '
     if q.strip():
         term = f'%{q.strip()}%'; query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term), Vulnerability.name.ilike(term), Vulnerability.plugin_id.ilike(term)))
     if os.strip(): query = query.where(Asset.os.ilike(f'%{os.strip()}%'))
+    if device_type.strip(): query = query.where(Vulnerability.technical['device_type'].as_string() == device_type.strip())
+    if environment.strip(): query = query.where(Asset.context['environment'].as_string() == environment.strip())
+    if raci_owner.strip(): query = query.where(or_(Asset.context['business_owner'].as_string() == raci_owner.strip(), Asset.context['it_owner'].as_string() == raci_owner.strip(), Asset.context['application_owner'].as_string() == raci_owner.strip(), Asset.context['remediation_owner'].as_string() == raci_owner.strip()))
+    if tag.strip(): query = query.where(Asset.tags.contains([tag.strip()]))
+    if regulatory.strip(): query = query.where(Asset.context['regulatory'].as_string().ilike(f'%{regulatory.strip()}%'))
     rows = db.execute(query.order_by(Asset.hostname, Finding.id).offset(offset).limit(limit)).all()
     required = active_methodology(db).configuration.get('required_context', [])
     items=[]; seen=set()
@@ -44,6 +49,7 @@ def smart_assessment_context_required(request: Request, q: str = '', os: str = '
         elif any(x in product for x in ('aws','azure','gcp','cloud')): category='Cloud'
         elif product: category='Applications'
         else: category='Unknown'
+        if subcategory.strip() and category != subcategory.strip(): continue
         items.append({'finding_id': finding.id, 'plugin_id': vuln.plugin_id, 'category': category, 'name': vuln.name, 'asset': {'id': asset.id, 'hostname': asset.hostname, 'ip': asset.ip, 'os': asset.os, 'tags': asset.tags}, 'missing_fields': missing, 'technical_completed': True, 'risk_assessed': False, 'status': 'Context Required'})
     total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
     return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
@@ -51,11 +57,14 @@ def smart_assessment_context_required(request: Request, q: str = '', os: str = '
 @router.post('/smart-assessment/context-required/bulk-classify', status_code=202)
 def bulk_classify_context(data: BulkClassificationChangeInput, request: Request, user=Depends(writer), db=Depends(get_db)):
     workspace=request.state.session.workspace
+    if not data.dry_run and (not data.justification.strip() or not data.evidence.strip()):
+        raise HTTPException(422, 'Justification and real evidence reference are required before submission')
     ids=list(dict.fromkeys(data.asset_ids))
     if data.selection:
         # Resolve the saved server-side cohort before applying changes. The
         # browser never needs to hold all matching IDs.
-        cohort=select(Finding.asset_id).join(Asset, Asset.id==Finding.asset_id).where(Finding.workspace==workspace)
+        latest=select(func.max(Assessment.id)).where(Assessment.instance_id==Finding.id).correlate(Finding).scalar_subquery()
+        cohort=select(Finding.asset_id).join(Asset, Asset.id==Finding.asset_id).join(Assessment, Assessment.id==latest).where(Finding.workspace==workspace, Assessment.status=='Context Required')
         if data.selection.get('q'):
             term=f"%{str(data.selection['q']).strip()}%"; cohort=cohort.where(or_(Asset.hostname.ilike(term),Asset.ip.ilike(term),Asset.os.ilike(term)))
         if data.selection.get('os'): cohort=cohort.where(Asset.os.ilike(f"%{data.selection['os']}%"))
@@ -65,15 +74,19 @@ def bulk_classify_context(data: BulkClassificationChangeInput, request: Request,
     if not ids: raise HTTPException(422, 'The selection matches no assets')
     assets=db.scalars(select(Asset).where(Asset.workspace==workspace, Asset.id.in_(ids))).all()
     if len(assets)!=len(ids): raise HTTPException(422, 'Every selected asset must belong to the current workspace')
-    requested=[]; unchanged=0; protected=0
+    requested=[]; unchanged=0; protected=0; proposed_count=0; conflicts=0
     for asset in assets:
         incoming=(data.per_asset_changes.get(str(asset.id)) or data.changes).model_dump(exclude_none=True)
         current=asset.context or {}; proposed={k:v for k,v in incoming.items() if current.get(k)!=v}
         if not proposed: unchanged+=1; continue
+        proposed_count += len(proposed)
+        conflicts += sum(1 for key in proposed if isinstance((asset.context_provenance or {}).get(key), dict) and (asset.context_provenance or {}).get(key, {}).get('approval_state') == 'Approved')
+        if data.dry_run: continue
         # Every change goes through the existing owner/GRC separation workflow.
         item=AssetClassificationChangeRequest(asset_id=asset.id, workspace=workspace, requested_by=user.id, expected_context_version=asset.context_version, before_context={k:current.get(k) for k in proposed}, proposed_context=proposed, justification=data.justification.strip(), evidence=data.evidence.strip())
         db.add(item); db.flush(); requested.append(item.id)
         db.add(Audit(actor_id=user.id, action='asset.classification_change_requested.bulk', entity='asset', entity_id=asset.id, details={'request_id':item.id,'fields':sorted(proposed)}))
+    if data.dry_run: return {'status':'Preview','assets_selected':len(ids),'proposed_assets':len(ids)-unchanged,'proposed_fields':proposed_count,'unchanged':unchanged,'approval_conflicts':conflicts,'missing_evidence':not bool(data.evidence.strip())}
     db.commit(); return {'status':'Awaiting Approval','requests_created':len(requested),'request_ids':requested,'unchanged':unchanged,'protected_preserved':protected,'assets_selected':len(ids)}
 
 def _question_contract():
