@@ -25,7 +25,7 @@ def smart_assessment_context_required(request: Request, q: str = '', os: str = '
     latest = select(func.max(Assessment.id).label('latest_id')).where(Assessment.instance_id == Finding.id).correlate(Finding).scalar_subquery()
     query = select(Finding, Asset, Vulnerability, Assessment).join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id).join(Assessment, Assessment.id == latest).where(Finding.workspace == workspace, Assessment.status == 'Context Required')
     if q.strip():
-        term = f'%{q.strip()}%'; query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term), Vulnerability.name.ilike(term), Vulnerability.plugin_id.ilike(term)))
+        term = f'%{q.strip()}%'; query = query.where(or_(Asset.hostname.ilike(term), Asset.ip.ilike(term)))
     if os.strip(): query = query.where(Asset.os.ilike(f'%{os.strip()}%'))
     if device_type.strip(): query = query.where(Vulnerability.technical['device_type'].as_string() == device_type.strip())
     if environment.strip(): query = query.where(Asset.context['environment'].as_string() == environment.strip())
@@ -66,8 +66,13 @@ def bulk_classify_context(data: BulkClassificationChangeInput, request: Request,
         latest=select(func.max(Assessment.id)).where(Assessment.instance_id==Finding.id).correlate(Finding).scalar_subquery()
         cohort=select(Finding.asset_id).join(Asset, Asset.id==Finding.asset_id).join(Assessment, Assessment.id==latest).where(Finding.workspace==workspace, Assessment.status=='Context Required')
         if data.selection.get('q'):
-            term=f"%{str(data.selection['q']).strip()}%"; cohort=cohort.where(or_(Asset.hostname.ilike(term),Asset.ip.ilike(term),Asset.os.ilike(term)))
+            term=f"%{str(data.selection['q']).strip()}%"; cohort=cohort.where(or_(Asset.hostname.ilike(term),Asset.ip.ilike(term)))
         if data.selection.get('os'): cohort=cohort.where(Asset.os.ilike(f"%{data.selection['os']}%"))
+        if data.selection.get('environment'): cohort=cohort.where(Asset.context['environment'].as_string()==data.selection['environment'])
+        if data.selection.get('raci_owner'):
+            owner=data.selection['raci_owner']; cohort=cohort.where(or_(Asset.context['business_owner'].as_string()==owner,Asset.context['it_owner'].as_string()==owner,Asset.context['application_owner'].as_string()==owner,Asset.context['remediation_owner'].as_string()==owner))
+        if data.selection.get('tag'): cohort=cohort.where(Asset.tags.contains([data.selection['tag']]))
+        if data.selection.get('regulatory'): cohort=cohort.where(Asset.context['regulatory'].as_string().ilike(f"%{data.selection['regulatory']}%"))
         if data.selection.get('category'):
             cohort=cohort.join(Vulnerability, Vulnerability.id==Finding.vulnerability_id).where(Vulnerability.technical['category'].as_string()==data.selection['category'])
         ids=list(dict.fromkeys(db.scalars(cohort.distinct()).all()))
