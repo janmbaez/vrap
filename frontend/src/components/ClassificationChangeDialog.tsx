@@ -124,8 +124,14 @@ export function ClassificationChangeReviewQueue({ onApplied }: { onApplied: () =
     try {
       let failed = 0
       const ids = [...selected]
-      for (let index = 0; index < ids.length; index += 25) {
-        const results = await Promise.allSettled(ids.slice(index, index + 25).map(id => api(`/classification-change-requests/${id}`, { method: 'PUT', body: JSON.stringify({ status: bulkStatus, justification: rationale }) })))
+      const decideWithRetry = async (id:number) => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try { return await api(`/classification-change-requests/${id}`, { method: 'PUT', body: JSON.stringify({ status: bulkStatus, justification: rationale }) }) }
+          catch (cause) { if (attempt === 2) throw cause; await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1))) }
+        }
+      }
+      for (let index = 0; index < ids.length; index += 5) {
+        const results = await Promise.allSettled(ids.slice(index, index + 5).map(decideWithRetry))
         failed += results.filter(result => result.status === 'rejected').length
         setBulkProgress(Math.min(ids.length, index + 25))
       }
