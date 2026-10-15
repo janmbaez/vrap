@@ -772,7 +772,7 @@ def update_assessment_category(category_key: str, data: dict, request: Request, 
     db.add(Audit(actor_id=user.id, action='assessment_category.updated', entity='assessment_category', entity_id=state.id, details={'category': category_key, 'changes': data}))
     db.commit(); return {'updated': True, 'categories': _smart_category_data(db, workspace)}
 
-@router.post('/assessment-categories/{category_key}/bulk-assess')
+@router.post('/assessment-categories/{category_key:path}/bulk-assess')
 def bulk_assess_category(category_key: str, data: PluginBulkAssessmentInput, background: BackgroundTasks, request: Request, user=Depends(writer), db=Depends(get_db)):
     workspace = _workspace(request); category = next((g for g in _smart_category_data(db, workspace) if g['key'] == category_key), None)
     if not category: raise HTTPException(404, 'Assessment category not found')

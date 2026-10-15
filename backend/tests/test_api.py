@@ -368,6 +368,22 @@ def test_assessment_recommendations_large_dataset_is_bounded_and_fast(client, db
     assert category_payload['category_count'] <= 20
     assert sum(len(category['plugin_ids']) for category in category_payload['categories']) == 2725
 
+def test_smart_category_bulk_questionnaire_supports_outcomes_and_multiple_plugins(client):
+    login(client)
+    first = create(client)
+    second = client.post('/api/findings', json={**DATA, 'hostname':'TEST-02', 'plugin_id':'test-101'}).json()
+    category = next(c for c in client.get('/api/assessment-categories').json()['categories'] if first['plugin_id'] in c['plugin_ids'] and second['plugin_id'] in c['plugin_ids'])
+    technical = {'applicability':'Applicable','attack_prerequisite':'Low','exploit_validation':'Not observed','remediation_feasibility':'Available','internet_exposure':'None'}
+    common = {'context':{},'controls':[],'owner_id':None,'workflow_status':'Investigating','status':'Assessed','decision':'Remediation Required','justification':'Reviewed evidence','active_only':True,'questionnaire_version':'1.0-provisional','answers':technical,'scenario_evidence':['scan://category'],'scenario_notes':'Shared evidence validated for the category'}
+    preview = client.post(f"/api/assessment-categories/{category['key']}/bulk-assess", json={**common,'dry_run':True})
+    assert preview.status_code == 200 and preview.json()['findings'] >= 2 and preview.json()['plugin_count'] >= 2
+    not_applicable = {**common,'answers':{'applicability':'Not applicable'},'decision':'Not Applicable','status':'Not Applicable','scenario_evidence':['ticket://na'],'scenario_notes':'Evidence confirms this is not applicable','justification':'Governed determination','dry_run':True}
+    assert client.post(f"/api/assessment-categories/{category['key']}/bulk-assess", json=not_applicable).status_code == 200
+    needs_validation = {**common,'answers':{'applicability':'Needs validation'},'decision':'Needs Further Assessment','status':'Pending Validation','dry_run':True}
+    assert client.post(f"/api/assessment-categories/{category['key']}/bulk-assess", json=needs_validation).status_code == 200
+    confirmed = client.post(f"/api/assessment-categories/{category['key']}/bulk-assess", json={**common,'dry_run':False,'idempotency_key':'category-multi-plugin-test'})
+    assert confirmed.status_code == 200 and confirmed.json()['total'] >= 2
+
 def test_protected_asset_context_rejects_a_stale_editor_version(client):
     login(client)
     finding=create(client)
