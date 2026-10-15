@@ -73,9 +73,21 @@ def bulk_classify_context(data: BulkClassificationChangeInput, request: Request,
             owner=data.selection['raci_owner']; cohort=cohort.where(or_(Asset.context['business_owner'].as_string()==owner,Asset.context['it_owner'].as_string()==owner,Asset.context['application_owner'].as_string()==owner,Asset.context['remediation_owner'].as_string()==owner))
         if data.selection.get('tag'): cohort=cohort.where(Asset.tags.contains([data.selection['tag']]))
         if data.selection.get('regulatory'): cohort=cohort.where(Asset.context['regulatory'].as_string().ilike(f"%{data.selection['regulatory']}%"))
+        if data.selection.get('device_type'):
+            cohort=cohort.join(Vulnerability, Vulnerability.id==Finding.vulnerability_id).where(Vulnerability.technical['device_type'].as_string()==data.selection['device_type'])
+        if data.selection.get('subcategory'):
+            sub=data.selection['subcategory'].lower()
+            if sub == 'windows servers': cohort=cohort.where(Asset.os.ilike('%windows%'), Asset.os.ilike('%server%'))
+            elif sub == 'windows workstations': cohort=cohort.where(Asset.os.ilike('%windows%')).where(~Asset.os.ilike('%server%'))
+            elif sub == 'linux servers': cohort=cohort.where(or_(Asset.os.ilike('%linux%'),Asset.os.ilike('%unix%'),Asset.os.ilike('%ubuntu%'),Asset.os.ilike('%rhel%')))
         if data.selection.get('category'):
             cohort=cohort.join(Vulnerability, Vulnerability.id==Finding.vulnerability_id).where(Vulnerability.technical['category'].as_string()==data.selection['category'])
         ids=list(dict.fromkeys(db.scalars(cohort.distinct()).all()))
+        if data.selection.get('missing_field'):
+            required=active_methodology(db).configuration.get('required_context', [])
+            field=data.selection['missing_field']
+            if field in required:
+                ids=[asset_id for asset_id in ids if (db.get(Asset, asset_id).context or {}).get(field) in (None,'',[])]
     if not ids: raise HTTPException(422, 'The selection matches no assets')
     assets=db.scalars(select(Asset).where(Asset.workspace==workspace, Asset.id.in_(ids))).all()
     if len(assets)!=len(ids): raise HTTPException(422, 'Every selected asset must belong to the current workspace')
