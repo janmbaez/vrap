@@ -869,7 +869,7 @@ def _package_output(db, package):
             'evidence': [{'id': e.id, 'type': e.evidence_type, 'reference': e.reference, 'verified': e.verified, 'created_at': e.created_at.isoformat()} for e in evidence]}
 
 @router.get('/remediation-packages')
-def list_remediation_packages(request: Request, user=Depends(require_user), db=Depends(get_db), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str | None = None, status: str | None = None, owner_id: int | None = None, include_archived: bool = False):
+def list_remediation_packages(request: Request, user=Depends(require_user), db=Depends(get_db), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str | None = None, status: str | None = None, owner_id: int | None = None, include_archived: bool = False, view: str | None = None):
     workspace = _workspace(request)
     query = select(RemediationPackage).where(RemediationPackage.workspace == workspace)
     if not include_archived: query = query.where(RemediationPackage.archived_at.is_(None))
@@ -877,10 +877,15 @@ def list_remediation_packages(request: Request, user=Depends(require_user), db=D
         needle = f'%{q.strip()}%'; query = query.where(or_(RemediationPackage.name.ilike(needle), RemediationPackage.remediation_action.ilike(needle), RemediationPackage.jira_reference.ilike(needle)))
     if status: query = query.where(RemediationPackage.status == status)
     if owner_id is not None: query = query.where(RemediationPackage.owner_id == owner_id)
+    if view == 'Archived': query = query.where(RemediationPackage.archived_at.is_not(None))
+    elif view == 'Suggested': query = query.where(RemediationPackage.source == 'suggested', RemediationPackage.archived_at.is_(None))
+    elif view == 'Completed': query = query.where(RemediationPackage.status == 'Verified Closed', RemediationPackage.archived_at.is_(None))
+    elif view == 'Reopened': query = query.where(RemediationPackage.status == 'Reopened', RemediationPackage.archived_at.is_(None))
+    elif view == 'Active': query = query.where(RemediationPackage.status.in_(('Planned', 'Open', 'In Progress', 'Pending Verification', 'Blocked', 'Partially Remediated')), RemediationPackage.archived_at.is_(None))
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
-    packages = db.scalars(query.order_by(RemediationPackage.updated_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
+    packages = db.scalars(query.order_by(RemediationPackage.updated_at.desc(), RemediationPackage.id.desc()).offset((page-1)*page_size).limit(page_size)).all()
     items = [_package_output(db, p) for p in packages]
-    return items if page == 1 and page_size == 50 and not any((q, status, owner_id, include_archived)) else {'items': items, 'page': page, 'page_size': page_size, 'total': total, 'pages': (total + page_size - 1)//page_size}
+    return items if page == 1 and page_size == 50 and not any((q, status, owner_id, include_archived, view)) else {'items': items, 'page': page, 'page_size': page_size, 'total': total, 'pages': (total + page_size - 1)//page_size}
 
 @router.post('/remediation-packages', status_code=201)
 def create_remediation_package(data: RemediationPackageInput, request: Request, user=Depends(writer), db=Depends(get_db)):
@@ -915,7 +920,9 @@ def create_remediation_package(data: RemediationPackageInput, request: Request, 
 def update_remediation_package(package_id: int, data: RemediationPackageUpdate, request: Request, user=Depends(writer), db=Depends(get_db)):
     package = db.get(RemediationPackage, package_id)
     if not package or package.workspace != _workspace(request): raise HTTPException(404, 'Remediation package not found')
-    changes = data.model_dump(exclude_none=True)
+    if package.status == 'Verified Closed' and data.status != 'Reopened' and any(key in data.model_fields_set for key in ('finding_ids', 'link_plugin_ids', 'link_asset_ids', 'link_remediation_action', 'unlink_finding_ids')):
+        raise HTTPException(409, 'Reopen the package before changing linked findings')
+    changes = data.model_dump(exclude_unset=True)
     finding_ids = changes.pop('finding_ids', None)
     link_plugin_ids = changes.pop('link_plugin_ids', None); link_asset_ids = changes.pop('link_asset_ids', None); link_action = changes.pop('link_remediation_action', None); unlink_ids = changes.pop('unlink_finding_ids', None)
     if finding_ids is not None:
@@ -943,9 +950,11 @@ def update_remediation_package(package_id: int, data: RemediationPackageUpdate, 
     if unlink_ids:
         for row in db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id, RemediationPackageFinding.finding_id.in_(unlink_ids))).all(): db.delete(row)
         changes['unlinked_finding_ids'] = unlink_ids
+    db.flush()
     if data.status == 'Verified Closed':
         rows = db.scalars(select(RemediationPackageFinding).where(RemediationPackageFinding.package_id == package.id)).all()
         if not rows or any(r.remediation_status != 'Fixed' or not r.verified_at for r in rows):
+            db.rollback()
             raise HTTPException(409, 'Every linked finding requires verified remediation evidence before closure')
     for key, value in changes.items(): setattr(package, key, value)
     db.add(RemediationPackageEvent(package_id=package.id, action='updated', details=changes, actor_id=user.id)); db.commit(); db.refresh(package)

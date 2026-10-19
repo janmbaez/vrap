@@ -515,6 +515,58 @@ def test_remediation_package_requires_verified_rescan_before_closure(client):
     assert reopened.status_code == 200
     assert reopened.json()['finding_ids'] == [finding['id']]
 
+def test_remediation_package_pagination_filters_and_clears_fields(client, db):
+    login(client)
+    for index in range(52):
+        response = client.post('/api/remediation-packages', json={'name': f'Wave {index:02}', 'remediation_action': 'Patch'})
+        assert response.status_code == 201, response.text
+    first = client.get('/api/remediation-packages?page=1&page_size=50&include_archived=true&view=All').json()
+    second = client.get('/api/remediation-packages?page=2&page_size=50&include_archived=true&view=All').json()
+    assert first['total'] == 52 and len(first['items']) == 50 and len(second['items']) == 2
+    assert not {row['id'] for row in first['items']} & {row['id'] for row in second['items']}
+    match = client.get('/api/remediation-packages?page=1&page_size=50&include_archived=true&view=All&q=Wave%2000').json()
+    assert match['total'] == 1 and match['items'][0]['name'] == 'Wave 00'
+    package_id = first['items'][0]['id']
+    saved = client.put(f'/api/remediation-packages/{package_id}', json={'jira_reference': 'TASK-1', 'change_window': 'Friday', 'owner_id': 1})
+    assert saved.status_code == 200, saved.text
+    cleared = client.put(f'/api/remediation-packages/{package_id}', json={'jira_reference': None, 'change_window': None, 'owner_id': None})
+    assert cleared.status_code == 200, cleared.text
+    assert all(cleared.json()[key] is None for key in ('jira_reference', 'change_window', 'owner_id'))
+    archived = client.post(f'/api/remediation-packages/{package_id}/archive').json()
+    assert archived['archived'] is True
+    assert client.get('/api/remediation-packages?page=1&include_archived=true&view=Archived').json()['total'] == 1
+    assert client.get('/api/remediation-packages?page=1&include_archived=true&view=Active').json()['total'] == 51
+
+def test_remediation_package_closure_uses_final_links_and_preserves_history(client, db):
+    from app.models import RemediationPackageEvent
+    login(client)
+    first = create(client)
+    second_data = {**DATA, 'hostname': 'SECOND'}
+    second = client.post('/api/findings', json=second_data).json()
+    package = client.post('/api/remediation-packages', json={'name': 'Closure check', 'remediation_action': 'Patch', 'finding_ids': [first['id']]}).json()
+    package_id = package['id']
+    evidence = client.post(f'/api/remediation-packages/{package_id}/evidence', json={'evidence_type': 'rescan', 'reference': 'scan'}).json()
+    assert client.post(f"/api/remediation-packages/{package_id}/evidence/{evidence['id']}/verify").status_code == 200
+    rejected = client.put(f'/api/remediation-packages/{package_id}', json={'finding_ids': [first['id'], second['id']], 'status': 'Verified Closed'})
+    assert rejected.status_code == 409
+    assert client.get(f'/api/remediation-packages/{package_id}').json()['finding_ids'] == [first['id']]
+    assert client.put(f'/api/remediation-packages/{package_id}', json={'status': 'Verified Closed'}).status_code == 200
+    assert client.put(f'/api/remediation-packages/{package_id}', json={'finding_ids': [first['id'], second['id']]}).status_code == 409
+    reopened = client.put(f'/api/remediation-packages/{package_id}', json={'status': 'Reopened', 'finding_ids': [first['id'], second['id']]})
+    assert reopened.status_code == 200 and set(reopened.json()['finding_ids']) == {first['id'], second['id']}
+    assert db.query(RemediationPackageEvent).filter_by(package_id=package_id).count() >= 4
+
+def test_remediation_package_filters_preserve_workspace_and_writer_roles(client):
+    login(client)
+    package = client.post('/api/remediation-packages', json={'name': 'Production package', 'remediation_action': 'Patch'}).json()
+    login(client, 'viewer')
+    assert client.get('/api/remediation-packages?page=1&view=All&include_archived=true').json()['total'] == 1
+    assert client.post('/api/remediation-packages', json={'name': 'Denied', 'remediation_action': 'Patch'}).status_code == 403
+    assert client.put(f"/api/remediation-packages/{package['id']}", json={'name': 'Denied'}).status_code == 403
+    login(client, environment='Demo')
+    assert client.get('/api/remediation-packages?page=1&view=All&include_archived=true').json()['total'] == 0
+    assert client.get(f"/api/remediation-packages/{package['id']}").status_code == 404
+
 def test_remediation_package_2_suggests_compatible_work_and_tracks_progress(client):
     login(client); finding = create(client)
     suggestions = client.get('/api/remediation-packages/suggestions')
