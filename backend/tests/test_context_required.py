@@ -302,10 +302,10 @@ def test_admin_bulk_request_cannot_self_validate_or_self_approve_or_use_job_bypa
     assert client.post(f'/api/classification-change-requests/{rid}/owner-validation', json={'justification':'Self review','evidence':'CMDB'}).status_code == 403
     assert client.put(f'/api/classification-change-requests/{rid}', json={'status':'Approved','justification':'Self approval'}).status_code == 403
     response = client.post('/api/classification-decision-jobs', json={'request_ids':[rid],'status':'Approved','justification':'Bypass attempt','idempotency_key':'cannot-bypass-owner-grc'})
-    assert response.status_code == 202
-    assert process_one(db)
-    outcome = client.get(f"/api/classification-decision-jobs/{response.json()['id']}").json()
-    assert outcome['failed'] == 1 and outcome['succeeded'] == 0
+    assert response.status_code == 403
+    assert 'different GRC administrator' in response.json()['detail']
+    assert not process_one(db)
+    assert db.scalar(select(func.count()).select_from(ClassificationDecisionJob)) == 0
     db.refresh(asset)
     assert asset.context == {}
     login(client,'analyst',environment='Demo')

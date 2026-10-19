@@ -1,6 +1,6 @@
 from conftest import login
 from app.api.classification_jobs import process_one
-from app.models import Asset, AssetClassificationChangeRequest, ClassificationDecisionJob
+from app.models import Asset, AssetClassificationChangeRequest, ClassificationDecisionJob, Audit
 
 def test_durable_approval_replay_isolation_and_checkpoint(client, db):
     login(client)
@@ -74,3 +74,50 @@ def test_large_selection_uses_one_server_job(client, db):
     assert result.status_code==202 and result.json()['total']==37558
     assert process_one(db)
     assert client.get(f"/api/classification-decision-jobs/{result.json()['id']}").json()['processed']==1
+
+
+def test_self_authored_bulk_preflight_does_not_queue(client, db):
+    login(client)
+    asset = Asset(hostname='bulk-sod', workspace='Production', context={}, tags=[])
+    db.add(asset); db.flush()
+    row = AssetClassificationChangeRequest(
+        asset_id=asset.id, workspace='Production', requested_by=1,
+        expected_context_version=asset.context_version, before_context={},
+        proposed_context={'environment': 'Production'},
+        justification='Validated inventory', evidence='CMDB')
+    db.add(row); db.flush()
+    db.add(Audit(actor_id=1, action='asset.classification_change_requested.bulk',
+                 entity='asset', entity_id=asset.id, details={'request_id':row.id}))
+    db.commit()
+    body = {'request_ids':[row.id], 'status':'Approved',
+            'justification':'Review', 'idempotency_key':'sod-reject'}
+    response = client.post('/api/classification-decision-jobs', json=body)
+    assert response.status_code == 403
+    assert 'different GRC administrator' in response.json()['detail']
+    assert db.query(ClassificationDecisionJob).count() == 0
+
+
+def test_existing_job_blocks_without_consuming_reviewer_ineligible_requests(client, db):
+    login(client)
+    asset = Asset(hostname='blocked-sod', workspace='Production', context={}, tags=[])
+    db.add(asset); db.flush()
+    row = AssetClassificationChangeRequest(
+        asset_id=asset.id, workspace='Production', requested_by=1,
+        expected_context_version=asset.context_version, before_context={},
+        proposed_context={'environment': 'Production'},
+        justification='Validated inventory', evidence='CMDB')
+    db.add(row); db.flush()
+    db.add(Audit(actor_id=1, action='asset.classification_change_requested.bulk',
+                 entity='asset', entity_id=asset.id, details={'request_id':row.id}))
+    job = ClassificationDecisionJob(
+        workspace='Production', requested_by=1, idempotency_key='existing-sod',
+        status='Queued', payload={'status':'Approved', 'justification':'Review'},
+        request_ids=[row.id])
+    db.add(job); db.commit()
+    assert process_one(db)
+    db.refresh(job); db.refresh(row)
+    assert job.status == 'Blocked'
+    assert job.processed == job.failed == job.succeeded == 0
+    assert job.errors[0]['request_id'] == row.id
+    assert row.status == 'Requested'
+    assert not process_one(db)
