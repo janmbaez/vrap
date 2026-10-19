@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, User } from '../api'
-import { Badge, ErrorBox } from './UI'
+import { Badge, ErrorBox, Loading } from './UI'
 import ContextClassificationReviews from './ContextClassificationReviews'
 
 type Filters = Record<'q'|'subcategory'|'os'|'device_type'|'missing_field'|'raci_owner'|'tag'|'environment'|'regulatory', string>
@@ -87,7 +87,7 @@ export default function ContextRequired({user}:{user:User}) {
       {filterSelect('environment','Environment',environments)}{filterSelect('regulatory','Regulatory scope',scopes)}
       <button onClick={()=>changeFilters({...emptyFilters})}>Clear filters</button>
     </div>
-    <p role="status">{loading?'Loading matching findings…':`${count.toLocaleString()} unique assets selected${all?' across all matching pages':''}.`}</p>
+    {loading?<Loading compact>Loading matching findings…</Loading>:<p role="status">{`${count.toLocaleString()} unique assets selected${all?' across all matching pages':''}.`}</p>}
     {!loading&&<div className="table-scroll"><table><thead><tr><th>Select asset</th><th>Category</th><th>Asset</th><th>Missing fields</th><th>Status</th></tr></thead><tbody>
       {data?.items.map(row=><tr key={row.finding_id}><td><input type="checkbox" aria-label={`Select asset ${row.asset.hostname} for finding ${row.finding_id}`} disabled={all||user.role==='Viewer'} checked={all||selected.includes(row.asset.id)} onChange={e=>{setSelected(ids=>e.target.checked?[...new Set([...ids,row.asset.id])]:ids.filter(id=>id!==row.asset.id));setPreview(undefined)}}/></td><td>{row.category}</td><td><strong>{row.asset.hostname}</strong><small>{row.asset.ip||'IP unknown'} · {row.asset.os||'OS unknown'}</small></td><td>{row.missing_fields.join(', ')}</td><td><Badge>Technical Completed · Context Required</Badge></td></tr>)}
       {!data?.items.length&&<tr><td colSpan={5}>No matching findings.</td></tr>}
