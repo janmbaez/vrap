@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 from cryptography.fernet import Fernet
 from app.config import settings
-from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,Finding,FindingWorkflow,ImportRow,IntegrationSettings,SyncJob,User,Vulnerability,RiskScore,now
+from app.models import Assessment,Asset,AssetRegulatoryScope,Audit,Finding,FindingWorkflow,ImportRow,IntegrationSettings,SyncJob,User,Vulnerability,RiskScore,Methodology,now
 from app.api.tenable import recover_stale_syncs
 from app.risk.policy import DEFAULT
 from conftest import login
@@ -554,14 +554,22 @@ def test_remediation_package_archive_restore_and_guarded_delete(client):
     assert restored.status_code == 200 and restored.json()['archived'] is False
     assert client.delete(f'/api/remediation-packages/{pid}').status_code == 409
 
-def test_smart_assessment_context_required_bulk_classification_is_governed(client):
+def test_smart_assessment_context_required_bulk_classification_is_governed(client, db):
     login(client); finding = create(client)
     asset_id = finding['asset']['id']
+    method = db.scalar(select(Methodology))
+    db.add(Assessment(instance_id=finding['id'], revision=1, methodology_id=method.id,
+                      analyst_id=1, context={}, justification='Technical investigation complete',
+                      decision='Remediation Required', status='Context Required'))
+    db.commit()
     response = client.get('/api/smart-assessment/context-required?limit=10')
-    assert response.status_code == 200 and {'items', 'total'} <= set(response.json())
+    assert response.status_code == 200 and response.json()['assets_total'] == 1
+    payload = {'asset_ids': [asset_id], 'changes': {'environment': 'Production'},
+               'justification': 'Validated by CMDB owner', 'evidence': 'CMDB-123'}
+    preview = client.post('/api/smart-assessment/context-required/bulk-classify', json={**payload, 'dry_run': True})
+    assert preview.status_code == 202, preview.text
     submitted = client.post('/api/smart-assessment/context-required/bulk-classify', json={
-        'asset_ids': [asset_id], 'changes': {'environment': 'Production'},
-        'justification': 'Validated by CMDB owner', 'evidence': 'CMDB-123'})
+        **payload, 'confirmed': True, 'preview_token': preview.json()['preview_token']})
     assert submitted.status_code == 202, submitted.text
     assert submitted.json()['status'] == 'Awaiting Approval'
     rejected = client.post('/api/smart-assessment/context-required/bulk-classify', json={'asset_ids': [asset_id], 'changes': {'environment': 'Test'}})

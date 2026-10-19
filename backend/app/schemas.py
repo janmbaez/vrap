@@ -240,14 +240,60 @@ class ClassificationChangeRequestInput(Strict):
             raise ValueError('At least one governed asset field is required')
         return self
 
+class ContextRequiredFilters(Strict):
+    q: str = Field(default='', max_length=500)
+    subcategory: Literal['', 'Windows Servers', 'Windows Workstations', 'Linux Servers', 'Network Devices', 'Storage', 'Databases', 'Cloud', 'Applications', 'Unknown'] = ''
+    os: str = Field(default='', max_length=200)
+    device_type: str = Field(default='', max_length=200)
+    missing_field: str = Field(default='', max_length=100)
+    raci_owner: str = Field(default='', max_length=200)
+    tag: str = Field(default='', max_length=500)
+    environment: Literal['', 'Development', 'Test', 'QA', 'Staging', 'Production'] = ''
+    regulatory: Literal['', 'PCI DSS', 'SOC 2', 'SOX', 'HIPAA', 'GDPR', 'Other', 'None'] = ''
+
+    @field_validator('*', mode='before')
+    @classmethod
+    def trim(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class ContextRequiredPage(ContextRequiredFilters):
+    limit: int = Field(default=100, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
+
+    def selection(self):
+        return ContextRequiredFilters.model_validate(self.model_dump(exclude={'limit', 'offset'}))
+
+
 class BulkClassificationChangeInput(Strict):
     asset_ids: list[int] = Field(default_factory=list, max_length=100000)
-    selection: dict[str, Any] = Field(default_factory=dict, max_length=30)
+    selection: ContextRequiredFilters | None = None
     changes: AssetUpdate = Field(default_factory=AssetUpdate)
     per_asset_changes: dict[str, AssetUpdate] = Field(default_factory=dict, max_length=5000)
-    justification: str = Field(min_length=1, max_length=5000)
+    justification: str = Field(default='', max_length=5000)
     evidence: str = Field(default='', max_length=10000)
     dry_run: bool = False
+    preview_token: str | None = Field(default=None, max_length=200)
+    confirmed: bool = False
+
+    @model_validator(mode='after')
+    def valid_selection(self):
+        if self.selection is not None and self.asset_ids:
+            raise ValueError('Choose explicit assets or all matching filters, never both')
+        if self.selection is None and not self.asset_ids:
+            raise ValueError('Select at least one asset')
+        if any(asset_id <= 0 for asset_id in self.asset_ids):
+            raise ValueError('Asset IDs must be positive')
+        for changes in [self.changes, *self.per_asset_changes.values()]:
+            if changes.regulatory and 'None' in changes.regulatory and len(changes.regulatory) > 1:
+                raise ValueError('None cannot be combined with regulatory scopes')
+        return self
+
+
+class ClassificationOwnerValidation(Strict):
+    justification: str = Field(min_length=1, max_length=5000)
+    evidence: str = Field(min_length=1, max_length=10000)
+
 
 class ClassificationChangeDecision(Strict):
     status: Literal['Approved', 'Rejected']
