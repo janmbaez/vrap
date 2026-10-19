@@ -546,3 +546,19 @@ class CampaignAuditEvent(Base):
     action: Mapped[str] = mapped_column(String(100))
     details: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class ClassificationDecisionJob(Base):
+    __tablename__ = 'classification_decision_jobs'
+    __table_args__ = (UniqueConstraint('workspace', 'idempotency_key'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), index=True)
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(30), default='Queued')
+    payload: Mapped[dict] = mapped_column(JSON)
+    request_ids: Mapped[list] = mapped_column(JSON)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[list] = mapped_column(JSON, default=list)

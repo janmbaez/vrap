@@ -103,41 +103,66 @@ export function ClassificationChangeReviewQueue({ onApplied }: { onApplied: () =
   const [bulkReason, setBulkReason] = useState('')
   const [bulkStatus, setBulkStatus] = useState<'Approved' | 'Rejected'>('Approved')
   const [bulkBusy, setBulkBusy] = useState(false)
-  const [bulkProgress, setBulkProgress] = useState(0)
-  const load = () => api<any[]>('/classification-change-requests?status=Requested').then(setRows).catch(cause => setError((cause as Error).message))
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(0)
+  const [maxId, setMaxId] = useState<number | null>(null)
+  const [selectionMaxId, setSelectionMaxId] = useState<number | null>(null)
+  const [selectionTotal, setSelectionTotal] = useState(0)
+  const [allPending, setAllPending] = useState(false)
+  const [excluded, setExcluded] = useState<number[]>([])
+  const selectedCount = allPending ? Math.max(0, selectionTotal - excluded.length) : selected.length
+  const isSelected = (id: number) => allPending ? id <= (selectionMaxId || 0) && !excluded.includes(id) : selected.includes(id)
+  const toggle = (id: number, checked: boolean) => {
+    if (allPending) setExcluded(values => checked ? values.filter(value => value !== id) : [...new Set([...values, id])])
+    else setSelected(values => checked ? [...new Set([...values, id])] : values.filter(value => value !== id))
+  }
+  const load = () => api<any>(`/classification-change-requests?status=Requested&limit=100&offset=${page * 100}`).then(result => { setRows(result.items); setTotal(result.total); setMaxId(result.max_id) }).catch(cause => setError((cause as Error).message))
   // The queue is intentionally a small, explicit reviewer surface rather than
   // an automatic approval hidden inside an asset form.
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [page])
   async function decide(row: any, status: 'Approved' | 'Rejected') {
     const justification = reasons[row.id]?.trim()
     if (!justification) { setError('Enter a decision rationale before approving or rejecting.'); return }
     setBusy(row.id); setError('')
     try {
       await api(`/classification-change-requests/${row.id}`, { method: 'PUT', body: JSON.stringify({ status, justification }) })
-      setRows(values => values.filter(value => value.id !== row.id)); onApplied()
+      load(); onApplied()
     } catch (cause) { setError((cause as Error).message); load() } finally { setBusy(null) }
   }
+  const [decisionJob,setDecisionJob] = useState<any>()
+  const [jobId,setJobId] = useState<number>(()=>Number(sessionStorage.getItem('classificationDecisionJob')||0))
+  useEffect(()=>{
+    if(!jobId)return
+    let live=true
+    const poll=async()=>{
+      try{
+        const result=await api<any>(`/classification-decision-jobs/${jobId}`)
+        if(!live)return
+        setDecisionJob(result)
+        if(result.status.startsWith('Completed')){
+          sessionStorage.removeItem('classificationDecisionJob');setJobId(0);load();onApplied()
+        }
+      }catch(cause){if(live)setError(`Progress unavailable; the server job continues. ${(cause as Error).message}`)}
+    }
+    poll();const timer=setInterval(poll,3000)
+    return()=>{live=false;clearInterval(timer)}
+  },[jobId])
   async function decideBulk() {
     const rationale = bulkReason.trim()
     if (!rationale) { setError('Enter one decision rationale for the selected requests.'); return }
-    setBulkBusy(true); setBulkProgress(0); setError('')
+    setBulkBusy(true); setError('')
     try {
-      let failed = 0
-      const ids = [...selected]
-      const decideWithRetry = async (id:number) => {
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try { return await api(`/classification-change-requests/${id}`, { method: 'PUT', body: JSON.stringify({ status: bulkStatus, justification: rationale }) }) }
-          catch (cause) { if (attempt === 2) throw cause; await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1))) }
-        }
-      }
-      for (let index = 0; index < ids.length; index += 5) {
-        const results = await Promise.allSettled(ids.slice(index, index + 5).map(decideWithRetry))
-        failed += results.filter(result => result.status === 'rejected').length
-        setBulkProgress(Math.min(ids.length, index + 25))
-      }
-      setSelected([]); setBulkOpen(false); setBulkReason(''); load(); onApplied()
-      if (failed) setError(`${failed} request(s) were already decided or could not be updated; the queue was refreshed.`)
-    } catch (cause) { setError((cause as Error).message); load() } finally { setBulkBusy(false); setBulkProgress(0) }
+      const submission = {request_ids: allPending ? [] : selected, all_pending: allPending, through_id: allPending ? selectionMaxId : null, excluded_ids: allPending ? excluded : [], status:bulkStatus, justification:rationale}
+      const fingerprint = JSON.stringify(submission)
+      const previous = sessionStorage.getItem('classificationSubmissionFingerprint')
+      const key = previous === fingerprint && sessionStorage.getItem('classificationSubmissionKey') || Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, '0')).join('')
+      sessionStorage.setItem('classificationSubmissionKey',key)
+      sessionStorage.setItem('classificationSubmissionFingerprint',fingerprint)
+      const result=await api<any>('/classification-decision-jobs',{method:'POST',body:JSON.stringify({...submission,idempotency_key:key})})
+      sessionStorage.removeItem('classificationSubmissionKey'); sessionStorage.removeItem('classificationSubmissionFingerprint')
+      sessionStorage.setItem('classificationDecisionJob',String(result.id))
+      setJobId(result.id);setDecisionJob(result);setSelected([]);setAllPending(false);setExcluded([]);setBulkOpen(false);setBulkReason('')
+    }catch(cause){setError((cause as Error).message)}finally{setBulkBusy(false)}
   }
-  return <><section className="panel table-panel"><div className="section-head"><div><h2>Classification change review queue</h2><p>Approve or reject protected asset changes with an auditable reviewer rationale.</p></div><div className="actions"><button onClick={()=>setSelected(rows.map(row=>row.id))} disabled={!rows.length}>Select all pending</button>{selected.length>0&&<button className="primary" onClick={()=>setBulkOpen(true)}>Review {selected.length} selected</button>}<button onClick={load}>Refresh</button></div></div><ErrorBox error={error}/>{error&&<button onClick={()=>navigate('/assessments')}>Review missing context in Smart Assessment</button>}{rows.length ? <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="Select all pending requests" checked={rows.length>0&&selected.length===rows.length} onChange={event=>setSelected(event.target.checked?rows.map(row=>row.id):[])}/></th><th>Asset</th><th>Requested change</th><th>Evidence</th><th>Decision rationale</th><th></th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td><input type="checkbox" aria-label={`Select request ${row.id}`} checked={selected.includes(row.id)} onChange={event=>setSelected(values=>event.target.checked?[...values,row.id]:values.filter(id=>id!==row.id))}/></td><td><strong className="mono">{row.asset_hostname}</strong><small>Request #{row.id} · {new Date(row.created_at).toLocaleString()}</small></td><td><details><summary>View before / proposed</summary><pre>{JSON.stringify({ before: row.before_context, proposed: row.proposed_context }, null, 2)}</pre></details><small>{row.justification}</small></td><td>{row.evidence || 'No reference supplied'}</td><td><textarea aria-label={`Decision rationale for request ${row.id}`} rows={2} maxLength={5000} value={reasons[row.id] || ''} onChange={event => setReasons(values => ({ ...values, [row.id]: event.target.value }))} placeholder="Required reviewer rationale"/></td><td><div className="actions"><button className="primary" disabled={busy === row.id} onClick={() => decide(row, 'Approved')}><CheckCircle2 size={15}/>Approve</button><button disabled={busy === row.id} onClick={() => decide(row, 'Rejected')}>Reject</button></div></td></tr>)}</tbody></table></div> : <p className="helper">No pending classification changes in this environment.</p>}</section>{bulkOpen&&<div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true"><div className="section-head"><h2>Bulk decision</h2><button onClick={()=>setBulkOpen(false)}>Close</button></div><p>Apply one decision and rationale to {selected.length} selected requests.</p><label>Decision<select value={bulkStatus} onChange={event=>setBulkStatus(event.target.value as any)}><option value="Approved">Approve</option><option value="Rejected">Reject</option></select></label><label>Decision rationale *<textarea autoFocus value={bulkReason} onChange={event=>setBulkReason(event.target.value)} placeholder="Explain this decision for all selected requests"/></label><div className="actions"><button onClick={()=>setBulkOpen(false)} disabled={bulkBusy}>Cancel</button><button className="primary" onClick={decideBulk} disabled={bulkBusy}>{bulkBusy?`Saving ${bulkProgress}/${selected.length}…`:bulkStatus==='Approved'?'Approve selected':'Reject selected'}</button></div></div></div>}</>
+  return <><section className="panel table-panel"><div className="section-head"><div><h2>Classification change review queue</h2><p>Approve or reject protected asset changes with an auditable reviewer rationale.</p></div><div className="actions"><button onClick={()=>{setAllPending(true);setSelectionMaxId(maxId);setSelectionTotal(total);setSelected([]);setExcluded([])}} disabled={!total||!!jobId}>Select all pending</button>{selectedCount>0&&<button className="primary" onClick={()=>setBulkOpen(true)}>Review {selectedCount} selected</button>}<button onClick={load}>Refresh</button></div></div><ErrorBox error={error}/>{decisionJob&&<div role="status" className="notice"><strong>Approval job #{decisionJob.id}: {decisionJob.status}</strong><p>{decisionJob.processed} / {decisionJob.total} processed · {decisionJob.succeeded} saved · {decisionJob.skipped} already decided · {decisionJob.failed} failed</p>{decisionJob.errors?.length>0&&<details><summary>Request errors</summary>{decisionJob.errors.map((item:any)=><p key={item.request_id}>Request #{item.request_id}: {item.error}</p>)}</details>}</div>}{error&&<button onClick={()=>navigate('/assessments')}>Review missing context in Smart Assessment</button>}{rows.length ? <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="Select all pending requests" checked={rows.length>0&&rows.every(row=>isSelected(row.id))} onChange={event=>rows.forEach(row=>toggle(row.id,event.target.checked))}/></th><th>Asset</th><th>Requested change</th><th>Evidence</th><th>Decision rationale</th><th></th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td><input type="checkbox" aria-label={`Select request ${row.id}`} checked={isSelected(row.id)} onChange={event=>toggle(row.id,event.target.checked)}/></td><td><strong className="mono">{row.asset_hostname}</strong><small>Request #{row.id} · {new Date(row.created_at).toLocaleString()}</small></td><td><details><summary>View before / proposed</summary><pre>{JSON.stringify({ before: row.before_context, proposed: row.proposed_context }, null, 2)}</pre></details><small>{row.justification}</small></td><td>{row.evidence || 'No reference supplied'}</td><td><textarea aria-label={`Decision rationale for request ${row.id}`} rows={2} maxLength={5000} value={reasons[row.id] || ''} onChange={event => setReasons(values => ({ ...values, [row.id]: event.target.value }))} placeholder="Required reviewer rationale"/></td><td><div className="actions"><button className="primary" disabled={busy === row.id} onClick={() => decide(row, 'Approved')}><CheckCircle2 size={15}/>Approve</button><button disabled={busy === row.id} onClick={() => decide(row, 'Rejected')}>Reject</button></div></td></tr>)}</tbody></table></div> : <p className="helper">No pending classification changes in this environment.</p>}<div className="actions"><button disabled={page===0} onClick={()=>setPage(page-1)}>Previous</button><span>{total ? page*100+1 : 0}–{Math.min((page+1)*100,total)} of {total}</span><button disabled={(page+1)*100>=total} onClick={()=>setPage(page+1)}>Next</button><button onClick={()=>{setSelected([]);setAllPending(false);setExcluded([])}} disabled={!selectedCount}>Clear selection</button></div></section>{bulkOpen&&<div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true"><div className="section-head"><h2>Bulk decision</h2><ErrorBox error={error}/><button onClick={()=>setBulkOpen(false)}>Close</button></div><p>Apply one decision and rationale to {selectedCount} selected requests. {allPending && 'Only requests present when selected will be included; already decided requests are skipped.'}</p><label>Decision<select value={bulkStatus} onChange={event=>setBulkStatus(event.target.value as any)}><option value="Approved">Approve</option><option value="Rejected">Reject</option></select></label><label>Decision rationale *<textarea autoFocus value={bulkReason} onChange={event=>setBulkReason(event.target.value)} placeholder="Explain this decision for all selected requests"/></label><div className="actions"><button onClick={()=>setBulkOpen(false)} disabled={bulkBusy||!!jobId}>Cancel</button><button className="primary" onClick={decideBulk} disabled={bulkBusy||!!jobId}>{bulkBusy?'Submitting…':bulkStatus==='Approved'?'Approve selected':'Reject selected'}</button></div></div></div>}</>
 }

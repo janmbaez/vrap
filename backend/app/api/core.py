@@ -505,8 +505,8 @@ def update_asset(id: int, data: AssetEdit, request: Request, user=Depends(writer
     db.commit()
     return {**_asset_output(asset), 'findings_flagged': len(findings)}
 
-def _classification_request_output(db, item):
-    asset = db.get(Asset, item.asset_id)
+def _classification_request_output(db, item, asset=None):
+    asset = asset or db.get(Asset, item.asset_id)
     return {
         'id': item.id, 'asset_id': item.asset_id, 'asset_hostname': asset.hostname if asset else None,
         'workspace': item.workspace, 'status': item.status,
@@ -527,14 +527,21 @@ def classification_questionnaire(user=Depends(require_user)):
 
 
 @router.get('/classification-change-requests')
-def classification_change_requests(request: Request, status: str = '', user=Depends(require_user), db=Depends(get_db)):
+def classification_change_requests(request: Request, status: str = '', limit: int | None = Query(None, ge=1, le=500), offset: int = Query(0, ge=0), user=Depends(require_user), db=Depends(get_db)):
     query = select(AssetClassificationChangeRequest).where(
         AssetClassificationChangeRequest.workspace == request.state.session.workspace,
     )
     if status:
         query = query.where(AssetClassificationChangeRequest.status == status)
-    rows = db.scalars(query.order_by(AssetClassificationChangeRequest.id.desc())).all()
-    return [_classification_request_output(db, item) for item in rows]
+    total = db.scalar(select(func.count()).select_from(query.subquery())) if limit is not None else None
+    max_id = db.scalar(select(func.max(AssetClassificationChangeRequest.id)).where(AssetClassificationChangeRequest.workspace == request.state.session.workspace, AssetClassificationChangeRequest.status == status)) if limit is not None and status else None
+    query = query.order_by(AssetClassificationChangeRequest.id.desc())
+    if limit is not None:
+        query = query.offset(offset).limit(limit)
+    rows = db.scalars(query).all()
+    assets = {a.id: a for a in db.scalars(select(Asset).where(Asset.id.in_({r.asset_id for r in rows}))).all()}
+    items = [_classification_request_output(db, item, assets.get(item.asset_id)) for item in rows]
+    return {'items': items, 'total': total, 'max_id': max_id} if limit is not None else items
 
 
 def _mission_output(item):
@@ -740,8 +747,11 @@ def _recalculate_context_required(db, asset, actor_id):
 
 @router.put('/classification-change-requests/{id}')
 def decide_classification_change(id: int, data: ClassificationChangeDecision, request: Request, user=Depends(admin), db=Depends(get_db)):
-    item = db.get(AssetClassificationChangeRequest, id)
-    if not item or item.workspace != request.state.session.workspace:
+    return apply_classification_decision(id, data, request.state.session.workspace, user, db)
+
+def apply_classification_decision(id, data, workspace, user, db, commit=True):
+    item = db.scalar(select(AssetClassificationChangeRequest).where(AssetClassificationChangeRequest.id == id).with_for_update())
+    if not item or item.workspace != workspace:
         raise HTTPException(404, 'Classification change request not found')
     if item.status != 'Requested':
         raise HTTPException(409, 'Classification change request has already been decided')
@@ -752,9 +762,9 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
     item.approved_by = user.id
     item.reviewed_at = datetime.now(timezone.utc)
     item.decision_justification = data.justification.strip()
-    asset = db.get(Asset, item.asset_id)
+    asset = db.scalar(select(Asset).where(Asset.id == item.asset_id).with_for_update())
     if data.status == 'Approved':
-        if not asset or asset.workspace != request.state.session.workspace:
+        if not asset or asset.workspace != workspace:
             raise HTTPException(404, 'Asset not found')
         if asset.context_version != item.expected_context_version:
             raise HTTPException(409, 'Asset context changed since this request was submitted; submit a new request.')
@@ -813,7 +823,8 @@ def decide_classification_change(id: int, data: ClassificationChangeDecision, re
         _mission_history(db, mission, user.id, f'review_{data.status.lower()}')
     db.add(Audit(actor_id=user.id, action='asset.classification_change_' + data.status.casefold(), entity='asset', entity_id=item.asset_id,
                  details={'request_id': item.id, 'decision': data.status, 'reason': item.decision_justification, 'risk_recalculated': recalculated if data.status == 'Approved' else 0}))
-    db.commit(); db.refresh(item)
+    if commit:
+        db.commit(); db.refresh(item)
     return _classification_request_output(db, item)
 
 
