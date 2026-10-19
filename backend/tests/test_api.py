@@ -985,3 +985,38 @@ def test_raci_template_and_preview_import(client):
     upload = client.post('/api/raci/import', files={'file':('raci.xlsx', output.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')})
     assert upload.status_code == 201
     assert upload.json()['status'] == 'Preview'
+
+def test_mission_center_sql_order_filter_pages_and_workspace(client, db):
+    from sqlalchemy import event
+    login(client)
+    vuln = Vulnerability(identity='mission-fixture', plugin_id='mission', name='Mission fixture', technical={'severity': 'Low'})
+    db.add(vuln); db.flush()
+    for i in range(120):
+        asset = Asset(hostname=f'mission-{i:03}', workspace='Production', context={'asset_criticality': 'Low'})
+        db.add(asset); db.flush()
+        db.add(Finding(asset_id=asset.id, vulnerability_id=vuln.id, source='test', workspace='Production',
+                       observed={'technical': {'severity': 'Low', 'kev': i >= 110}}, revision=0))
+    other = Asset(hostname='mission-secret', workspace='Development', context={})
+    db.add(other); db.flush()
+    db.add(Finding(asset_id=other.id, vulnerability_id=vuln.id, source='test', workspace='Development', observed={'technical': {'severity': 'Critical'}}))
+    db.commit()
+    statements = []
+    def track(_conn, _cursor, statement, _params, _context, _executemany):
+        if 'vulnerability_instances' in statement:
+            statements.append(statement)
+    event.listen(db.bind, 'before_cursor_execute', track)
+    try:
+        first = client.get('/api/mission-center?queue=urgent_review&page_size=3').json()
+        second = client.get('/api/mission-center?queue=urgent_review&page_size=3&page=2').json()
+        filtered = client.get('/api/mission-center?q=mission-000').json()
+        owned = client.get('/api/mission-center?owner_id=999').json()
+    finally:
+        event.remove(db.bind, 'before_cursor_execute', track)
+    assert first['summary'] == {'urgent_review': 10}
+    ids1 = [row['finding_id'] for row in first['queues']['urgent_review']]
+    ids2 = [row['finding_id'] for row in second['queues']['urgent_review']]
+    assert len(ids1) == len(ids2) == 3 and ids1 == sorted(ids1) and max(ids1) < min(ids2)
+    assert filtered['summary']['automated_provisional'] == 1
+    assert sum(owned['summary'].values()) == 0
+    assert all(row['asset'] != 'mission-secret' for row in filtered['queues']['automated_provisional'])
+    assert len(statements) <= 12

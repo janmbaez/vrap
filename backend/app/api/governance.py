@@ -5,7 +5,7 @@ import uuid
 from io import BytesIO, StringIO
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
-from sqlalchemy import select, func, case, update, delete, or_
+from sqlalchemy import select, func, case, update, delete, or_, and_
 from sqlalchemy.orm import aliased
 from ..db import get_db
 from ..auth import require_user, writer, admin
@@ -795,13 +795,41 @@ def bulk_assess_category(category_key: str, data: PluginBulkAssessmentInput, bac
 @router.get('/mission-center')
 def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), q: str = '', owner_id: int | None = None, user=Depends(require_user), db=Depends(get_db)):
     workspace = _workspace(request)
-    # Join the latest assessment once.  The previous implementation issued one
-    # query per finding and then paginated the complete inventory in Python.
-    latest_revision = (select(Assessment.instance_id.label('instance_id'),
-                              func.max(Assessment.revision).label('revision'))
-                       .group_by(Assessment.instance_id).subquery())
+    today = datetime.now(timezone.utc).date()
+    required_context = active_methodology(db).configuration.get('required_context', [])
+    latest_revision = (select(Assessment.instance_id.label('instance_id'), func.max(Assessment.revision).label('revision'))
+                       .join(Finding, Finding.id == Assessment.instance_id)
+                       .where(Finding.workspace == workspace).group_by(Assessment.instance_id).subquery())
     LatestAssessment = aliased(Assessment)
-    statement = (select(Finding, Vulnerability, Asset, FindingWorkflow, LatestAssessment)
+    observed = case((Finding.observed['technical'].is_not(None), Finding.observed['technical']), else_=Finding.observed)
+    def tech(key):
+        return func.coalesce(observed[key].as_string(), Vulnerability.technical[key].as_string())
+    def flag(key):
+        return func.coalesce(observed[key].as_boolean(), Vulnerability.technical[key].as_boolean(), False)
+    context = Asset.context
+    status = func.coalesce(FindingWorkflow.status, 'New')
+    overdue = and_(FindingWorkflow.remediation_due_at < datetime.combine(today, datetime.min.time(), timezone.utc),
+                   status.notin_(('Closed', 'Accepted')))
+    missing_fields = [field for field in required_context]
+    missing_context = or_(*(or_(context[field].as_string().is_(None), context[field].as_string() == '',
+                                context[field] == [])
+                            for field in missing_fields)) if missing_fields else False
+    missing = or_(LatestAssessment.id.is_(None), missing_context)
+    stale = and_(LatestAssessment.id.is_not(None), LatestAssessment.revision != Finding.revision)
+    severity = func.lower(func.coalesce(tech('severity'), ''))
+    priority = (case((flag('kev'), 40), else_=0) + case((flag('exploit_available'), 25), else_=0)
+                + case((context['asset_criticality'].as_string().in_(('Critical', 'High')), 20), else_=0)
+                + case((context['exposure'].as_string() == 'Internet Facing', 15), else_=0)
+                + case((overdue, 15), else_=0) + case((missing, 10), else_=0)
+                + case((stale, 10), else_=0)
+                + case((severity == 'critical', 20), (severity == 'high', 10), (severity == 'medium', 4), else_=0))
+    bucket = case((LatestAssessment.status == 'Context Required', 'missing_context_evidence'),
+                  (or_(severity.in_(('critical', 'high')), priority >= 45, overdue,
+                       status.in_(('Assessment In Progress', 'Above Risk Appetite'))), 'urgent_review'),
+                  (or_(stale, and_(LatestAssessment.id.is_(None), status.notin_(('Closed', 'Accepted')))),
+                   case((stale, 'monitor_reassess'), else_='automated_provisional')),
+                  (missing, 'missing_context_evidence'), else_='monitor_reassess')
+    statement = (select(Finding.id.label('finding_id'), priority.label('priority_score'), bucket.label('bucket'))
         .join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
         .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
         .outerjoin(latest_revision, latest_revision.c.instance_id == Finding.id)
@@ -816,11 +844,34 @@ def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1)
                                        func.lower(func.coalesce(Vulnerability.plugin_id, '')).like(term)))
     if owner_id is not None:
         statement = statement.where(FindingWorkflow.owner_id == owner_id)
-    rows = db.execute(statement.order_by(Finding.id.desc())).all()
-    queues = {key: [] for key in ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')}
-    today = datetime.now(timezone.utc).date()
-    required_context = active_methodology(db).configuration.get('required_context', [])
-    for finding, vuln, asset, workflow, assessment in rows:
+    ranked = statement.subquery()
+    keys = ('urgent_review', 'missing_context_evidence', 'automated_provisional', 'monitor_reassess')
+    selected = (queue,) if queue in keys else keys
+    counts = dict(db.execute(select(ranked.c.bucket, func.count()).group_by(ranked.c.bucket)).all())
+    queues = {}
+    for key in selected:
+        if not counts.get(key):
+            queues[key] = []
+            continue
+        page_ids = db.execute(select(ranked.c.finding_id, ranked.c.priority_score)
+                              .where(ranked.c.bucket == key)
+                              .order_by(ranked.c.priority_score.desc(), ranked.c.finding_id)
+                              .offset((page - 1) * page_size).limit(page_size)).all()
+        queues[key] = page_ids
+    ids = [finding_id for items in queues.values() for finding_id, _ in items]
+    details = (db.execute(select(Finding, Vulnerability, Asset, FindingWorkflow, LatestAssessment)
+               .join(Asset, Asset.id == Finding.asset_id).join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
+               .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
+               .outerjoin(latest_revision, latest_revision.c.instance_id == Finding.id)
+               .outerjoin(LatestAssessment, (LatestAssessment.instance_id == latest_revision.c.instance_id) &
+                          (LatestAssessment.revision == latest_revision.c.revision))
+               .where(Finding.id.in_(ids))).all() if ids else [])
+    by_id = {finding.id: (finding, vuln, asset, workflow, assessment)
+             for finding, vuln, asset, workflow, assessment in details}
+    output = {key: [] for key in selected}
+    for key, items in queues.items():
+      for finding_id, score in items:
+        finding, vuln, asset, workflow, assessment = by_id[finding_id]
         status = workflow.status if workflow else 'New'
         tech = {**(vuln.technical or {}), **(finding.observed or {}).get('technical', finding.observed or {})}
         context = asset.context or {}
@@ -835,21 +886,13 @@ def mission_center(request: Request, queue: str = '', page: int = Query(1, ge=1)
         missing = not assessment or bool(missing_fields)
         stale = bool(assessment and assessment.revision != finding.revision)
         severity = str(tech.get('severity') or '').lower()
-        priority = (40 if tech.get('kev') else 0) + (25 if tech.get('exploit_available') else 0) + (20 if context.get('asset_criticality') in ('Critical','High') else 0) + (15 if context.get('exposure') == 'Internet Facing' else 0) + (15 if overdue else 0) + (10 if missing else 0) + (10 if stale else 0) + ({'critical':20,'high':10,'medium':4}.get(severity, 0))
-        if assessment and assessment.status == 'Context Required': bucket = 'missing_context_evidence'
-        elif severity in ('critical', 'high') or priority >= 45 or overdue or status in ('Assessment In Progress', 'Above Risk Appetite'): bucket = 'urgent_review'
-        elif stale or (not assessment and status not in ('Closed', 'Accepted')): bucket = 'monitor_reassess' if stale else 'automated_provisional'
-        elif missing: bucket = 'missing_context_evidence'
-        else: bucket = 'monitor_reassess'
         item = {'finding_id': finding.id, 'name': vuln.name, 'asset': asset.hostname, 'plugin_id': vuln.plugin_id,
-                'status': status, 'owner_id': workflow.owner_id if workflow else None, 'priority_score': priority,
+                'status': status, 'owner_id': workflow.owner_id if workflow else None, 'priority_score': score,
                 'missing_fields': missing_fields, 'priority_factors': factors, 'overdue': overdue, 'recommended_action':
                 'Reassess changed evidence' if stale else ('Collect authoritative context/evidence' if missing else ('Address overdue remediation' if overdue else 'Open finding and complete the assessment'))}
-        queues[bucket].append(item)
-    for items in queues.values(): items.sort(key=lambda x: (-x['priority_score'], x['finding_id']))
-    selected = {queue: queues[queue]} if queue in queues else queues
-    return {'workspace': workspace, 'queues': {k: v[(page-1)*page_size:page*page_size] for k,v in selected.items()},
-            'summary': {key: len(value) for key, value in selected.items()}, 'page': page, 'page_size': page_size,
+        output[key].append(item)
+    return {'workspace': workspace, 'queues': output,
+            'summary': {key: counts.get(key, 0) for key in selected}, 'page': page, 'page_size': page_size,
             'generated_at': datetime.now(timezone.utc).isoformat()}
 
 def _package_output(db, package):
