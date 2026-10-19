@@ -19,7 +19,7 @@ from ..services import active_methodology, cleanup_tenable_duplicates, detail, t
 from ..risk.engine import calculate
 from ..asset_rules import PROTECTED_CONTEXT_FIELDS
 from ..vulnerability_questionnaire import QUESTIONNAIRE
-from ..kpis import calculate_kpis
+from ..kpis import calculate_kpis, evaluate_sla
 from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(tags=['Governance'])
@@ -1042,17 +1042,7 @@ def create_sla_policy(data: RemediationSLAPolicyInput, request: Request, user=De
 
 @router.get('/remediation-sla/evaluate')
 def evaluate_remediation_sla(request: Request, user=Depends(require_user), db=Depends(get_db)):
-    workspace = _workspace(request); today = datetime.now(timezone.utc).date()
-    defaults = {('PCI DSS','Critical'):30,('PCI DSS','High'):30,('PCI DSS','Medium'):90,('PCI DSS','Low'):180,('Non-PCI','Critical'):30,('Non-PCI','High'):60,('Non-PCI','Medium'):90,('Non-PCI','Low'):None}
-    policies = db.scalars(select(RemediationSLAPolicy).where(RemediationSLAPolicy.workspace == workspace, RemediationSLAPolicy.approved.is_(True), RemediationSLAPolicy.effective_from <= today, (RemediationSLAPolicy.effective_to.is_(None) | (RemediationSLAPolicy.effective_to >= today)))).all()
-    rows=[]
-    for finding, vuln, asset, workflow in db.execute(select(Finding,Vulnerability,Asset,FindingWorkflow).join(Vulnerability,Vulnerability.id==Finding.vulnerability_id).join(Asset,Asset.id==Finding.asset_id).outerjoin(FindingWorkflow,FindingWorkflow.finding_id==Finding.id).where(Finding.workspace==workspace)).all():
-        tech={**(vuln.technical or {}), **(finding.observed or {})}; severity=tech.get('severity','Low'); scopes=(asset.context or {}).get('regulatory') or []
-        obligations=[(s, next((p.days for p in policies if p.regulatory_scope==s and p.severity==severity), defaults.get((s,severity), defaults.get(('Non-PCI',severity)))) ) for s in (scopes or ['Non-PCI'])]
-        obligations=[x for x in obligations if x[1] is not None]; days=min((x[1] for x in obligations), default=None)
-        first=(finding.source_last_seen or today); age=(today-first).days; due=first+timedelta(days=days) if days else None
-        rows.append({'finding_id':finding.id,'severity':severity,'scopes':scopes,'first_seen':first.isoformat(),'age_days':age,'sla_days':days,'due_date':due.isoformat() if due else None,'overdue':bool(due and today>due),'due_soon':bool(due and not (today>due) and (due-today).days<=7),'exception':False})
-    return {'workspace':workspace,'policies':'provisional defaults plus approved overrides','total':len(rows),'overdue':sum(x['overdue'] for x in rows),'due_soon':sum(x['due_soon'] for x in rows),'items':rows}
+    return evaluate_sla(db, _workspace(request))
 
 def _executive_filters(request):
     allowed = ('period_start', 'period_end', 'severity', 'asset_group', 'business_owner', 'it_owner', 'application_owner', 'regulatory', 'campaign_id')
