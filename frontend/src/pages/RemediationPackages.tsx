@@ -82,14 +82,6 @@ export default function RemediationPackages({ user }: { user: User }) {
       show(await api(`/remediation-packages/${open.id}/${open.archived?'restore':'archive'}`, {method:'POST'})); reload()
     } catch (err) { setError((err as Error).message) } finally { setBusy(false) }
   }
-  async function remove() {
-    if (!open?.id || !confirm('Delete this empty package permanently?')) return
-    setBusy(true); setError('')
-    try {
-      await api(`/remediation-packages/${open.id}`, {method:'DELETE'}); setOpen(null); reload()
-    } catch (err) { setError((err as Error).message) } finally { setBusy(false) }
-  }
-
   return <>
     <PageTitle title="Remediation Work Packages 2.0" description="Coordinate compatible fixes across plugins and assets, then verify every finding." actions={<>
       <button onClick={reload} disabled={loading}><RefreshCw size={16}/> Refresh</button>
@@ -112,7 +104,7 @@ export default function RemediationPackages({ user }: { user: User }) {
       {tab==='Remediation'&&<div className="wide"><p>{(open.finding_statuses&&Object.entries(open.finding_statuses).map(([key,value])=>`${key}: ${value}`).join(' · '))||'No findings linked yet.'}</p><p>{(open.closure_blockers||[]).join('; ')||'No closure blockers.'}</p></div>}
       {tab==='Evidence'&&<div className="wide"><div className="inline-form"><input value={evidence} disabled={!canWrite||!open.id} onChange={event=>setEvidence(event.target.value)} placeholder="Rescan report or change record reference"/>{canWrite&&<button disabled={!open.id||busy} onClick={addEvidence}><ShieldCheck size={16}/> Add evidence</button>}</div>{(open.evidence||[]).map((item:any)=><div className="check-row" key={item.id}>{item.type}: {item.reference} · {item.verified?'Verified':user.role==='Administrator'?<button disabled={busy} onClick={()=>verify(item.id)}>Verify</button>:<span>Awaiting administrator verification</span>}</div>)}</div>}
       {tab==='Activity History'&&<p className="wide">Package changes are recorded in Audit History.</p>}
-      {canWrite&&<div className="inline-form wide"><button className="primary" disabled={busy||!open.name?.trim()||!open.remediation_action?.trim()} onClick={save}><Save size={16}/> Save package</button>{open.id&&<button disabled={busy} onClick={archive}>{open.archived?'Restore':'Archive'}</button>}{user.role==='Administrator'&&open.id&&!open.finding_ids?.length&&<button disabled={busy} onClick={remove}>Delete</button>}</div>}
+      {canWrite&&<div className="inline-form wide"><button className="primary" disabled={busy||!open.name?.trim()||!open.remediation_action?.trim()} onClick={save}><Save size={16}/> Save package</button>{open.id&&<button disabled={busy} onClick={archive}>{open.archived?'Restore':'Archive'}</button>}</div>}
     </section>}
   </>
 }
