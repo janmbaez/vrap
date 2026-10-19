@@ -2,7 +2,7 @@
 from threading import Event, Thread
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from ..auth import admin
 from ..db import SessionLocal, get_db
@@ -18,6 +18,28 @@ class Submission(ClassificationChangeDecision):
     excluded_ids: list[int] = Field(default_factory=list, max_length=100000)
     through_id: int | None = None
     idempotency_key: str = Field(min_length=1, max_length=120)
+
+def self_authored_bulk_request(db, workspace, user_id, ids, *, all_pending=False, through_id=None, excluded_ids=None):
+    """Find one bulk proposal authored by the reviewer before enqueuing a large job."""
+    base = (select(AssetClassificationChangeRequest.id)
+            .join(Audit, and_(
+                Audit.action == 'asset.classification_change_requested.bulk',
+                Audit.entity_id == AssetClassificationChangeRequest.asset_id,
+                Audit.details['request_id'].as_integer() == AssetClassificationChangeRequest.id))
+            .where(AssetClassificationChangeRequest.workspace == workspace,
+                   AssetClassificationChangeRequest.requested_by == user_id))
+    if all_pending:
+        query = base.where(AssetClassificationChangeRequest.status == 'Requested',
+                           AssetClassificationChangeRequest.id <= through_id)
+        if excluded_ids:
+            query = query.where(~AssetClassificationChangeRequest.id.in_(excluded_ids))
+        return db.scalar(query.limit(1))
+    for start in range(0, len(ids), 500):
+        found = db.scalar(base.where(AssetClassificationChangeRequest.id.in_(ids[start:start + 500])).limit(1))
+        if found is not None:
+            return found
+    return None
+
 
 def output(job):
     return {key: getattr(job, key) for key in ('id','status','processed','succeeded','skipped','failed','errors')} | {'total': len(job.request_ids)}
@@ -48,6 +70,13 @@ def submit(data: Submission, request: Request, user=Depends(admin), db=Depends(g
             raise HTTPException(404, 'Selection contains unavailable requests')
     if not ids:
         raise HTTPException(422, 'No pending requests selected')
+    conflicting = self_authored_bulk_request(
+        db, workspace, user.id, ids, all_pending=data.all_pending,
+        through_id=data.through_id, excluded_ids=data.excluded_ids)
+    if conflicting is not None:
+        raise HTTPException(403, f'Request #{conflicting} was submitted by your account. '
+                            'Bulk classifications require a different GRC administrator '
+                            'and independent owner validation before approval.')
     job = ClassificationDecisionJob(workspace=workspace, requested_by=user.id, idempotency_key=data.idempotency_key, payload=payload, request_ids=ids)
     db.add(job); db.flush()
     db.add(Audit(actor_id=user.id, action='classification.bulk_decision_queued', entity='classification_job', entity_id=job.id, details={'total':len(ids),'decision':data.status}))
@@ -81,6 +110,17 @@ def process_one(db):
                     apply_classification_decision(request_id, ClassificationChangeDecision(status=job.payload['status'], justification=job.payload['justification']), job.workspace, user, db, commit=False)
                     job.succeeded += 1
         except HTTPException as exc:
+            # A global SoD/reviewer prerequisite must not consume tens of
+            # thousands of pending requests as individual failed decisions.
+            if exc.status_code == 403 and str(exc.detail) in (
+                'Bulk classification requires an independent GRC reviewer',
+                'Independent assigned owner validation and GRC approval are required',
+            ):
+                job.status = 'Blocked'
+                if len(job.errors) < 100:
+                    job.errors = [*job.errors, {'request_id': request_id, 'error': str(exc.detail)}]
+                db.commit()
+                return True
             job.failed += 1
             if len(job.errors) < 100:
                 job.errors = [*job.errors, {'request_id':request_id,'error':str(exc.detail)}]
