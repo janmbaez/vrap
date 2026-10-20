@@ -1,12 +1,15 @@
 """Cohort parity, confirmation, workspace and approval boundaries through the API."""
 from datetime import datetime, timezone, timedelta
+from time import monotonic
 
 import pytest
-from sqlalchemy import select, func, event
+from sqlalchemy import select, func, event, insert
 
-from app.models import (Asset, Finding, Vulnerability, Assessment, Methodology, Audit, User,
+from app.models import (Asset, Finding, FindingWorkflow, Vulnerability, Assessment, Methodology, Audit, User,
                         AssetClassificationChangeRequest, AssetRegulatoryScope, AssetClassificationMission)
 from conftest import login
+from app.api.context_jobs import process_batch
+from app.models import ContextClassificationJob
 
 URL = '/api/smart-assessment/context-required'
 
@@ -107,6 +110,127 @@ def test_regulatory_and_tags_use_exact_membership_not_substrings(client, db):
     assert listed['assets_total'] == 1 and listed['items'][0]['asset']['id'] == target.id
     assert client.get(URL, params={'regulatory': 'SOC'}).status_code == 422
     assert client.get(URL, params={'regulatory': 'PCI DSS', 'tag': 'bl'}).json()['total'] == 0
+    without_scope = add_asset(db, 'without-scope')
+    none = client.get(URL, params={'regulatory': 'None'}).json()
+    assert none['assets_total'] == 1 and none['items'][0]['asset']['id'] == without_scope.id
+
+
+def test_search_matches_asset_os_plugin_and_displayed_subcategory(client, db):
+    login(client, 'analyst')
+    asset = add_asset(db, 'target-host', os='Windows Server 2022', findings=2)
+    asset.ip = '10.7.8.9'
+    vulnerability = db.scalar(select(Vulnerability).where(Vulnerability.plugin_id == 'target-host-0'))
+    vulnerability.plugin_id = 'PLUGIN-7142'
+    vulnerability.name = 'Special TLS finding'
+    db.commit()
+    for term, expected in [('target-host', 2), ('10.7.8.9', 2), ('Server 2022', 2),
+                           ('PLUGIN-7142', 1), ('Special TLS', 1), ('Windows Servers', 2)]:
+        result = client.get(URL, params={'q': term}).json()
+        assert result['total'] == expected
+        body = payload(selection={'q': term})
+        assert preview(client, body)['findings_selected'] == expected
+
+
+def test_all_matching_exclusions_and_duplicate_findings_count_distinct_assets(client, db):
+    login(client, 'analyst')
+    first = add_asset(db, 'win-a', os='Windows Server', findings=3)
+    second = add_asset(db, 'win-b', os='Windows Server', findings=2)
+    add_asset(db, 'linux', os='Debian', findings=4)
+    selection = {'selection': {'subcategory': 'Windows Servers'}, 'exclude_asset_ids': [second.id]}
+    summary = client.post(URL+'/selection-summary', json=selection)
+    assert summary.status_code == 200, summary.text
+    assert summary.json() == {'assets_selected': 1, 'findings_selected': 3}
+    checked = preview(client, payload(**selection))
+    assert (checked['assets_selected'], checked['findings_selected']) == (1, 3)
+    assert submit(client, payload(**selection), checked).json()['requests_created'] == 1
+    assert db.scalar(select(AssetClassificationChangeRequest.asset_id)) == first.id
+
+
+def test_closed_stale_and_old_methodology_assessments_are_excluded(client, db):
+    login(client, 'analyst')
+    active = add_asset(db, 'active')
+    closed = add_asset(db, 'closed')
+    stale = add_asset(db, 'stale')
+    older_method = add_asset(db, 'older-method')
+    closed_finding = db.scalar(select(Finding).where(Finding.asset_id == closed.id))
+    db.add(FindingWorkflow(finding_id=closed_finding.id, status='Closed', updated_by=1))
+    stale_finding = db.scalar(select(Finding).where(Finding.asset_id == stale.id))
+    stale_finding.revision += 1
+    historical = db.scalar(select(Assessment).join(Finding, Finding.id == Assessment.instance_id).where(Finding.asset_id == older_method.id))
+    historical.methodology_id = db.scalar(select(Methodology.id).where(Methodology.id != historical.methodology_id)) or historical.methodology_id
+    db.commit()
+    result = client.get(URL).json()
+    assert active.id in {row['asset']['id'] for row in result['items']}
+    assert closed.id not in {row['asset']['id'] for row in result['items']}
+    assert stale.id not in {row['asset']['id'] for row in result['items']}
+
+
+def test_large_selection_queues_chunked_job_and_retries_conflicted_asset(client, db):
+    login(client, 'analyst')
+    assets = [add_asset(db, f'bulk-{index:04d}', findings=2) for index in range(205)]
+    body = payload(selection={'q': 'bulk-'})
+    checked = preview(client, body)
+    assert (checked['assets_selected'], checked['findings_selected']) == (205, 410)
+    response = submit(client, body, checked)
+    assert response.status_code == 202, response.text
+    assert response.json()['status'] == 'Queued' and response.json()['requests_created'] == 0
+    job_id = response.json()['job_id']
+    assert client.post(f'{URL}/jobs/{job_id}/cancel').json()['status'] == 'Cancel requested'
+    assert process_batch(db)
+    assert client.get(f'{URL}/jobs/{job_id}').json()['status'] == 'Canceled'
+    assert client.post(f'{URL}/jobs/{job_id}/retry').json()['queued'] == 205
+    # A protected asset changed after confirmation; the worker must not overwrite it.
+    changed = assets[-1]
+    changed.context_version += 1
+    db.commit()
+    while process_batch(db, size=40):
+        pass
+    progress = client.get(f'{URL}/jobs/{job_id}')
+    assert progress.status_code == 200
+    assert progress.json()['awaiting_approval'] == 204
+    assert progress.json()['conflicted'] == 1
+    assert db.scalar(select(func.count()).select_from(AssetClassificationChangeRequest)) == 204
+    # Retry does not duplicate those 204 requests or bypass changed context.
+    retry = client.post(f'{URL}/jobs/{job_id}/retry')
+    assert retry.status_code == 200
+    assert retry.json()['total'] == 205 and retry.json()['queued'] == 1
+    assert process_batch(db)
+    assert db.scalar(select(func.count()).select_from(AssetClassificationChangeRequest)) == 204
+    login(client, 'analyst', environment='Demo')
+    assert client.get(f'{URL}/jobs/{job_id}').status_code == 404
+
+
+def test_35000_findings_select_all_beyond_100_pages_queues_without_request_timeout(client, db):
+    login(client, 'analyst')
+    method = db.scalar(select(Methodology))
+    analyst = db.scalar(select(User).where(User.username == 'analyst'))
+    vulnerability = Vulnerability(identity='large-cohort', plugin_id='large-100',
+                                  name='Large cohort plugin', technical={})
+    db.add(vulnerability); db.flush()
+    db.execute(insert(Asset), [{'hostname': f'large-{index:05}', 'os': 'Windows Server',
+                                'workspace': 'Production', 'context': {}, 'tags': []}
+                               for index in range(1000)])
+    asset_ids = db.scalars(select(Asset.id)).all()
+    findings = [{'asset_id': asset_id, 'vulnerability_id': vulnerability.id, 'port': port,
+                 'protocol': 'tcp', 'source': 'Manual', 'source_record': {}, 'observed': {},
+                 'revision': 1, 'workspace': 'Production'}
+                for asset_id in asset_ids for port in range(1, 36)]
+    finding_ids = db.scalars(insert(Finding).returning(Finding.id), findings).all()
+    db.execute(insert(Assessment), [{'instance_id': finding_id, 'revision': 1,
+        'methodology_id': method.id, 'analyst_id': analyst.id, 'context': {},
+        'justification': 'Technical investigation completed', 'decision': 'Remediation Required',
+        'status': 'Context Required'} for finding_id in finding_ids])
+    db.commit()
+    started = monotonic()
+    filters = {'q': 'large-', 'subcategory': 'Windows Servers'}
+    page = client.get(URL, params={**filters, 'offset': 20000, 'limit': 100})
+    assert page.status_code == 200 and len(page.json()['items']) == 100
+    assert (page.json()['total'], page.json()['assets_total']) == (35000, 1000)
+    checked = preview(client, payload(selection=filters))
+    queued = submit(client, payload(selection=filters), checked)
+    assert queued.status_code == 202 and queued.json()['status'] == 'Queued'
+    assert queued.json()['findings_selected'] == 35000
+    assert monotonic() - started < 30
 
 
 def test_persisted_regulatory_scope_is_authoritative_for_missing_fields_and_review_diff(client, db):
@@ -344,5 +468,9 @@ def test_select_all_over_1000_assets_has_no_pagination_or_n_plus_one_dependency(
     assert checked['assets_selected'] == 1005 and checked['findings_selected'] == 1006
     result = submit(client, payload(selection=filters), checked)
     assert result.status_code == 202, result.text
-    assert result.json()['requests_created'] == 1005
+    assert result.json()['status'] == 'Queued' and result.json()['requests_created'] == 0
+    while process_batch(db, size=100):
+        pass
+    job = db.get(ContextClassificationJob, result.json()['job_id'])
+    assert job.status == 'Completed' and job.awaiting_approval == 1005
     assert db.scalar(select(func.count()).select_from(AssetClassificationChangeRequest)) == 1005

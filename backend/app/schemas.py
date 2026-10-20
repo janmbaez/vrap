@@ -265,8 +265,27 @@ class ContextRequiredPage(ContextRequiredFilters):
         return ContextRequiredFilters.model_validate(self.model_dump(exclude={'limit', 'offset'}))
 
 
+class ContextSelectionInput(Strict):
+    asset_ids: list[int] = Field(default_factory=list, max_length=100000)
+    selection: ContextRequiredFilters | None = None
+    exclude_asset_ids: list[int] = Field(default_factory=list, max_length=100000)
+
+    @model_validator(mode='after')
+    def valid_selection(self):
+        if self.selection is None and not self.asset_ids:
+            raise ValueError('Select at least one asset')
+        if self.selection is not None and self.asset_ids:
+            raise ValueError('Choose explicit assets or all matching results')
+        if self.exclude_asset_ids and self.selection is None:
+            raise ValueError('Exclusions require an all-matching selection')
+        if any(value <= 0 for value in [*self.asset_ids, *self.exclude_asset_ids]):
+            raise ValueError('Asset IDs must be positive')
+        return self
+
+
 class BulkClassificationChangeInput(Strict):
     asset_ids: list[int] = Field(default_factory=list, max_length=100000)
+    exclude_asset_ids: list[int] = Field(default_factory=list, max_length=100000)
     selection: ContextRequiredFilters | None = None
     changes: AssetUpdate = Field(default_factory=AssetUpdate)
     per_asset_changes: dict[str, AssetUpdate] = Field(default_factory=dict, max_length=5000)
@@ -284,6 +303,10 @@ class BulkClassificationChangeInput(Strict):
             raise ValueError('Select at least one asset')
         if any(asset_id <= 0 for asset_id in self.asset_ids):
             raise ValueError('Asset IDs must be positive')
+        if self.exclude_asset_ids and self.selection is None:
+            raise ValueError('Exclusions require an all-matching selection')
+        if any(asset_id <= 0 for asset_id in self.exclude_asset_ids):
+            raise ValueError('Excluded asset IDs must be positive')
         for changes in [self.changes, *self.per_asset_changes.values()]:
             if changes.regulatory and 'None' in changes.regulatory and len(changes.regulatory) > 1:
                 raise ValueError('None cannot be combined with regulatory scopes')

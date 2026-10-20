@@ -562,3 +562,25 @@ class ClassificationDecisionJob(Base):
     skipped: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
     errors: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class ContextClassificationJob(Base):
+    __tablename__ = 'context_classification_jobs'
+    __table_args__ = (UniqueConstraint('workspace', 'preview_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), index=True)
+    preview_id: Mapped[int] = mapped_column(ForeignKey('audit_log.id'))
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    status: Mapped[str] = mapped_column(String(30), default='Queued')
+    asset_ids: Mapped[list] = mapped_column(JSON)
+    total_assets: Mapped[int] = mapped_column(Integer)
+    proposals: Mapped[dict] = mapped_column(JSON)
+    justification: Mapped[str] = mapped_column(Text)
+    evidence: Mapped[str] = mapped_column(Text)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    awaiting_approval: Mapped[int] = mapped_column(Integer, default=0)
+    unchanged: Mapped[int] = mapped_column(Integer, default=0)
+    conflicted: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[list] = mapped_column(JSON, default=list)
+    retry_ids: Mapped[list] = mapped_column(JSON, default=list)
