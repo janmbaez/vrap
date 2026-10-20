@@ -8,6 +8,7 @@ from .models import SyncJob, now
 from .auth import router as auth_router
 from .api.core import router as core_router
 from .api.classification_jobs import router as classification_jobs_router, start_worker
+from .api.context_jobs import router as context_jobs_router, start_worker as start_context_worker
 from .api.imports import router as imports_router
 from .api.tenable import router as tenable_router
 from .api.governance import router as governance_router
@@ -31,13 +32,15 @@ async def lifespan(_app):
         if abandoned:
             db.commit()
     worker_stop = start_worker()
+    context_worker_stop = start_context_worker()
     try:
         yield
     finally:
         worker_stop.set()
+        context_worker_stop.set()
 
 app = FastAPI(title='VRAP', version='1.0.0', docs_url='/api/docs', openapi_url='/api/openapi.json', redoc_url=None, lifespan=lifespan)
-for router in (classification_jobs_router, auth_router, core_router, imports_router, tenable_router, governance_router, campaigns_router, campaign_exports_router):
+for router in (classification_jobs_router, context_jobs_router, auth_router, core_router, imports_router, tenable_router, governance_router, campaigns_router, campaign_exports_router):
     app.include_router(router, prefix='/api')
 
 @app.middleware('http')

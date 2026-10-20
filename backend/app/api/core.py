@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from ..db import get_db
 from ..auth import require_user, writer, admin, passwords
 from ..models import *
-from ..schemas import FindingCreate, AssessmentInput, Context, Control, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, BulkClassificationChangeInput, ContextRequiredPage, ClassificationOwnerValidation, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
+from ..schemas import FindingCreate, AssessmentInput, Context, Control, MethodologyCreate, UserCreate, UserRoleUpdate, AssetUpdate, AssetEdit, AssetCreate, AssetRuleInput, SavedFilterInput, ClassificationChangeRequestInput, BulkClassificationChangeInput, ContextRequiredPage, ContextSelectionInput, ClassificationOwnerValidation, ClassificationChangeDecision, ClassificationMissionDraft, ClassificationEvidenceInput, ClassificationReviewerAssignment
 from ..asset_rules import ASSET_CONTEXT_KEYS, PROTECTED_CONTEXT_FIELDS, resolve_rules, resolve_rule_list
 from ..services import active_methodology, ingest, get_finding, detail, latest_assessment
 from ..risk.engine import calculate
@@ -14,7 +14,7 @@ from ..query import finding_query, validate_filters
 from ..assessment_state import assessment_currency, latest_assessment_revision, current_assessment_columns
 from ..regulatory import active_scopes, add_scope_memberships, normalize_scopes
 from ..classification_questionnaire import QUESTIONNAIRE
-from ..context_required import list_context, bulk_context, bulk_reviews
+from ..context_required import list_context, bulk_context, bulk_reviews, selection_summary
 
 router = APIRouter(tags=['Workbench'])
 
@@ -26,6 +26,11 @@ def smart_assessment_context_required(request: Request, filters: ContextRequired
 @router.post('/smart-assessment/context-required/bulk-classify', status_code=202)
 def bulk_classify_context(data: BulkClassificationChangeInput, request: Request, user=Depends(writer), db=Depends(get_db)):
     return bulk_context(db, request.state.session.workspace, user, data)
+
+
+@router.post('/smart-assessment/context-required/selection-summary')
+def context_selection_summary(data: ContextSelectionInput, request: Request, user=Depends(require_user), db=Depends(get_db)):
+    return selection_summary(db, request.state.session.workspace, data)
 
 
 @router.get('/smart-assessment/context-required/reviews')

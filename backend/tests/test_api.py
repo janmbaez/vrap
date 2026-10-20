@@ -610,7 +610,7 @@ def test_smart_assessment_context_required_bulk_classification_is_governed(clien
     login(client); finding = create(client)
     asset_id = finding['asset']['id']
     method = db.scalar(select(Methodology))
-    db.add(Assessment(instance_id=finding['id'], revision=1, methodology_id=method.id,
+    db.add(Assessment(instance_id=finding['id'], revision=finding['revision'], methodology_id=method.id,
                       analyst_id=1, context={}, justification='Technical investigation complete',
                       decision='Remediation Required', status='Context Required'))
     db.commit()

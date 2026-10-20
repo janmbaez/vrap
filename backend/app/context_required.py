@@ -7,15 +7,15 @@ from datetime import datetime, timezone, timedelta
 from fastapi import HTTPException
 from sqlalchemy import select, func, case, or_, and_, exists, update
 
-from .models import (Finding, Asset, Vulnerability, Assessment, AssetRegulatoryScope,
+from .models import (Finding, FindingWorkflow, Asset, Vulnerability, Assessment, AssetRegulatoryScope,
                      AssetClassificationChangeRequest, AssetClassificationMission, Audit,
-                     AssetClassificationMissionHistory)
+                     AssetClassificationMissionHistory, ContextClassificationJob)
 from .query import asset_tag_has, json_list_has
 from .services import active_methodology
 from .regulatory import normalize_scopes
 
 GOVERNED = {'asset_criticality', 'business_criticality', 'data_classification', 'regulatory',
-            'environment', 'exposure', 'business_owner', 'it_owner', 'application_owner', 'asset_group'}
+            'environment', 'exposure'}
 PREVIEW = 'asset.classification_bulk.previewed'
 CONFIRMED = 'asset.classification_bulk.confirmed'
 
@@ -81,19 +81,29 @@ def missing_value(field):
 
 
 def cohort_query(db, workspace, filters):
-    required = active_methodology(db).configuration.get('required_context', [])
+    methodology = active_methodology(db)
+    required = methodology.configuration.get('required_context', [])
     if filters.missing_field and filters.missing_field not in required:
         raise HTTPException(422, 'Missing field must be required by the active methodology')
     latest = select(func.max(Assessment.id)).where(Assessment.instance_id == Finding.id).correlate(Finding).scalar_subquery()
-    query = (select(Finding, Asset, Vulnerability, Assessment, category_expression().label('category'))
+    category = category_expression()
+    query = (select(Finding, Asset, Vulnerability, Assessment, category.label('category'))
              .join(Asset, Asset.id == Finding.asset_id)
              .join(Vulnerability, Vulnerability.id == Finding.vulnerability_id)
              .join(Assessment, Assessment.id == latest)
+             .outerjoin(FindingWorkflow, FindingWorkflow.finding_id == Finding.id)
              .where(Finding.workspace == workspace, Asset.workspace == workspace,
-                    Assessment.status == 'Context Required'))
+                    Assessment.status == 'Context Required',
+                    Assessment.revision == Finding.revision,
+                    Assessment.methodology_id == methodology.id,
+                    or_(FindingWorkflow.status.is_(None), FindingWorkflow.status != 'Closed')))
     if filters.q:
         query = query.where(or_(Asset.hostname.icontains(filters.q, autoescape=True),
-                                Asset.ip.icontains(filters.q, autoescape=True)))
+                                Asset.ip.icontains(filters.q, autoescape=True),
+                                Asset.os.icontains(filters.q, autoescape=True),
+                                Vulnerability.plugin_id.icontains(filters.q, autoescape=True),
+                                Vulnerability.name.icontains(filters.q, autoescape=True),
+                                category.icontains(filters.q, autoescape=True)))
     if filters.os:
         os = func.coalesce(func.nullif(Asset.os, ''), Vulnerability.technical['os'].as_string(), '')
         query = query.where(os.icontains(filters.os, autoescape=True))
@@ -116,13 +126,33 @@ def cohort_query(db, workspace, filters):
         membership = exists(select(1).where(AssetRegulatoryScope.asset_id == Asset.id,
                                             AssetRegulatoryScope.active.is_(True)))
         if filters.regulatory == 'None':
-            query = query.where(~membership, json_list_has(db, Asset.context['regulatory'], 'None'))
+            stored = Asset.context['regulatory']
+            query = query.where(~membership, or_(stored.is_(None), stored.as_string().is_(None),
+                                                 stored.as_string().in_(['', '[]']),
+                                                 json_list_has(db, stored, 'None')))
         else:
             query = query.where(or_(json_list_has(db, Asset.context['regulatory'], filters.regulatory),
                                     exists(select(1).where(AssetRegulatoryScope.asset_id == Asset.id,
                                            AssetRegulatoryScope.active.is_(True),
                                            AssetRegulatoryScope.scope == filters.regulatory))))
     return query, required
+
+
+def selected_query(db, workspace, selection, asset_ids=(), exclude_asset_ids=()):
+    from .schemas import ContextRequiredFilters
+    query, required = cohort_query(db, workspace, selection or ContextRequiredFilters())
+    if selection is None:
+        query = query.where(Asset.id.in_(set(asset_ids)))
+    elif exclude_asset_ids:
+        query = query.where(Asset.id.not_in(set(exclude_asset_ids)))
+    return query, required
+
+
+def selection_summary(db, workspace, data):
+    query, _ = selected_query(db, workspace, data.selection, data.asset_ids, data.exclude_asset_ids)
+    ids = query.with_only_columns(Finding.id.label('finding_id'), Asset.id.label('asset_id')).order_by(None).subquery()
+    findings, assets = db.execute(select(func.count(), func.count(func.distinct(ids.c.asset_id))).select_from(ids)).one()
+    return {'findings_selected': findings, 'assets_selected': assets}
 
 
 def list_context(db, workspace, filters, limit, offset):
@@ -148,21 +178,46 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), default=str).encode()).hexdigest()
 
 
+def create_request(db, asset, changes, before, actor_id, workspace, justification, evidence, preview_id, job_id=None, mission=None):
+    item = AssetClassificationChangeRequest(asset_id=asset.id, workspace=workspace, requested_by=actor_id,
+        expected_context_version=asset.context_version, before_context=before, proposed_context=changes,
+        justification=justification, evidence=evidence)
+    db.add(item); db.flush()
+    if not mission:
+        mission = db.scalar(select(AssetClassificationMission).where(
+            AssetClassificationMission.asset_id == asset.id, AssetClassificationMission.workspace == workspace))
+    if not mission:
+        mission = AssetClassificationMission(asset_id=asset.id, workspace=workspace, created_by=actor_id, updated_by=actor_id)
+        db.add(mission)
+    mission.status, mission.current_step, mission.updated_by = 'Pending Owner Validation', 5, actor_id
+    db.flush()
+    db.add(AssetClassificationMissionHistory(mission_id=mission.id, asset_id=asset.id, workspace=workspace,
+        actor_id=actor_id, action='submitted_for_approval', status=mission.status,
+        current_step=5, responses={'request_id': item.id, 'preview_id': preview_id, 'proposed': changes}))
+    db.add(Audit(actor_id=actor_id, action='asset.classification_change_requested.bulk', entity='asset', entity_id=asset.id,
+                 details={'request_id': item.id, 'preview_id': preview_id, 'job_id': job_id,
+                          'workspace': workspace, 'before': before, 'proposed': changes,
+                          'expected_context_version': asset.context_version}))
+    return item.id
+
+
 def bulk_context(db, workspace, user, data):
     from .schemas import ContextRequiredFilters
-    query, _ = cohort_query(db, workspace, data.selection or ContextRequiredFilters())
-    if data.selection is None:
-        query = query.where(Asset.id.in_(set(data.asset_ids)))
+    query, _ = selected_query(db, workspace, data.selection, data.asset_ids, data.exclude_asset_ids)
     rows = db.execute(query.order_by(Finding.id)).all()
     ids = sorted({asset.id for _, asset, _, _, _ in rows})
     if not ids:
-        raise HTTPException(422, 'The selection matches no assets')
+        raise HTTPException(409 if data.preview_token else 422,
+                            'Selection changed since preview; review the current results and preview again.'
+                            if data.preview_token else 'The selection matches no assets')
     if data.selection is None and ids != sorted(set(data.asset_ids)):
         raise HTTPException(409, 'Selected assets are no longer in this workspace context-required cohort. Preview again.')
     # A database subquery keeps parameter counts bounded even for large cohorts.
     asset_scope = query.with_only_columns(Asset.id).order_by(None)
-    assets = db.scalars(select(Asset).where(Asset.id.in_(asset_scope)).order_by(Asset.id)
-                        .with_for_update().execution_options(populate_existing=True)).all()
+    asset_statement = select(Asset).where(Asset.id.in_(asset_scope)).order_by(Asset.id)
+    if not data.dry_run:
+        asset_statement = asset_statement.with_for_update()
+    assets = db.scalars(asset_statement.execution_options(populate_existing=True)).all()
     rows = db.execute(query.order_by(Finding.id).execution_options(populate_existing=True)).all()
     if ids != [asset.id for asset in assets] or ids != sorted({asset.id for _, asset, _, _, _ in rows}):
         raise HTTPException(409, 'Cohort changed during verification. Preview again.')
@@ -186,6 +241,8 @@ def bulk_context(db, workspace, user, data):
     proposed = {}
     before = {}
     approved_fields = 0
+    unchanged_fields = 0
+    preview_items = []
     for asset in assets:
         incoming = data.per_asset_changes.get(str(asset.id), data.changes).model_dump(exclude_none=True)
         if set(incoming) - GOVERNED or not incoming:
@@ -198,13 +255,21 @@ def bulk_context(db, workspace, user, data):
             incoming['regulatory'] = normalize_scopes(incoming['regulatory']) or ['None']
         proposed[asset.id] = {key: value for key, value in incoming.items() if current.get(key) != value}
         before[asset.id] = {key: current.get(key) for key in proposed[asset.id]}
+        unchanged_fields += len(incoming) - len(proposed[asset.id])
+        if len(preview_items) < 50:
+            preview_items.append({'asset_id': asset.id, 'hostname': asset.hostname,
+                                  'before': before[asset.id], 'proposed': proposed[asset.id],
+                                  'unchanged_fields': sorted(set(incoming) - set(proposed[asset.id]))})
         approved_fields += sum(1 for key in proposed[asset.id]
                                if (key == 'regulatory' and asset.id in approved_regulatory)
                                or (isinstance((asset.context_provenance or {}).get(key), dict)
                                    and asset.context_provenance[key].get('approval_state') == 'Approved'))
     pending_conflicts = {item.asset_id for item in pending if set(item.proposed_context or {}) & set(proposed[item.asset_id])}
+    for item in preview_items:
+        item['pending_conflict'] = item['asset_id'] in pending_conflicts
     binding = {'workspace': workspace, 'actor_id': user.id,
                'asset_ids': sorted(set(data.asset_ids)),
+               'exclude_asset_ids': sorted(set(data.exclude_asset_ids)),
                'selection': data.selection.model_dump() if data.selection is not None else None,
                'justification': data.justification.strip(), 'evidence': data.evidence.strip(),
                'changes': data.changes.model_dump(exclude_none=True),
@@ -217,6 +282,8 @@ def bulk_context(db, workspace, user, data):
     summary = {'assets_selected': len(ids), 'findings_selected': len(rows),
                'proposed_assets': sum(bool(value) for value in proposed.values()),
                'proposed_fields': sum(len(value) for value in proposed.values()),
+               'unchanged_fields': unchanged_fields, 'sample_items': preview_items,
+               'missing_evidence': [name for name, value in [('justification', data.justification), ('evidence', data.evidence)] if not value.strip()],
                'unchanged': sum(not value for value in proposed.values()),
                'approval_conflicts': approved_fields, 'pending_conflicts': len(pending_conflicts)}
     if data.dry_run:
@@ -239,7 +306,7 @@ def bulk_context(db, workspace, user, data):
             or preview.created_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc) - timedelta(minutes=15)
             or preview.details.get('state_hash') != fingerprint(state)):
         raise HTTPException(409, 'Selection or context changed, or preview expired/used. Preview again before confirming.')
-    if pending_conflicts:
+    if pending_conflicts and len(ids) <= 200:
         raise HTTPException(409, 'Overlapping classification requests await approval; resolve them and preview again.')
     if not summary['proposed_assets']:
         raise HTTPException(422, 'No classification changes remain to submit')
@@ -247,6 +314,17 @@ def bulk_context(db, workspace, user, data):
     consumed = db.execute(update(Audit).where(Audit.id == preview.id, Audit.action == PREVIEW).values(action=CONFIRMED))
     if consumed.rowcount != 1:
         raise HTTPException(409, 'Preview already confirmed. Reload before submitting again.')
+    if len(ids) > 200:
+        job = ContextClassificationJob(workspace=workspace, preview_id=preview.id, requested_by=user.id,
+            asset_ids=ids, total_assets=len(ids), proposals={str(asset.id): {'version': asset.context_version,
+                'changes': proposed[asset.id], 'before': before[asset.id]} for asset in assets},
+            justification=data.justification.strip(), evidence=data.evidence.strip(), status='Queued',
+            processed=0, awaiting_approval=0, unchanged=0, conflicted=0, failed=0, errors=[], retry_ids=[])
+        db.add(job); db.flush()
+        db.add(Audit(actor_id=user.id, action='asset.classification_bulk.queued', entity='classification_job',
+                     entity_id=job.id, details={'workspace': workspace, 'summary': summary, 'preview_id': preview.id}))
+        db.commit()
+        return {'status': 'Queued', **summary, 'requests_created': 0, 'job_id': job.id}
     requested = []
     missions = {m.asset_id: m for m in db.scalars(select(AssetClassificationMission).where(
         AssetClassificationMission.asset_id.in_(asset_scope), AssetClassificationMission.workspace == workspace))}
@@ -254,26 +332,9 @@ def bulk_context(db, workspace, user, data):
         changes = proposed[asset.id]
         if not changes:
             continue
-        item = AssetClassificationChangeRequest(asset_id=asset.id, workspace=workspace, requested_by=user.id,
-            expected_context_version=asset.context_version,
-            before_context=before[asset.id], proposed_context=changes,
-            justification=data.justification.strip(), evidence=data.evidence.strip())
-        db.add(item); db.flush(); requested.append(item.id)
-        mission = missions.get(asset.id)
-        if not mission:
-            mission = AssetClassificationMission(asset_id=asset.id, workspace=workspace, created_by=user.id, updated_by=user.id)
-            db.add(mission)
-        mission.status = 'Pending Owner Validation'
-        mission.current_step = 5
-        mission.updated_by = user.id
-        db.flush()
-        db.add(AssetClassificationMissionHistory(mission_id=mission.id, asset_id=asset.id, workspace=workspace,
-            actor_id=user.id, action='submitted_for_approval', status=mission.status,
-            current_step=5, responses={'request_id': item.id, 'preview_id': preview.id, 'proposed': changes}))
-        db.add(Audit(actor_id=user.id, action='asset.classification_change_requested.bulk', entity='asset', entity_id=asset.id,
-                     details={'request_id': item.id, 'preview_id': preview.id, 'workspace': workspace,
-                              'before': item.before_context, 'proposed': changes,
-                              'expected_context_version': asset.context_version}))
+        requested.append(create_request(db, asset, changes, before[asset.id], user.id, workspace,
+                                        data.justification.strip(), data.evidence.strip(), preview.id,
+                                        mission=missions.get(asset.id)))
     db.add(Audit(actor_id=user.id, action='asset.classification_bulk.submitted', entity='classification_bulk',
                  entity_id=preview.id, details={'workspace': workspace, 'summary': summary,
                                                'request_ids': requested, 'state_hash': fingerprint(state)}))
