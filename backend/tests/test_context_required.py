@@ -5,7 +5,8 @@ import pytest
 from sqlalchemy import select, func, event
 
 from app.models import (Asset, Finding, Vulnerability, Assessment, Methodology, Audit, User,
-                        AssetClassificationChangeRequest, AssetRegulatoryScope, AssetClassificationMission)
+                        AssetClassificationChangeRequest, AssetRegulatoryScope, AssetClassificationMission,
+                        ClassificationDecisionJob)
 from conftest import login
 
 URL = '/api/smart-assessment/context-required'
