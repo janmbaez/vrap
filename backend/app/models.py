@@ -87,6 +87,20 @@ class AssetClassificationMission(Base):
     owner_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     grc_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
 
+
+class ApprovedRaciReviewerMapping(Base):
+    __tablename__ = 'approved_raci_reviewer_mappings'
+    __table_args__ = (UniqueConstraint('workspace', 'owner_name'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(20), index=True)
+    owner_name: Mapped[str] = mapped_column(String(200))
+    validator_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    approved_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    evidence: Mapped[str] = mapped_column(Text)
+    justification: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 class AssetClassificationMissionHistory(Base):
     __tablename__ = 'asset_classification_mission_history'
     __table_args__ = (Index('ix_asset_classification_mission_history_mission', 'mission_id', 'created_at'),)

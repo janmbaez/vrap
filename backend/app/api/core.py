@@ -559,6 +559,19 @@ def assign_classification_reviewer(id: int, data: ClassificationReviewerAssignme
         reviewer = db.get(User, data.user_id)
         if not reviewer or not reviewer.active:
             raise HTTPException(422, 'Reviewer is not active')
+        if data.role == 'grc' and reviewer.role != 'Administrator':
+            raise HTTPException(422, 'GRC reviewer must be an active administrator')
+        if data.role == 'owner' and reviewer.role == 'Viewer':
+            raise HTTPException(422, 'Owner reviewer must be able to validate')
+        pending = db.scalars(select(AssetClassificationChangeRequest).where(
+            AssetClassificationChangeRequest.asset_id == id,
+            AssetClassificationChangeRequest.workspace == asset.workspace,
+            AssetClassificationChangeRequest.status == 'Requested')).all()
+        if any(data.user_id == item.requested_by for item in pending):
+            raise HTTPException(422, 'The submitter cannot be an owner or GRC reviewer')
+        other = mission.grc_reviewer_id if data.role == 'owner' else mission.owner_reviewer_id
+        if data.user_id == other:
+            raise HTTPException(422, 'Owner validator and GRC reviewer must be different users')
     if data.role == 'owner': mission.owner_reviewer_id = data.user_id
     else: mission.grc_reviewer_id = data.user_id
     _mission_history(db, mission, user.id, f'{data.role}_reviewer_assigned')
@@ -696,7 +709,7 @@ def validate_bulk_classification_owner(id: int, data: ClassificationOwnerValidat
         raise HTTPException(404, 'Bulk classification request not found')
     mission = db.scalar(select(AssetClassificationMission).where(
         AssetClassificationMission.asset_id == item.asset_id, AssetClassificationMission.workspace == item.workspace))
-    if not mission or mission.owner_reviewer_id != user.id or user.id == item.requested_by:
+    if not mission or mission.owner_reviewer_id != user.id or user.id in (item.requested_by, mission.grc_reviewer_id):
         raise HTTPException(403, 'The assigned independent owner must validate this request')
     asset = db.get(Asset, item.asset_id)
     if item.status != 'Requested' or asset.context_version != item.expected_context_version:

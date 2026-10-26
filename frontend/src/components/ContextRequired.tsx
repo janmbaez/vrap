@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api, User } from '../api'
 import { Badge, ErrorBox } from './UI'
 import ContextClassificationReviews from './ContextClassificationReviews'
+import ApprovalReadinessCenter from './ApprovalReadinessCenter'
 import {selectPage, toggleAsset, selectionPayload} from './contextSelection.ts'
 
 type Filters = Record<'q'|'subcategory'|'os'|'device_type'|'missing_field'|'raci_owner'|'tag'|'environment'|'regulatory', string>
@@ -130,7 +131,7 @@ export default function ContextRequired({user}:{user:User}) {
       {!data?.items.length&&<tr><td colSpan={5}>No matching findings.</td></tr>}
     </tbody></table></div>}
     <div className="actions"><button disabled={loading||offset===0} onClick={()=>{setLoading(true);setOffset(v=>v-100)}}>Previous</button><span>{data?.total?offset+1:0}–{Math.min(offset+100,data?.total||0)} of {data?.total||0} findings</span><button disabled={loading||offset+100>=(data?.total||0)} onClick={()=>{setLoading(true);setOffset(v=>v+100)}}>Next</button><button disabled={loading} onClick={()=>{clearSelection();setLoading(true);setRefresh(v=>v+1)}}>Refresh</button></div>
-    {user.role!=='Viewer'&&<><button onClick={()=>setReviewsOpen(value=>!value)}>{reviewsOpen?'Hide':'Open'} owner / GRC review queue</button>{reviewsOpen&&<ContextClassificationReviews user={user} onApplied={()=>{clearSelection();setLoading(true);setRefresh(value=>value+1)}}/>}</>}
+    {user.role!=='Viewer'&&<><button onClick={()=>setReviewsOpen(value=>!value)}>{reviewsOpen?'Hide':'Open'} Approval Readiness Center</button>{reviewsOpen&&<><ApprovalReadinessCenter user={user} onApplied={()=>{clearSelection();setLoading(true);setRefresh(value=>value+1)}}/><ContextClassificationReviews user={user} onApplied={()=>{clearSelection();setLoading(true);setRefresh(value=>value+1)}}/></>}</>}
     {step>0&&<div className="modal-backdrop"><div className="modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-context-title">
       <div className="section-head"><h2 id="bulk-context-title">Bulk classify assets</h2><button disabled={busy} onClick={()=>setStep(0)}>Close</button></div><ErrorBox error={error}/>
       <div className="chips">{['Select Assets','Set Missing Context','Preview','Submit for Approval'].map((label,i)=><span key={label} className={step===i+1?'chip checked':'chip'}>{i+1}. {label}</span>)}</div>
