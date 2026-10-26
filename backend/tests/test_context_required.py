@@ -9,7 +9,7 @@ from app.models import (Asset, Finding, FindingWorkflow, Vulnerability, Assessme
                         AssetClassificationChangeRequest, AssetRegulatoryScope, AssetClassificationMission)
 from conftest import login
 from app.api.context_jobs import process_batch
-from app.models import ContextClassificationJob
+from app.models import ContextClassificationJob, ClassificationDecisionJob
 
 URL = '/api/smart-assessment/context-required'
 
@@ -426,15 +426,128 @@ def test_admin_bulk_request_cannot_self_validate_or_self_approve_or_use_job_bypa
     assert client.post(f'/api/classification-change-requests/{rid}/owner-validation', json={'justification':'Self review','evidence':'CMDB'}).status_code == 403
     assert client.put(f'/api/classification-change-requests/{rid}', json={'status':'Approved','justification':'Self approval'}).status_code == 403
     response = client.post('/api/classification-decision-jobs', json={'request_ids':[rid],'status':'Approved','justification':'Bypass attempt','idempotency_key':'cannot-bypass-owner-grc'})
-    assert response.status_code == 202
-    assert process_one(db)
-    outcome = client.get(f"/api/classification-decision-jobs/{response.json()['id']}").json()
-    assert outcome['failed'] == 1 and outcome['succeeded'] == 0
+    assert response.status_code == 422
+    assert 'independent' in str(response.json()).lower()
+    assert db.scalar(select(func.count()).select_from(ClassificationDecisionJob)) == 0
     db.refresh(asset)
     assert asset.context == {}
     login(client,'analyst',environment='Demo')
     assert client.get(URL+'/reviews').json()['total'] == 0
     assert client.post(f'/api/classification-change-requests/{rid}/owner-validation', json={'justification':'Other workspace','evidence':'CMDB'}).status_code == 404
+
+
+def test_readiness_owner_grc_path_recalculates_risk_without_repeating_investigation(client, db):
+    from app.api.classification_jobs import process_one
+    login(client, 'analyst')
+    asset = add_asset(db, 'ready-for-risk', context={
+        'asset_criticality': 'High', 'business_owner': 'Windows Infrastructure',
+        'data_classification': 'Confidential', 'environment': 'Production', 'production': True,
+        'exposure': 'Internal', 'publicly_accessible': False, 'regulatory': ['PCI DSS']})
+    asset.context_provenance = {'business_owner': {'approval_state': 'Approved'}}
+    owner = User(username='owner', role='Security Analyst', password_hash=db.scalar(
+        select(User.password_hash).where(User.username == 'analyst')))
+    assessment = db.scalar(select(Assessment))
+    assessment.context = {'_technical_investigation': {'evidence': 'Owner CMDB evidence'}}
+    db.add(owner); db.commit()
+    body = payload(selection={'q':'ready-for-risk'})
+    rid = submit(client, body, preview(client, body)).json()['request_ids'][0]
+    login(client)
+    center = client.get('/api/approval-readiness').json()
+    assert center['counts']['Missing Reviewer'] == 1
+    denied = client.post('/api/classification-decision-jobs/preview', json={
+        'request_ids':[rid], 'status':'Approved', 'justification':'GRC review', 'idempotency_key':'preview'}).json()
+    assert denied['blocked'] == 1
+    mapping = client.post('/api/approval-readiness/owner-mappings', json={
+        'owner_name':'Windows Infrastructure', 'validator_id':owner.id,
+        'evidence':'Approved RACI delegation record 123',
+        'justification':'Windows team delegated asset validation to this owner'})
+    assert mapping.status_code == 200, mapping.text
+    assigned = client.post('/api/approval-readiness/assign-reviewers', json={
+        'request_ids':[rid], 'grc_reviewer_id':1, 'justification':'Approved RACI owner mapping'})
+    assert assigned.status_code == 200, assigned.text
+    assert client.get('/api/approval-readiness').json()['counts']['Ready for Owner Validation'] == 1
+    login(client, 'owner')
+    validated = client.post('/api/approval-readiness/validate-owner', json={
+        'request_ids':[rid], 'justification':'I verified the BIA and inventory',
+        'evidence':'Owner attestation 123'})
+    assert validated.status_code == 200, validated.text
+    login(client)
+    assert client.get('/api/approval-readiness').json()['counts']['Ready for GRC'] == 1
+    job = client.post('/api/classification-decision-jobs', json={
+        'request_ids':[rid], 'status':'Approved', 'justification':'Independent GRC review',
+        'idempotency_key':'ready-approval'})
+    assert job.status_code == 202, job.text
+    assert process_one(db)
+    progress = client.get(f"/api/classification-decision-jobs/{job.json()['id']}").json()
+    assert progress['status'] == 'Completed' and progress['approved'] == 1 and progress['failed'] == 0
+    db.refresh(asset)
+    assert asset.context['business_criticality'] == 'High' and asset.context_version == 2
+    assert db.scalar(select(Assessment).order_by(Assessment.id.desc())).status == 'Assessed'
+    assert client.get('/api/approval-readiness').json()['counts']['Completed'] == 1
+    assert client.post('/api/classification-decision-jobs', json={
+        'request_ids':[rid], 'status':'Approved', 'justification':'Independent GRC review',
+        'idempotency_key':'ready-approval'}).json()['id'] == job.json()['id']
+
+
+def test_readiness_rejects_unmapped_reviewer_and_blocks_preexisting_job(client, db):
+    from app.api.classification_jobs import process_one
+    login(client, 'analyst')
+    asset = add_asset(db, 'no-raci-owner')
+    body = payload(selection={'q':'no-raci-owner'})
+    rid = submit(client, body, preview(client, body)).json()['request_ids'][0]
+    login(client)
+    response = client.post('/api/approval-readiness/assign-reviewers', json={
+        'request_ids':[rid], 'grc_reviewer_id':1, 'justification':'Attempted routing'})
+    assert response.status_code == 422 and 'approved RACI owner' in str(response.json())
+    historical = ClassificationDecisionJob(workspace='Production', requested_by=1,
+        idempotency_key='old-unchecked-job', status='Queued', payload={
+            'status':'Approved', 'justification':'Old job'}, request_ids=[rid])
+    db.add(historical);db.commit()
+    assert process_one(db)
+    db.refresh(historical)
+    assert historical.status == 'Blocked' and historical.processed == historical.failed == 0
+    assert db.get(AssetClassificationChangeRequest, rid).status == 'Requested'
+    assert client.post(f'/api/classification-decision-jobs/{historical.id}/resume').status_code == 422
+    login(client, 'analyst', environment='Demo')
+    assert client.get('/api/approval-readiness').json()['total'] == 0
+
+
+def test_equivalent_duplicates_are_reviewed_and_stale_rebase_never_applies_context(client, db):
+    login(client, 'analyst')
+    asset = add_asset(db, 'duplicate-stale')
+    body = payload(selection={'q': 'duplicate-stale'})
+    first_id = submit(client, body, preview(client, body)).json()['request_ids'][0]
+    first = db.get(AssetClassificationChangeRequest, first_id)
+    duplicate = AssetClassificationChangeRequest(asset_id=asset.id, workspace='Production',
+        requested_by=first.requested_by, expected_context_version=first.expected_context_version,
+        before_context=first.before_context, proposed_context=first.proposed_context,
+        justification=first.justification, evidence=first.evidence)
+    db.add(duplicate);db.flush()
+    db.add(Audit(actor_id=first.requested_by, action='asset.classification_change_requested.bulk',
+        entity='asset', entity_id=asset.id,
+        details={'workspace':'Production', 'request_id':duplicate.id}))
+    db.commit()
+    login(client)
+    assert client.get('/api/approval-readiness').json()['counts']['Duplicate/Conflicting'] == 2
+    response = client.post('/api/approval-readiness/deduplicate', json={
+        'request_ids':[first_id, duplicate.id], 'justification':'Same asset and proposal'})
+    assert response.status_code == 200, response.text
+    assert db.get(AssetClassificationChangeRequest, duplicate.id).status == 'Superseded'
+    assert asset.context == {}
+    asset.context_version += 1
+    db.commit()
+    review = client.get(f'/api/approval-readiness/{first_id}/rebase').json()
+    assert review['eligible'] and review['current_version'] == 2
+    stale_attempt = client.post(f'/api/approval-readiness/{first_id}/rebase', json={
+        'expected_current_version':1, 'justification':'Recheck', 'evidence':'CMDB'} )
+    assert stale_attempt.status_code == 409
+    login(client, 'analyst')
+    rebased = client.post(f'/api/approval-readiness/{first_id}/rebase', json={
+        'expected_current_version':2, 'justification':'Rechecked current inventory', 'evidence':'CMDB-456'})
+    assert rebased.status_code == 200, rebased.text
+    assert db.get(AssetClassificationChangeRequest, first_id).status == 'Superseded'
+    assert db.get(AssetClassificationChangeRequest, rebased.json()['request_id']).status == 'Requested'
+    assert asset.context == {}
 
 
 def test_select_all_over_1000_assets_has_no_pagination_or_n_plus_one_dependency(client, db):
