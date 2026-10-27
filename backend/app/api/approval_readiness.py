@@ -347,6 +347,97 @@ def approve_selected(data: DirectApproval, request: Request, user=Depends(admin)
     return output(job)
 
 
+@router.post('/approval-readiness/fix-and-approve', status_code=202)
+def fix_and_approve(data: DirectApproval, request: Request, user=Depends(admin), db=Depends(get_db)):
+    """Resolve equivalent duplicates around the selection and queue every
+    canonical request that already satisfies the approval gates.
+
+    Related requests are expanded server-side, so page boundaries never make
+    the operation fail. Differing proposals remain pending and are reported.
+    """
+    from .classification_jobs import eligibility, output
+    from ..models import ClassificationDecisionJob
+    workspace = request.state.session.workspace
+    selected = selected_rows(db, workspace, data)
+    asset_ids = {row['asset_id'] for row in selected}
+    pending = db.scalars(select(Change).where(
+        Change.workspace == workspace, Change.status == 'Requested',
+        Change.asset_id.in_(asset_ids)).order_by(Change.id)).all()
+    by_asset = defaultdict(list)
+    for item in pending:
+        by_asset[item.asset_id].append(item)
+
+    superseded = []
+    canonical_ids = []
+    conflicting_ids = []
+    for items in by_asset.values():
+        equivalence = defaultdict(list)
+        for item in items:
+            key = (json.dumps(item.before_context or {}, sort_keys=True),
+                   json.dumps(item.proposed_context or {}, sort_keys=True),
+                   (item.evidence or '').strip())
+            equivalence[key].append(item)
+        canonicals = []
+        for equivalents in equivalence.values():
+            canonical = min(equivalents, key=lambda item: item.id)
+            canonicals.append(canonical)
+            for duplicate in equivalents:
+                if duplicate.id == canonical.id:
+                    continue
+                duplicate.status = 'Superseded'
+                duplicate.decision_justification = data.justification.strip()
+                superseded.append(duplicate.id)
+                db.add(Audit(actor_id=user.id, action='asset.classification_duplicate_superseded',
+                    entity='classification_change_request', entity_id=duplicate.id,
+                    details={'workspace': workspace, 'canonical_request_id': canonical.id,
+                             'justification': data.justification.strip(), 'automatic_expansion': True}))
+        # More than one distinct proposal for one asset is a real conflict.
+        if len(canonicals) == 1:
+            canonical_ids.append(canonicals[0].id)
+        else:
+            conflicting_ids.extend(item.id for item in canonicals)
+
+    db.flush()
+    check = eligibility(db, workspace, canonical_ids, user, 'Approved') if canonical_ids else {
+        'blocked': 0, 'reasons': {}, 'examples': []}
+    blocked_ids = {example['request_id'] for example in check['examples']}
+    # eligibility examples are capped, so run each canonical when blockers exist
+    # to avoid accidentally queuing an unreported blocked request.
+    eligible_ids = []
+    for request_id in canonical_ids:
+        single = eligibility(db, workspace, [request_id], user, 'Approved')
+        if single['blocked']:
+            blocked_ids.add(request_id)
+        else:
+            eligible_ids.append(request_id)
+
+    job = None
+    if eligible_ids:
+        existing = db.scalar(select(ClassificationDecisionJob).where(
+            ClassificationDecisionJob.workspace == workspace,
+            ClassificationDecisionJob.idempotency_key == data.idempotency_key))
+        if existing:
+            job = existing
+        else:
+            payload = {'status': 'Approved', 'justification': data.justification.strip(),
+                       'selection': {'all_pending': False, 'request_ids': eligible_ids,
+                                     'excluded_ids': [], 'through_id': None}}
+            job = ClassificationDecisionJob(workspace=workspace, requested_by=user.id,
+                idempotency_key=data.idempotency_key, payload=payload, request_ids=eligible_ids)
+            db.add(job); db.flush()
+            db.add(Audit(actor_id=user.id, action='classification.bulk_decision_queued',
+                entity='classification_job', entity_id=job.id,
+                details={'total': len(eligible_ids), 'decision': 'Approved',
+                         'readiness_center': True, 'automatic_duplicate_resolution': True}))
+    db.commit()
+    return {'superseded': len(superseded), 'expanded_requests': len(pending),
+            'queued_for_approval': len(eligible_ids),
+            'approval_job': output(job) if job else None,
+            'conflicting': len(conflicting_ids), 'conflicting_ids': conflicting_ids[:50],
+            'blocked': len(blocked_ids), 'blocked_reasons': check['reasons'],
+            'blocked_examples': check['examples']}
+
+
 @router.post('/approval-readiness/validate-owner')
 def validate_owner(data: OwnerAttestation, request: Request, user=Depends(writer), db=Depends(get_db)):
     workspace = request.state.session.workspace

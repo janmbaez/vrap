@@ -529,9 +529,14 @@ def test_equivalent_duplicates_are_reviewed_and_stale_rebase_never_applies_conte
     db.commit()
     login(client)
     assert client.get('/api/approval-readiness').json()['counts']['Duplicate/Conflicting'] == 2
-    response = client.post('/api/approval-readiness/deduplicate', json={
-        'request_ids':[first_id, duplicate.id], 'justification':'Same asset and proposal'})
-    assert response.status_code == 200, response.text
+    response = client.post('/api/approval-readiness/fix-and-approve', json={
+        'request_ids':[first_id], 'justification':'Same asset and proposal',
+        'idempotency_key':'fix-duplicate-page-boundary'})
+    assert response.status_code == 202, response.text
+    assert response.json()['expanded_requests'] == 2
+    assert response.json()['superseded'] == 1
+    assert response.json()['queued_for_approval'] == 0
+    assert response.json()['blocked'] == 1
     assert db.get(AssetClassificationChangeRequest, duplicate.id).status == 'Superseded'
     assert asset.context == {}
     asset.context_version += 1
