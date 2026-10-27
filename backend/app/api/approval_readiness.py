@@ -141,6 +141,58 @@ class AssignReviewers(Selection):
     justification: str = Field(min_length=1, max_length=5000)
 
 
+@router.post('/approval-readiness/prepare')
+def prepare(data: Selection, request: Request, user=Depends(admin), db=Depends(get_db)):
+    """One-click administrator preparation: choose eligible RACI owners and a
+    distinct active GRC administrator, then record the normal assignment audit.
+    It never performs owner attestation or GRC approval.
+    """
+    workspace = request.state.session.workspace
+    rows = selected_rows(db, workspace, data)
+    if not rows:
+        raise HTTPException(422, 'No requests selected')
+    admins = [candidate for candidate in db.scalars(select(User).where(
+        User.active.is_(True), User.role == 'Administrator')).all()
+              if candidate.id != user.id]
+    assets = {asset.id: asset for asset in db.scalars(select(Asset).where(
+        Asset.workspace == workspace, Asset.id.in_([row['asset_id'] for row in rows])))}
+    users = db.scalars(select(User).where(User.active.is_(True))).all()
+    mappings = {mapping.owner_name: mapping for mapping in db.scalars(select(ApprovedRaciReviewerMapping).where(
+        ApprovedRaciReviewerMapping.workspace == workspace,
+        ApprovedRaciReviewerMapping.active.is_(True)))}
+    assignments = []
+    blocked = []
+    for row in rows:
+        if row['readiness'] != 'Missing Reviewer' or row['status'] != 'Requested':
+            blocked.append({'request_id': row['id'], 'reason': row['readiness']})
+            continue
+        owner = approved_owner_user(assets.get(row['asset_id']), users, mappings)
+        grc = next((candidate for candidate in admins
+                    if len({row['requested_by'], owner.id if owner else 0, candidate.id}) == 3), None)
+        if not owner or not grc:
+            blocked.append({'request_id': row['id'], 'reason': 'No independent approved RACI owner/GRC administrator'})
+            continue
+        assignments.append((row, owner.id, grc.id))
+    for row, owner_id, grc_id in assignments:
+        mission = db.scalar(select(Mission).where(Mission.asset_id == row['asset_id'],
+            Mission.workspace == workspace).with_for_update())
+        if not mission:
+            blocked.append({'request_id': row['id'], 'reason': 'Classification mission missing'})
+            continue
+        mission.owner_reviewer_id, mission.grc_reviewer_id = owner_id, grc_id
+        db.add(AssetClassificationMissionHistory(mission_id=mission.id, asset_id=mission.asset_id,
+            workspace=workspace, actor_id=user.id, action='admin_prepare_reviewers',
+            status=mission.status, current_step=mission.current_step,
+            responses={'request_id': row['id'], 'owner_id': owner_id, 'grc_id': grc_id}))
+        db.add(Audit(actor_id=user.id, action='asset.classification_reviewers_prepared',
+            entity='classification_change_request', entity_id=row['id'],
+            details={'workspace': workspace, 'owner_id': owner_id, 'grc_id': grc_id,
+                     'automated': True}))
+    db.commit()
+    return {'prepared': len(assignments), 'blocked': blocked,
+            'message': 'Reviewers prepared. Owner attestation and independent GRC approval are still required.'}
+
+
 def approved_owner_user(asset, users, mappings):
     context = asset.context or {}
     provenance = asset.context_provenance or {}
