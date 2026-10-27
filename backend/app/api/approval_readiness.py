@@ -315,6 +315,38 @@ class OwnerAttestation(Selection):
     evidence: str = Field(min_length=1, max_length=10000)
 
 
+class DirectApproval(Selection):
+    justification: str = Field(min_length=1, max_length=5000)
+    idempotency_key: str = Field(min_length=1, max_length=120)
+
+
+@router.post('/approval-readiness/approve-selected', status_code=202)
+def approve_selected(data: DirectApproval, request: Request, user=Depends(admin), db=Depends(get_db)):
+    """Single-action GRC approval for requests already passing every gate."""
+    from .classification_jobs import selection_ids, eligibility, output
+    from ..models import ClassificationDecisionJob
+    workspace = request.state.session.workspace
+    ids = selection_ids(db, workspace, data)
+    check = eligibility(db, workspace, ids, user, 'Approved')
+    if check['blocked']:
+        raise HTTPException(422, {'message': 'Some selected requests still need attention.', **check})
+    existing = db.scalar(select(ClassificationDecisionJob).where(
+        ClassificationDecisionJob.workspace == workspace,
+        ClassificationDecisionJob.idempotency_key == data.idempotency_key))
+    if existing:
+        return output(existing)
+    payload = {'status': 'Approved', 'justification': data.justification.strip(),
+               'selection': {'all_pending': False, 'request_ids': ids, 'excluded_ids': [], 'through_id': None}}
+    job = ClassificationDecisionJob(workspace=workspace, requested_by=user.id,
+        idempotency_key=data.idempotency_key, payload=payload, request_ids=ids)
+    db.add(job); db.flush()
+    db.add(Audit(actor_id=user.id, action='classification.bulk_decision_queued',
+        entity='classification_job', entity_id=job.id,
+        details={'total': len(ids), 'decision': 'Approved', 'readiness_center': True}))
+    db.commit()
+    return output(job)
+
+
 @router.post('/approval-readiness/validate-owner')
 def validate_owner(data: OwnerAttestation, request: Request, user=Depends(writer), db=Depends(get_db)):
     workspace = request.state.session.workspace
