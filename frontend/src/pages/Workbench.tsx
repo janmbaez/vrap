@@ -2,7 +2,6 @@ import {useEffect,useState} from 'react'
 import {Link,useParams} from 'react-router-dom'
 import {Check,ChevronLeft,Save,ShieldCheck} from 'lucide-react'
 import {api,Finding,fmt,User} from '../api'
-import Loading from '../components/Loading'
 import {Badge,ErrorBox,PageTitle} from '../components/UI'
 
 const actionStates=['New','Investigating','Remediation Planned','Risk Review','Accepted','Closed']
@@ -13,7 +12,7 @@ export default function Workbench({user}:{user:User}){
  async function load(){setError('');try{const [f,h]=await Promise.all([api<Finding>(`/findings/${id}`),api<any[]>(`/findings/${id}/history`)]);apply(f);setHistory(h)}catch(e){setError((e as Error).message)}}
  useEffect(()=>{load()},[id])
  async function save(){setBusy(true);setError('');setMessage('');try{await api(`/findings/${id}/workflow`,{method:'PUT',body:JSON.stringify({owner_id:null,status,remediation_due_at:due?`${due}T00:00:00Z`:null,remediation_evidence:evidence.trim()||null})});await load();setMessage('Action plan saved and added to the audit history.')}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
- if(!finding)return <><ErrorBox error={error}/><Loading message="Loading vulnerability action…"/></>
+ if(!finding)return <><ErrorBox error={error}/><div className="loading" role="status">Loading vulnerability action…</div></>
  const risk=finding.saved_score,entries={'CVE':finding.cves.join(', ')||'Not available','Plugin ID':finding.plugin_id||'Not available','Asset':finding.asset.hostname,'IP address':finding.asset.ip||'Unknown','Operating system':finding.asset.os||'Unknown','Port / protocol':`${finding.port} / ${finding.protocol}`,'CVSS v3':finding.technical.cvss??'Unknown','VPR':finding.technical.vpr??'Unknown','CISA KEV':finding.technical.kev==null?'Unknown':finding.technical.kev?'Yes':'No','Source':finding.source}
  return <><Link to="/assessments" className="back"><ChevronLeft size={16}/> Risk Workbench</Link><PageTitle eyebrow={`VULNERABILITY ACTION / FINDING ${finding.id}`} title={finding.name} description={`${finding.asset.hostname} · ${finding.cves.join(', ')||'No CVE'}`} actions={<Badge>{status}</Badge>}/><ErrorBox error={error}/>{message&&<div className="notice success" role="status"><Check size={17}/>{message}</div>}
  <div className="action-workbench"><section className="panel technical"><div className="panel-heading"><span className="step">01</span><h2>Finding evidence</h2></div><div className="technical-score"><span>Technical severity</span><strong>{finding.technical.cvss??'—'}<small> CVSS</small></strong><Badge level={finding.technical.severity}>{finding.technical.severity||'Unknown'}</Badge></div><dl className="evidence">{Object.entries(entries).map(([key,value])=><div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl><details open><summary>Description</summary><p>{finding.technical.description||'No description supplied.'}</p></details><details open><summary>Recommended solution</summary><p>{finding.technical.solution||'No solution supplied.'}</p></details></section>
