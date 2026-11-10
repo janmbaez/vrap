@@ -1,15 +1,14 @@
 import {useState} from 'react'
 import {User} from '../api'
-import AssessmentGroups from './AssessmentGroups'
-import SmartAssessmentCategories from './SmartAssessmentCategories'
 import MissionCenter from './MissionCenter'
+import Findings from './Findings'
 import Imports from './Imports'
 import {Administration,AuditHistory,MethodologyPage,Tenable} from './Management'
 
 export function AssessmentHub({user}:{user:User}){
- const [tab,setTab]=useState('assessments')
- const tabs=[['assessments','Assessments'],['smart','Smart Assessment'],['mission','Mission Center']]
- return <><div className="hub-tabs" role="tablist">{tabs.map(([key,label])=><button key={key} className={tab===key?'active':''} onClick={()=>setTab(key)}>{label}</button>)}</div>{tab==='assessments'&&<AssessmentGroups user={user}/>} {tab==='smart'&&<SmartAssessmentCategories user={user}/>} {tab==='mission'&&<MissionCenter/>}</>
+ const [tab,setTab]=useState<'priorities'|'findings'>('priorities')
+ const tabs=[['priorities','Priority queue'],['findings','All vulnerabilities']] as const
+ return <><div className="hub-intro"><div><span className="eyebrow">RISK OPERATIONS</span><h1>Risk Workbench</h1><p>Prioritize findings, assign the next action, and track remediation from one place.</p></div></div><div className="hub-tabs" role="tablist" aria-label="Risk workbench sections">{tabs.map(([key,label])=><button key={key} role="tab" aria-selected={tab===key} className={tab===key?'active':''} onClick={()=>setTab(key)}>{label}</button>)}</div>{tab==='priorities'&&<MissionCenter/>}{tab==='findings'&&<Findings user={user} assessments/>}</>
 }
 export function SettingsHub({user}:{user:User}){
  const [tab,setTab]=useState(user.role==='Viewer'?'methodology':'imports')
